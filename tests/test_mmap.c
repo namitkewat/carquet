@@ -28,11 +28,11 @@ static int create_test_file(int64_t num_rows) {
 
     /* Add required int64 column */
     carquet_schema_add_column(schema, "id", CARQUET_PHYSICAL_INT64,
-                               NULL, CARQUET_REPETITION_REQUIRED, 0);
+                               NULL, CARQUET_REPETITION_REQUIRED, 0, 0);
 
     /* Add required double column */
     carquet_schema_add_column(schema, "value", CARQUET_PHYSICAL_DOUBLE,
-                               NULL, CARQUET_REPETITION_REQUIRED, 0);
+                               NULL, CARQUET_REPETITION_REQUIRED, 0, 0);
 
     /* Writer options - NO COMPRESSION for zero-copy */
     carquet_writer_options_t opts;

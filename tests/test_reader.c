@@ -15,13 +15,13 @@ static int test_version(void) {
     const char* ver = carquet_version();
     (void)ver;
     assert(ver != NULL);
-    assert(strcmp(ver, "0.1.1") == 0);
+    assert(strcmp(ver, "0.1.2") == 0);
 
     int major, minor, patch;
     carquet_version_components(&major, &minor, &patch);
     assert(major == 0);
     assert(minor == 1);
-    assert(patch == 1);
+    assert(patch == 2);
 
     TEST_PASS("version");
     return 0;
@@ -153,46 +153,44 @@ static int test_nested_schema_levels(void) {
     /* Add flat columns at root level */
     status = carquet_schema_add_column(
         schema, "id", CARQUET_PHYSICAL_INT32, NULL,
-        CARQUET_REPETITION_REQUIRED, 0);
+        CARQUET_REPETITION_REQUIRED, 0, 0);
     assert(status == CARQUET_OK);
 
     status = carquet_schema_add_column(
         schema, "name", CARQUET_PHYSICAL_BYTE_ARRAY, NULL,
-        CARQUET_REPETITION_OPTIONAL, 0);
+        CARQUET_REPETITION_OPTIONAL, 0, 0);
     assert(status == CARQUET_OK);
 
     /* Add optional group "address" */
     int32_t address_idx = carquet_schema_add_group(
-        schema, "address", CARQUET_REPETITION_OPTIONAL, -1);
-    (void)address_idx;
+        schema, "address", CARQUET_REPETITION_OPTIONAL, 0);
     assert(address_idx >= 0);
 
     /* Add columns inside address group */
     status = carquet_schema_add_column(
         schema, "street", CARQUET_PHYSICAL_BYTE_ARRAY, NULL,
-        CARQUET_REPETITION_REQUIRED, 0);
+        CARQUET_REPETITION_REQUIRED, 0, address_idx);
     assert(status == CARQUET_OK);
 
     status = carquet_schema_add_column(
         schema, "city", CARQUET_PHYSICAL_BYTE_ARRAY, NULL,
-        CARQUET_REPETITION_OPTIONAL, 0);
+        CARQUET_REPETITION_OPTIONAL, 0, address_idx);
     assert(status == CARQUET_OK);
 
     /* Add repeated group "phones" */
     int32_t phones_idx = carquet_schema_add_group(
-        schema, "phones", CARQUET_REPETITION_REPEATED, -1);
-    (void)phones_idx;
+        schema, "phones", CARQUET_REPETITION_REPEATED, 0);
     assert(phones_idx >= 0);
 
     /* Add columns inside phones group */
     status = carquet_schema_add_column(
         schema, "number", CARQUET_PHYSICAL_BYTE_ARRAY, NULL,
-        CARQUET_REPETITION_REQUIRED, 0);
+        CARQUET_REPETITION_REQUIRED, 0, phones_idx);
     assert(status == CARQUET_OK);
 
     status = carquet_schema_add_column(
         schema, "type", CARQUET_PHYSICAL_BYTE_ARRAY, NULL,
-        CARQUET_REPETITION_OPTIONAL, 0);
+        CARQUET_REPETITION_OPTIONAL, 0, phones_idx);
     assert(status == CARQUET_OK);
 
     /* Get number of columns (leaves) */
@@ -290,12 +288,12 @@ static int test_write_simple_file(void) {
     /* Add columns */
     carquet_status_t status = carquet_schema_add_column(
         schema, "id", CARQUET_PHYSICAL_INT32, NULL,
-        CARQUET_REPETITION_REQUIRED, 0);
+        CARQUET_REPETITION_REQUIRED, 0, 0);
     assert(status == CARQUET_OK);
 
     status = carquet_schema_add_column(
         schema, "value", CARQUET_PHYSICAL_DOUBLE, NULL,
-        CARQUET_REPETITION_REQUIRED, 0);
+        CARQUET_REPETITION_REQUIRED, 0, 0);
     assert(status == CARQUET_OK);
 
     /* Create writer */

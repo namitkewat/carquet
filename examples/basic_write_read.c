@@ -59,7 +59,7 @@ static int write_parquet_file(const char* filename) {
     };
 
     status = carquet_schema_add_column(schema, "id",
-        CARQUET_PHYSICAL_INT32, NULL, CARQUET_REPETITION_REQUIRED, 0);
+        CARQUET_PHYSICAL_INT32, NULL, CARQUET_REPETITION_REQUIRED, 0, 0);
     if (status != CARQUET_OK) {
         fprintf(stderr, "Failed to add 'id' column\n");
         carquet_schema_free(schema);
@@ -67,7 +67,7 @@ static int write_parquet_file(const char* filename) {
     }
 
     status = carquet_schema_add_column(schema, "name",
-        CARQUET_PHYSICAL_BYTE_ARRAY, &string_type, CARQUET_REPETITION_REQUIRED, 0);
+        CARQUET_PHYSICAL_BYTE_ARRAY, &string_type, CARQUET_REPETITION_REQUIRED, 0, 0);
     if (status != CARQUET_OK) {
         fprintf(stderr, "Failed to add 'name' column\n");
         carquet_schema_free(schema);
@@ -75,7 +75,7 @@ static int write_parquet_file(const char* filename) {
     }
 
     status = carquet_schema_add_column(schema, "price",
-        CARQUET_PHYSICAL_DOUBLE, NULL, CARQUET_REPETITION_REQUIRED, 0);
+        CARQUET_PHYSICAL_DOUBLE, NULL, CARQUET_REPETITION_REQUIRED, 0, 0);
     if (status != CARQUET_OK) {
         fprintf(stderr, "Failed to add 'price' column\n");
         carquet_schema_free(schema);
@@ -83,7 +83,7 @@ static int write_parquet_file(const char* filename) {
     }
 
     status = carquet_schema_add_column(schema, "quantity",
-        CARQUET_PHYSICAL_INT64, NULL, CARQUET_REPETITION_REQUIRED, 0);
+        CARQUET_PHYSICAL_INT64, NULL, CARQUET_REPETITION_REQUIRED, 0, 0);
     if (status != CARQUET_OK) {
         fprintf(stderr, "Failed to add 'quantity' column\n");
         carquet_schema_free(schema);

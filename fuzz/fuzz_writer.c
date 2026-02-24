@@ -134,7 +134,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
             : CARQUET_REPETITION_REQUIRED;
 
         carquet_status_t status = carquet_schema_add_column(
-            schema, col_name, col_types[i], NULL, rep, 0);
+            schema, col_name, col_types[i], NULL, rep, 0, 0);
 
         if (status != CARQUET_OK) {
             free(col_types);

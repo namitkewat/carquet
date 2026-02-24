@@ -88,9 +88,9 @@ static double benchmark_write(const char* filename, int num_rows, carquet_compre
     carquet_error_t err = CARQUET_ERROR_INIT;
 
     carquet_schema_t* schema = carquet_schema_create(&err);
-    (void)carquet_schema_add_column(schema, "id", CARQUET_PHYSICAL_INT64, NULL, CARQUET_REPETITION_REQUIRED, 0);
-    (void)carquet_schema_add_column(schema, "value", CARQUET_PHYSICAL_DOUBLE, NULL, CARQUET_REPETITION_REQUIRED, 0);
-    (void)carquet_schema_add_column(schema, "category", CARQUET_PHYSICAL_INT32, NULL, CARQUET_REPETITION_REQUIRED, 0);
+    (void)carquet_schema_add_column(schema, "id", CARQUET_PHYSICAL_INT64, NULL, CARQUET_REPETITION_REQUIRED, 0, 0);
+    (void)carquet_schema_add_column(schema, "value", CARQUET_PHYSICAL_DOUBLE, NULL, CARQUET_REPETITION_REQUIRED, 0, 0);
+    (void)carquet_schema_add_column(schema, "category", CARQUET_PHYSICAL_INT32, NULL, CARQUET_REPETITION_REQUIRED, 0, 0);
 
     carquet_writer_options_t opts;
     carquet_writer_options_init(&opts);

@@ -58,6 +58,7 @@ typedef struct carquet_mmap_info {
 struct carquet_schema {
     carquet_arena_t arena;
     parquet_schema_element_t* elements;
+    int32_t* parent_indices;    /* Parent element index for each element (-1 for root) */
     int32_t num_elements;
     int32_t capacity;           /* Capacity of elements/leaf arrays */
 

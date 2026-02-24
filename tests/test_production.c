@@ -36,13 +36,13 @@ static int create_test_file(void) {
     if (!schema) return -1;
 
     (void)carquet_schema_add_column(schema, "id", CARQUET_PHYSICAL_INT32, NULL,
-        CARQUET_REPETITION_REQUIRED, 0);
+        CARQUET_REPETITION_REQUIRED, 0, 0);
     (void)carquet_schema_add_column(schema, "value", CARQUET_PHYSICAL_DOUBLE, NULL,
-        CARQUET_REPETITION_REQUIRED, 0);
+        CARQUET_REPETITION_REQUIRED, 0, 0);
     (void)carquet_schema_add_column(schema, "category", CARQUET_PHYSICAL_INT32, NULL,
-        CARQUET_REPETITION_REQUIRED, 0);
+        CARQUET_REPETITION_REQUIRED, 0, 0);
     (void)carquet_schema_add_column(schema, "score", CARQUET_PHYSICAL_FLOAT, NULL,
-        CARQUET_REPETITION_REQUIRED, 0);
+        CARQUET_REPETITION_REQUIRED, 0, 0);
 
     /* Writer options - small row groups for testing */
     carquet_writer_options_t opts;

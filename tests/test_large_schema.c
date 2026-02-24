@@ -51,7 +51,7 @@ static int test_large_schema_write(void) {
         }
 
         carquet_status_t status = carquet_schema_add_column(
-            schema, col_name, type, NULL, CARQUET_REPETITION_REQUIRED, 0);
+            schema, col_name, type, NULL, CARQUET_REPETITION_REQUIRED, 0, 0);
 
         if (status != CARQUET_OK) {
             printf("  Failed to add column %d\n", i);
@@ -321,7 +321,7 @@ static int test_very_large_schema(void) {
 
         carquet_status_t status = carquet_schema_add_column(
             schema, col_name, CARQUET_PHYSICAL_FLOAT, NULL,
-            CARQUET_REPETITION_REQUIRED, 0);
+            CARQUET_REPETITION_REQUIRED, 0, 0);
 
         if (status != CARQUET_OK) {
             printf("  Failed to add column %d\n", i);

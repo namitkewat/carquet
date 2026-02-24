@@ -85,7 +85,7 @@ static int test_schema_single_column(void) {
 
     carquet_status_t status = carquet_schema_add_column(
         schema, "value", CARQUET_PHYSICAL_INT32, NULL,
-        CARQUET_REPETITION_REQUIRED, 0);
+        CARQUET_REPETITION_REQUIRED, 0, 0);
 
     if (status != CARQUET_OK) {
         carquet_schema_free(schema);
@@ -115,27 +115,27 @@ static int test_schema_all_types(void) {
 
     /* Add one column of each physical type */
     status = carquet_schema_add_column(schema, "bool_col",
-        CARQUET_PHYSICAL_BOOLEAN, NULL, CARQUET_REPETITION_REQUIRED, 0);
+        CARQUET_PHYSICAL_BOOLEAN, NULL, CARQUET_REPETITION_REQUIRED, 0, 0);
     if (status != CARQUET_OK) goto fail;
 
     status = carquet_schema_add_column(schema, "int32_col",
-        CARQUET_PHYSICAL_INT32, NULL, CARQUET_REPETITION_REQUIRED, 0);
+        CARQUET_PHYSICAL_INT32, NULL, CARQUET_REPETITION_REQUIRED, 0, 0);
     if (status != CARQUET_OK) goto fail;
 
     status = carquet_schema_add_column(schema, "int64_col",
-        CARQUET_PHYSICAL_INT64, NULL, CARQUET_REPETITION_REQUIRED, 0);
+        CARQUET_PHYSICAL_INT64, NULL, CARQUET_REPETITION_REQUIRED, 0, 0);
     if (status != CARQUET_OK) goto fail;
 
     status = carquet_schema_add_column(schema, "float_col",
-        CARQUET_PHYSICAL_FLOAT, NULL, CARQUET_REPETITION_REQUIRED, 0);
+        CARQUET_PHYSICAL_FLOAT, NULL, CARQUET_REPETITION_REQUIRED, 0, 0);
     if (status != CARQUET_OK) goto fail;
 
     status = carquet_schema_add_column(schema, "double_col",
-        CARQUET_PHYSICAL_DOUBLE, NULL, CARQUET_REPETITION_REQUIRED, 0);
+        CARQUET_PHYSICAL_DOUBLE, NULL, CARQUET_REPETITION_REQUIRED, 0, 0);
     if (status != CARQUET_OK) goto fail;
 
     status = carquet_schema_add_column(schema, "binary_col",
-        CARQUET_PHYSICAL_BYTE_ARRAY, NULL, CARQUET_REPETITION_REQUIRED, 0);
+        CARQUET_PHYSICAL_BYTE_ARRAY, NULL, CARQUET_REPETITION_REQUIRED, 0, 0);
     if (status != CARQUET_OK) goto fail;
 
     int32_t num_cols = carquet_schema_num_columns(schema);
@@ -166,17 +166,17 @@ static int test_schema_repetition_types(void) {
 
     /* REQUIRED - must be present */
     status = carquet_schema_add_column(schema, "required_col",
-        CARQUET_PHYSICAL_INT32, NULL, CARQUET_REPETITION_REQUIRED, 0);
+        CARQUET_PHYSICAL_INT32, NULL, CARQUET_REPETITION_REQUIRED, 0, 0);
     if (status != CARQUET_OK) goto fail;
 
     /* OPTIONAL - may be null */
     status = carquet_schema_add_column(schema, "optional_col",
-        CARQUET_PHYSICAL_INT32, NULL, CARQUET_REPETITION_OPTIONAL, 0);
+        CARQUET_PHYSICAL_INT32, NULL, CARQUET_REPETITION_OPTIONAL, 0, 0);
     if (status != CARQUET_OK) goto fail;
 
     /* REPEATED - array of values */
     status = carquet_schema_add_column(schema, "repeated_col",
-        CARQUET_PHYSICAL_INT32, NULL, CARQUET_REPETITION_REPEATED, 0);
+        CARQUET_PHYSICAL_INT32, NULL, CARQUET_REPETITION_REPEATED, 0, 0);
     if (status != CARQUET_OK) goto fail;
 
     carquet_schema_free(schema);
@@ -285,7 +285,7 @@ static int test_writer_invalid_path(void) {
 
     carquet_schema_t* schema = carquet_schema_create(&err);
     carquet_schema_add_column(schema, "value", CARQUET_PHYSICAL_INT32, NULL,
-                              CARQUET_REPETITION_REQUIRED, 0);
+                              CARQUET_REPETITION_REQUIRED, 0, 0);
 
     /* Try to write to non-existent directory */
     carquet_writer_t* writer = carquet_writer_create(
@@ -315,7 +315,7 @@ static int test_roundtrip_single_row(void) {
     /* Create schema */
     carquet_schema_t* schema = carquet_schema_create(&err);
     carquet_schema_add_column(schema, "value", CARQUET_PHYSICAL_INT32, NULL,
-                              CARQUET_REPETITION_REQUIRED, 0);
+                              CARQUET_REPETITION_REQUIRED, 0, 0);
 
     /* Write single row */
     carquet_writer_t* writer = carquet_writer_create(path, schema, NULL, &err);

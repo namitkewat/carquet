@@ -168,9 +168,9 @@ int main(void) {
     // Create schema with two columns
     carquet_schema_t* schema = carquet_schema_create(&err);
     carquet_schema_add_column(schema, "id", CARQUET_PHYSICAL_INT32,
-                              NULL, CARQUET_REPETITION_REQUIRED, 0);
+                              NULL, CARQUET_REPETITION_REQUIRED, 0, 0);
     carquet_schema_add_column(schema, "value", CARQUET_PHYSICAL_DOUBLE,
-                              NULL, CARQUET_REPETITION_REQUIRED, 0);
+                              NULL, CARQUET_REPETITION_REQUIRED, 0, 0);
 
     // Write data
     carquet_writer_t* writer = carquet_writer_create("test.parquet", schema, NULL, &err);
@@ -355,11 +355,11 @@ carquet_schema_t* schema = carquet_schema_create(&err);
 
 // Add required column (non-nullable)
 carquet_schema_add_column(schema, "id", CARQUET_PHYSICAL_INT64,
-                          NULL, CARQUET_REPETITION_REQUIRED, 0);
+                          NULL, CARQUET_REPETITION_REQUIRED, 0, 0);
 
 // Add optional column (nullable)
 carquet_schema_add_column(schema, "name", CARQUET_PHYSICAL_BYTE_ARRAY,
-                          NULL, CARQUET_REPETITION_OPTIONAL, 0);
+                          NULL, CARQUET_REPETITION_OPTIONAL, 0, 0);
 
 // Add column with logical type
 carquet_logical_type_t timestamp_type = {
@@ -367,7 +367,7 @@ carquet_logical_type_t timestamp_type = {
     .timestamp = { .unit = CARQUET_TIME_MILLIS, .is_adjusted_to_utc = true }
 };
 carquet_schema_add_column(schema, "created_at", CARQUET_PHYSICAL_INT64,
-                          &timestamp_type, CARQUET_REPETITION_REQUIRED, 0);
+                          &timestamp_type, CARQUET_REPETITION_REQUIRED, 0, 0);
 ```
 
 ### Writer Options
@@ -489,7 +489,7 @@ int32_t person_idx = carquet_schema_add_group(schema, "person",
 
 // Add leaf columns under person
 carquet_schema_add_column(schema, "name", CARQUET_PHYSICAL_BYTE_ARRAY,
-                          NULL, CARQUET_REPETITION_REQUIRED, person_idx);
+                          NULL, CARQUET_REPETITION_REQUIRED, 0, person_idx);
 
 // Add nested group for address
 int32_t address_idx = carquet_schema_add_group(schema, "address",
@@ -497,9 +497,9 @@ int32_t address_idx = carquet_schema_add_group(schema, "address",
 
 // Add columns under address
 carquet_schema_add_column(schema, "street", CARQUET_PHYSICAL_BYTE_ARRAY,
-                          NULL, CARQUET_REPETITION_REQUIRED, address_idx);
+                          NULL, CARQUET_REPETITION_REQUIRED, 0, address_idx);
 carquet_schema_add_column(schema, "city", CARQUET_PHYSICAL_BYTE_ARRAY,
-                          NULL, CARQUET_REPETITION_REQUIRED, address_idx);
+                          NULL, CARQUET_REPETITION_REQUIRED, 0, address_idx);
 ```
 
 ## Compression
@@ -692,6 +692,7 @@ int32_t carquet_schema_add_column(carquet_schema_t* schema, const char* name,
                                    carquet_physical_type_t type,
                                    const carquet_logical_type_t* logical_type,
                                    carquet_field_repetition_t repetition,
+                                   int32_t type_length,
                                    int32_t parent_index);
 int32_t carquet_schema_add_group(carquet_schema_t* schema, const char* name,
                                   carquet_field_repetition_t repetition,

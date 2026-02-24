@@ -80,19 +80,19 @@ static int write_test_file(const char* path, carquet_compression_t codec) {
 
     /* All major types */
     (void)carquet_schema_add_column(schema, "bool_col", CARQUET_PHYSICAL_BOOLEAN,
-                                    NULL, CARQUET_REPETITION_REQUIRED, 0);
+                                    NULL, CARQUET_REPETITION_REQUIRED, 0, 0);
     (void)carquet_schema_add_column(schema, "int32_col", CARQUET_PHYSICAL_INT32,
-                                    NULL, CARQUET_REPETITION_REQUIRED, 0);
+                                    NULL, CARQUET_REPETITION_REQUIRED, 0, 0);
     (void)carquet_schema_add_column(schema, "int64_col", CARQUET_PHYSICAL_INT64,
-                                    NULL, CARQUET_REPETITION_REQUIRED, 0);
+                                    NULL, CARQUET_REPETITION_REQUIRED, 0, 0);
     (void)carquet_schema_add_column(schema, "float_col", CARQUET_PHYSICAL_FLOAT,
-                                    NULL, CARQUET_REPETITION_REQUIRED, 0);
+                                    NULL, CARQUET_REPETITION_REQUIRED, 0, 0);
     (void)carquet_schema_add_column(schema, "double_col", CARQUET_PHYSICAL_DOUBLE,
-                                    NULL, CARQUET_REPETITION_REQUIRED, 0);
+                                    NULL, CARQUET_REPETITION_REQUIRED, 0, 0);
     (void)carquet_schema_add_column(schema, "string_col", CARQUET_PHYSICAL_BYTE_ARRAY,
-                                    NULL, CARQUET_REPETITION_OPTIONAL, 0);
+                                    NULL, CARQUET_REPETITION_OPTIONAL, 0, 0);
     (void)carquet_schema_add_column(schema, "nullable_int", CARQUET_PHYSICAL_INT32,
-                                    NULL, CARQUET_REPETITION_OPTIONAL, 0);
+                                    NULL, CARQUET_REPETITION_OPTIONAL, 0, 0);
 
     carquet_writer_options_t opts;
     carquet_writer_options_init(&opts);

@@ -48,6 +48,7 @@ typedef struct {
     int16_t* max_def;
     int16_t* max_rep;
     int32_t* leaf_indices;
+    int32_t* parent_indices;
     int32_t leaf_idx;
 } schema_traverse_ctx_t;
 
@@ -63,6 +64,7 @@ typedef struct {
 static int32_t traverse_schema_recursive(
     schema_traverse_ctx_t* ctx,
     int32_t element_idx,
+    int32_t parent_idx,
     int16_t def_level,
     int16_t rep_level) {
 
@@ -71,6 +73,11 @@ static int32_t traverse_schema_recursive(
     }
 
     const parquet_schema_element_t* elem = &ctx->elements[element_idx];
+
+    /* Record parent index */
+    if (ctx->parent_indices) {
+        ctx->parent_indices[element_idx] = parent_idx;
+    }
 
     /* Calculate level contribution from this node's repetition type */
     int16_t this_def = def_level;
@@ -106,7 +113,7 @@ static int32_t traverse_schema_recursive(
     /* Group node - recursively process children */
     int32_t next_idx = element_idx + 1;
     for (int32_t child = 0; child < elem->num_children; child++) {
-        next_idx = traverse_schema_recursive(ctx, next_idx, this_def, this_rep);
+        next_idx = traverse_schema_recursive(ctx, next_idx, element_idx, this_def, this_rep);
     }
 
     return next_idx;
@@ -137,10 +144,15 @@ static void compute_levels(
     int32_t num_elements,
     int16_t* max_def,
     int16_t* max_rep,
-    int32_t* leaf_indices) {
+    int32_t* leaf_indices,
+    int32_t* parent_indices) {
 
     if (num_elements <= 1) {
         return;  /* Empty or root-only schema */
+    }
+
+    if (parent_indices) {
+        parent_indices[0] = -1;  /* Root has no parent */
     }
 
     schema_traverse_ctx_t ctx = {
@@ -149,6 +161,7 @@ static void compute_levels(
         .max_def = max_def,
         .max_rep = max_rep,
         .leaf_indices = leaf_indices,
+        .parent_indices = parent_indices,
         .leaf_idx = 0
     };
 
@@ -158,7 +171,7 @@ static void compute_levels(
     const parquet_schema_element_t* root = &elements[0];
     int32_t next_idx = 1;
     for (int32_t child = 0; child < root->num_children; child++) {
-        next_idx = traverse_schema_recursive(&ctx, next_idx, 0, 0);
+        next_idx = traverse_schema_recursive(&ctx, next_idx, 0, 0, 0);
     }
 }
 
@@ -178,18 +191,20 @@ carquet_schema_t* build_schema(
     schema->capacity = metadata->num_schema_elements;  /* Fixed size from file */
     schema->num_leaves = count_leaves(metadata->schema, metadata->num_schema_elements);
 
+    schema->parent_indices = carquet_arena_calloc(arena, schema->num_elements, sizeof(int32_t));
     schema->leaf_indices = carquet_arena_calloc(arena, schema->num_leaves, sizeof(int32_t));
     schema->max_def_levels = carquet_arena_calloc(arena, schema->num_leaves, sizeof(int16_t));
     schema->max_rep_levels = carquet_arena_calloc(arena, schema->num_leaves, sizeof(int16_t));
 
-    if (!schema->leaf_indices || !schema->max_def_levels || !schema->max_rep_levels) {
+    if (!schema->parent_indices || !schema->leaf_indices ||
+        !schema->max_def_levels || !schema->max_rep_levels) {
         CARQUET_SET_ERROR(error, CARQUET_ERROR_OUT_OF_MEMORY, "Failed to allocate schema arrays");
         return NULL;
     }
 
     compute_levels(schema->elements, schema->num_elements,
                    schema->max_def_levels, schema->max_rep_levels,
-                   schema->leaf_indices);
+                   schema->leaf_indices, schema->parent_indices);
 
     return schema;
 }

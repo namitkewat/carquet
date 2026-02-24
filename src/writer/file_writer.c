@@ -114,6 +114,10 @@ struct carquet_writer {
     int32_t num_columns;
     int32_t column_capacity;
 
+    /* Full schema elements (including groups) for metadata serialization */
+    parquet_schema_element_t* schema_elements;
+    int32_t num_schema_elements;
+
     /* Options */
     carquet_writer_options_t options;
 
@@ -189,7 +193,9 @@ static carquet_status_t add_column_internal(
     carquet_physical_type_t physical_type,
     const carquet_logical_type_t* logical_type,
     carquet_field_repetition_t repetition,
-    int32_t type_length) {
+    int32_t type_length,
+    int16_t max_def_level,
+    int16_t max_rep_level) {
 
     /* Expand capacity if needed */
     if (writer->num_columns >= writer->column_capacity) {
@@ -227,12 +233,35 @@ static carquet_status_t add_column_internal(
         col->logical_type = *logical_type;
     }
 
-    /* Compute definition level based on repetition */
-    col->max_def_level = (repetition == CARQUET_REPETITION_OPTIONAL) ? 1 : 0;
-    col->max_rep_level = (repetition == CARQUET_REPETITION_REPEATED) ? 1 : 0;
+    col->max_def_level = max_def_level;
+    col->max_rep_level = max_rep_level;
 
     writer->column_values_written[writer->num_columns] = 0;
     writer->num_columns++;
+
+    return CARQUET_OK;
+}
+
+/* Store the full schema elements (including groups) for metadata serialization */
+static carquet_status_t store_schema_elements(
+    carquet_writer_t* writer,
+    const carquet_schema_t* schema) {
+
+    writer->num_schema_elements = schema->num_elements;
+    writer->schema_elements = calloc(schema->num_elements, sizeof(parquet_schema_element_t));
+    if (!writer->schema_elements) {
+        return CARQUET_ERROR_OUT_OF_MEMORY;
+    }
+
+    for (int32_t i = 0; i < schema->num_elements; i++) {
+        writer->schema_elements[i] = schema->elements[i];
+        if (schema->elements[i].name) {
+            writer->schema_elements[i].name = strdup(schema->elements[i].name);
+            if (!writer->schema_elements[i].name) {
+                return CARQUET_ERROR_OUT_OF_MEMORY;
+            }
+        }
+    }
 
     return CARQUET_OK;
 }
@@ -392,37 +421,21 @@ static carquet_status_t build_file_metadata(
     metadata->created_by = carquet_arena_strdup(&writer->arena,
         writer->options.created_by ? writer->options.created_by : "Carquet");
 
-    /* Build schema: root group + leaf columns */
-    int32_t num_schema_elements = 1 + writer->num_columns;
-    metadata->num_schema_elements = num_schema_elements;
-    metadata->schema = carquet_arena_calloc(&writer->arena, num_schema_elements,
+    /* Build schema from stored elements (includes groups for nested schemas) */
+    metadata->num_schema_elements = writer->num_schema_elements;
+    metadata->schema = carquet_arena_calloc(&writer->arena, writer->num_schema_elements,
         sizeof(parquet_schema_element_t));
 
     if (!metadata->schema) {
         return CARQUET_ERROR_OUT_OF_MEMORY;
     }
 
-    /* Root element */
-    parquet_schema_element_t* root = &metadata->schema[0];
-    root->name = carquet_arena_strdup(&writer->arena, "schema");
-    root->num_children = writer->num_columns;
-    root->has_repetition = false;
-
-    /* Column elements */
-    for (int32_t i = 0; i < writer->num_columns; i++) {
-        writer_column_def_t* col = &writer->columns[i];
-        parquet_schema_element_t* elem = &metadata->schema[1 + i];
-
-        elem->name = carquet_arena_strdup(&writer->arena, col->name);
-        elem->has_type = true;
-        elem->type = col->physical_type;
-        elem->has_repetition = true;
-        elem->repetition_type = col->repetition;
-        elem->type_length = col->type_length;
-
-        if (col->logical_type.id != CARQUET_LOGICAL_UNKNOWN) {
-            elem->has_logical_type = true;
-            elem->logical_type = col->logical_type;
+    for (int32_t i = 0; i < writer->num_schema_elements; i++) {
+        metadata->schema[i] = writer->schema_elements[i];
+        /* Duplicate strings into arena so they outlive the writer */
+        if (writer->schema_elements[i].name) {
+            metadata->schema[i].name = carquet_arena_strdup(
+                &writer->arena, writer->schema_elements[i].name);
         }
     }
 
@@ -492,7 +505,17 @@ carquet_writer_t* carquet_writer_create(
         carquet_writer_options_init(&writer->options);
     }
 
-    /* Add columns from schema (schema is nonnull per API contract) */
+    /* Store full schema elements for metadata serialization */
+    {
+        carquet_status_t status = store_schema_elements(writer, schema);
+        if (status != CARQUET_OK) {
+            carquet_writer_abort(writer);
+            CARQUET_SET_ERROR(error, status, "Failed to store schema elements");
+            return NULL;
+        }
+    }
+
+    /* Add leaf columns from schema (schema is nonnull per API contract) */
     for (int32_t i = 0; i < schema->num_leaves; i++) {
         int32_t elem_idx = schema->leaf_indices[i];
         parquet_schema_element_t* elem = &schema->elements[elem_idx];
@@ -505,7 +528,9 @@ carquet_writer_t* carquet_writer_create(
             elem->type,
             lt,
             elem->repetition_type,
-            elem->type_length);
+            elem->type_length,
+            schema->max_def_levels[i],
+            schema->max_rep_levels[i]);
 
         if (status != CARQUET_OK) {
             carquet_writer_abort(writer);
@@ -547,7 +572,17 @@ carquet_writer_t* carquet_writer_create_file(
         carquet_writer_options_init(&writer->options);
     }
 
-    /* Add columns from schema (schema is nonnull per API contract) */
+    /* Store full schema elements for metadata serialization */
+    {
+        carquet_status_t status = store_schema_elements(writer, schema);
+        if (status != CARQUET_OK) {
+            carquet_writer_abort(writer);
+            CARQUET_SET_ERROR(error, status, "Failed to store schema elements");
+            return NULL;
+        }
+    }
+
+    /* Add leaf columns from schema (schema is nonnull per API contract) */
     for (int32_t i = 0; i < schema->num_leaves; i++) {
         int32_t elem_idx = schema->leaf_indices[i];
         parquet_schema_element_t* elem = &schema->elements[elem_idx];
@@ -560,7 +595,9 @@ carquet_writer_t* carquet_writer_create_file(
             elem->type,
             lt,
             elem->repetition_type,
-            elem->type_length);
+            elem->type_length,
+            schema->max_def_levels[i],
+            schema->max_rep_levels[i]);
 
         if (status != CARQUET_OK) {
             carquet_writer_abort(writer);
@@ -717,6 +754,14 @@ cleanup:
         free(writer->columns);
     }
 
+    /* Free schema elements */
+    if (writer->schema_elements) {
+        for (int32_t i = 0; i < writer->num_schema_elements; i++) {
+            free(writer->schema_elements[i].name);
+        }
+        free(writer->schema_elements);
+    }
+
     free(writer->column_values_written);
     free(writer->row_groups);
     free(writer->path);
@@ -751,6 +796,14 @@ void carquet_writer_abort(carquet_writer_t* writer) {
             free(writer->columns[i].name);
         }
         free(writer->columns);
+    }
+
+    /* Free schema elements */
+    if (writer->schema_elements) {
+        for (int32_t i = 0; i < writer->num_schema_elements; i++) {
+            free(writer->schema_elements[i].name);
+        }
+        free(writer->schema_elements);
     }
 
     free(writer->column_values_written);

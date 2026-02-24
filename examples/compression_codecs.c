@@ -55,11 +55,11 @@ static carquet_schema_t* create_schema(void) {
     carquet_logical_type_t string_type = { .id = CARQUET_LOGICAL_STRING };
 
 (void)carquet_schema_add_column(schema, "id",
-        CARQUET_PHYSICAL_INT64, NULL, CARQUET_REPETITION_REQUIRED, 0);
+        CARQUET_PHYSICAL_INT64, NULL, CARQUET_REPETITION_REQUIRED, 0, 0);
 (void)carquet_schema_add_column(schema, "value",
-        CARQUET_PHYSICAL_DOUBLE, NULL, CARQUET_REPETITION_REQUIRED, 0);
+        CARQUET_PHYSICAL_DOUBLE, NULL, CARQUET_REPETITION_REQUIRED, 0, 0);
 (void)carquet_schema_add_column(schema, "category",
-        CARQUET_PHYSICAL_BYTE_ARRAY, &string_type, CARQUET_REPETITION_REQUIRED, 0);
+        CARQUET_PHYSICAL_BYTE_ARRAY, &string_type, CARQUET_REPETITION_REQUIRED, 0, 0);
 
     return schema;
 }

@@ -1,7 +1,7 @@
 /**
  * @file carquet.h
  * @brief Carquet - High-Performance Pure C Parquet Library
- * @version 0.1.1
+ * @version 0.1.2
  *
  * @copyright Copyright (c) 2025. All rights reserved.
  * @license MIT License
@@ -196,10 +196,10 @@ extern "C" {
 #define CARQUET_VERSION_MINOR 1
 
 /** @brief Patch version number */
-#define CARQUET_VERSION_PATCH 1
+#define CARQUET_VERSION_PATCH 2
 
 /** @brief Version string in "MAJOR.MINOR.PATCH" format */
-#define CARQUET_VERSION_STRING "0.1.1"
+#define CARQUET_VERSION_STRING "0.1.2"
 
 /** @brief Numeric version for compile-time comparisons: (MAJOR * 10000 + MINOR * 100 + PATCH) */
 #define CARQUET_VERSION_NUMBER (CARQUET_VERSION_MAJOR * 10000 + CARQUET_VERSION_MINOR * 100 + CARQUET_VERSION_PATCH)
@@ -517,6 +517,7 @@ void carquet_schema_free(carquet_schema_t* schema);
  * @param[in] logical_type Logical type annotation (may be NULL)
  * @param[in] repetition Field repetition level
  * @param[in] type_length Byte length for FIXED_LEN_BYTE_ARRAY (0 otherwise)
+ * @param[in] parent_index Parent group index (0 for root level, or index from add_group)
  * @return CARQUET_OK on success, error code on failure
  *
  * @note Thread-safe: No (schema is mutable during construction)
@@ -531,17 +532,17 @@ void carquet_schema_free(carquet_schema_t* schema);
  * - CARQUET_PHYSICAL_FIXED_LEN_BYTE_ARRAY: Fixed-length byte sequence
  *
  * @code{.c}
- * // Required INT64 column
+ * // Required INT64 column at root
  * carquet_schema_add_column(schema, "id", CARQUET_PHYSICAL_INT64,
- *                           NULL, CARQUET_REPETITION_REQUIRED, 0);
+ *                           NULL, CARQUET_REPETITION_REQUIRED, 0, 0);
  *
- * // Optional string column
+ * // Optional string column at root
  * carquet_schema_add_column(schema, "name", CARQUET_PHYSICAL_BYTE_ARRAY,
- *                           NULL, CARQUET_REPETITION_OPTIONAL, 0);
+ *                           NULL, CARQUET_REPETITION_OPTIONAL, 0, 0);
  *
- * // Fixed-length UUID column
+ * // Fixed-length UUID column at root
  * carquet_schema_add_column(schema, "uuid", CARQUET_PHYSICAL_FIXED_LEN_BYTE_ARRAY,
- *                           NULL, CARQUET_REPETITION_REQUIRED, 16);
+ *                           NULL, CARQUET_REPETITION_REQUIRED, 16, 0);
  * @endcode
  */
 CARQUET_API CARQUET_WARN_UNUSED_RESULT CARQUET_NONNULL(1, 2)
@@ -551,7 +552,8 @@ carquet_status_t carquet_schema_add_column(
     carquet_physical_type_t physical_type,
     const carquet_logical_type_t* logical_type,
     carquet_field_repetition_t repetition,
-    int32_t type_length);
+    int32_t type_length,
+    int32_t parent_index);
 
 /**
  * @brief Add a group (struct) to the schema for nested structures.
@@ -572,9 +574,9 @@ carquet_status_t carquet_schema_add_column(
  * int32_t address_idx = carquet_schema_add_group(schema, "address",
  *                                                 CARQUET_REPETITION_OPTIONAL, 0);
  * carquet_schema_add_column(schema, "street", CARQUET_PHYSICAL_BYTE_ARRAY,
- *                           NULL, CARQUET_REPETITION_REQUIRED, address_idx);
+ *                           NULL, CARQUET_REPETITION_REQUIRED, 0, address_idx);
  * carquet_schema_add_column(schema, "city", CARQUET_PHYSICAL_BYTE_ARRAY,
- *                           NULL, CARQUET_REPETITION_REQUIRED, address_idx);
+ *                           NULL, CARQUET_REPETITION_REQUIRED, 0, address_idx);
  * @endcode
  */
 CARQUET_API CARQUET_WARN_UNUSED_RESULT CARQUET_NONNULL(1, 2)

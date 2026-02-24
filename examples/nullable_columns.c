@@ -43,23 +43,23 @@ static carquet_schema_t* create_schema_with_nullables(void) {
 
     /* Required column (always has a value) */
 (void)carquet_schema_add_column(schema, "id",
-        CARQUET_PHYSICAL_INT64, NULL, CARQUET_REPETITION_REQUIRED, 0);
+        CARQUET_PHYSICAL_INT64, NULL, CARQUET_REPETITION_REQUIRED, 0, 0);
 
     /* Required string column */
 (void)carquet_schema_add_column(schema, "name",
-        CARQUET_PHYSICAL_BYTE_ARRAY, &string_type, CARQUET_REPETITION_REQUIRED, 0);
+        CARQUET_PHYSICAL_BYTE_ARRAY, &string_type, CARQUET_REPETITION_REQUIRED, 0, 0);
 
     /* Optional integer column (can be NULL) */
 (void)carquet_schema_add_column(schema, "age",
-        CARQUET_PHYSICAL_INT32, NULL, CARQUET_REPETITION_OPTIONAL, 0);
+        CARQUET_PHYSICAL_INT32, NULL, CARQUET_REPETITION_OPTIONAL, 0, 0);
 
     /* Optional double column (can be NULL) */
 (void)carquet_schema_add_column(schema, "score",
-        CARQUET_PHYSICAL_DOUBLE, NULL, CARQUET_REPETITION_OPTIONAL, 0);
+        CARQUET_PHYSICAL_DOUBLE, NULL, CARQUET_REPETITION_OPTIONAL, 0, 0);
 
     /* Optional string column (can be NULL) */
 (void)carquet_schema_add_column(schema, "email",
-        CARQUET_PHYSICAL_BYTE_ARRAY, &string_type, CARQUET_REPETITION_OPTIONAL, 0);
+        CARQUET_PHYSICAL_BYTE_ARRAY, &string_type, CARQUET_REPETITION_OPTIONAL, 0, 0);
 
     printf("Schema created:\n");
     printf("  - id: INT64 (REQUIRED)\n");

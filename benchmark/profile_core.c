@@ -262,17 +262,17 @@ static carquet_schema_t* create_schema(void) {
     if (!schema) return NULL;
 
     (void)carquet_schema_add_column(schema, "id", CARQUET_PHYSICAL_INT64,
-                                    NULL, CARQUET_REPETITION_REQUIRED, 0);
+                                    NULL, CARQUET_REPETITION_REQUIRED, 0, 0);
     (void)carquet_schema_add_column(schema, "value_i32", CARQUET_PHYSICAL_INT32,
-                                    NULL, CARQUET_REPETITION_REQUIRED, 0);
+                                    NULL, CARQUET_REPETITION_REQUIRED, 0, 0);
     (void)carquet_schema_add_column(schema, "value_f64", CARQUET_PHYSICAL_DOUBLE,
-                                    NULL, CARQUET_REPETITION_REQUIRED, 0);
+                                    NULL, CARQUET_REPETITION_REQUIRED, 0, 0);
     (void)carquet_schema_add_column(schema, "value_f32", CARQUET_PHYSICAL_FLOAT,
-                                    NULL, CARQUET_REPETITION_REQUIRED, 0);
+                                    NULL, CARQUET_REPETITION_REQUIRED, 0, 0);
     (void)carquet_schema_add_column(schema, "category", CARQUET_PHYSICAL_INT32,
-                                    NULL, CARQUET_REPETITION_REQUIRED, 0);
+                                    NULL, CARQUET_REPETITION_REQUIRED, 0, 0);
     (void)carquet_schema_add_column(schema, "nullable_val", CARQUET_PHYSICAL_DOUBLE,
-                                    NULL, CARQUET_REPETITION_OPTIONAL, 0);
+                                    NULL, CARQUET_REPETITION_OPTIONAL, 0, 0);
 
     return schema;
 }

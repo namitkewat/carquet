@@ -48,6 +48,17 @@ carquet_schema_t* carquet_schema_create(carquet_error_t* error) {
     schema->elements[0].name = carquet_arena_strdup(&schema->arena, "schema");
     schema->elements[0].num_children = 0;
 
+    /* Allocate parent index tracking */
+    schema->parent_indices = calloc(schema->capacity, sizeof(int32_t));
+    if (!schema->parent_indices) {
+        free(schema->elements);
+        carquet_arena_destroy(&schema->arena);
+        free(schema);
+        CARQUET_SET_ERROR(error, CARQUET_ERROR_OUT_OF_MEMORY, "Failed to allocate parent indices");
+        return NULL;
+    }
+    schema->parent_indices[0] = -1;  /* Root has no parent */
+
     /* Allocate leaf tracking arrays with malloc */
     schema->leaf_indices = calloc(schema->capacity, sizeof(int32_t));
     schema->max_def_levels = calloc(schema->capacity, sizeof(int16_t));
@@ -56,6 +67,7 @@ carquet_schema_t* carquet_schema_create(carquet_error_t* error) {
 
     if (!schema->leaf_indices || !schema->max_def_levels || !schema->max_rep_levels) {
         free(schema->elements);
+        free(schema->parent_indices);
         free(schema->leaf_indices);
         free(schema->max_def_levels);
         free(schema->max_rep_levels);
@@ -71,6 +83,7 @@ carquet_schema_t* carquet_schema_create(carquet_error_t* error) {
 void carquet_schema_free(carquet_schema_t* schema) {
     if (schema) {
         free(schema->elements);
+        free(schema->parent_indices);
         free(schema->leaf_indices);
         free(schema->max_def_levels);
         free(schema->max_rep_levels);
@@ -99,6 +112,13 @@ static carquet_status_t schema_ensure_capacity(carquet_schema_t* schema, int32_t
     memset(new_elements + schema->capacity, 0,
            (new_capacity - schema->capacity) * sizeof(parquet_schema_element_t));
     schema->elements = new_elements;
+
+    int32_t* new_parent_indices = realloc(
+        schema->parent_indices, new_capacity * sizeof(int32_t));
+    if (!new_parent_indices) {
+        return CARQUET_ERROR_OUT_OF_MEMORY;
+    }
+    schema->parent_indices = new_parent_indices;
 
     int32_t* new_leaf_indices = realloc(
         schema->leaf_indices, new_capacity * sizeof(int32_t));
@@ -136,9 +156,22 @@ carquet_status_t carquet_schema_add_column(
     carquet_physical_type_t physical_type,
     const carquet_logical_type_t* logical_type,
     carquet_field_repetition_t repetition,
-    int32_t type_length) {
+    int32_t type_length,
+    int32_t parent_index) {
 
     /* schema and name are nonnull per API contract */
+
+    /* Validate parent_index: -1 or 0 means root, otherwise must be a valid group */
+    if (parent_index == -1) {
+        parent_index = 0;
+    }
+    if (parent_index < 0 || parent_index >= schema->num_elements) {
+        return CARQUET_ERROR_INVALID_ARGUMENT;
+    }
+    /* Parent must be root (index 0) or a group (no physical type) */
+    if (parent_index != 0 && schema->elements[parent_index].has_type) {
+        return CARQUET_ERROR_INVALID_ARGUMENT;
+    }
 
     /* Ensure capacity for new element */
     carquet_status_t status = schema_ensure_capacity(schema, schema->num_elements + 1);
@@ -164,12 +197,36 @@ carquet_status_t carquet_schema_add_column(
     }
 
     schema->num_elements++;
-    schema->elements[0].num_children++;
+    schema->parent_indices[elem_idx] = parent_index;
+    schema->elements[parent_index].num_children++;
+
+    /* Compute definition and repetition levels by walking the parent chain */
+    int16_t def_level = 0;
+    int16_t rep_level = 0;
+
+    if (repetition == CARQUET_REPETITION_OPTIONAL) {
+        def_level++;
+    } else if (repetition == CARQUET_REPETITION_REPEATED) {
+        def_level++;
+        rep_level++;
+    }
+
+    int32_t ancestor = parent_index;
+    while (ancestor > 0) {
+        carquet_field_repetition_t ancestor_rep = schema->elements[ancestor].repetition_type;
+        if (ancestor_rep == CARQUET_REPETITION_OPTIONAL) {
+            def_level++;
+        } else if (ancestor_rep == CARQUET_REPETITION_REPEATED) {
+            def_level++;
+            rep_level++;
+        }
+        ancestor = schema->parent_indices[ancestor];
+    }
 
     /* Track as leaf */
     schema->leaf_indices[schema->num_leaves] = elem_idx;
-    schema->max_def_levels[schema->num_leaves] = (repetition == CARQUET_REPETITION_OPTIONAL) ? 1 : 0;
-    schema->max_rep_levels[schema->num_leaves] = (repetition == CARQUET_REPETITION_REPEATED) ? 1 : 0;
+    schema->max_def_levels[schema->num_leaves] = def_level;
+    schema->max_rep_levels[schema->num_leaves] = rep_level;
     schema->num_leaves++;
 
     return CARQUET_OK;
@@ -182,8 +239,14 @@ int32_t carquet_schema_add_group(
     int32_t parent_index) {
 
     /* schema and name are nonnull per API contract */
-    /* For now, only support adding to root */
-    if (parent_index != -1 && parent_index != 0) {
+    if (parent_index == -1) {
+        parent_index = 0;
+    }
+    if (parent_index < 0 || parent_index >= schema->num_elements) {
+        return -1;
+    }
+    /* Parent must be root (index 0) or a group (no physical type) */
+    if (parent_index != 0 && schema->elements[parent_index].has_type) {
         return -1;
     }
 
@@ -203,7 +266,8 @@ int32_t carquet_schema_add_group(
     elem->num_children = 0;
 
     schema->num_elements++;
-    schema->elements[0].num_children++;
+    schema->parent_indices[elem_idx] = parent_index;
+    schema->elements[parent_index].num_children++;
 
     return elem_idx;
 }

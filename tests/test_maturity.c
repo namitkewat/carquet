@@ -104,7 +104,7 @@ static int test_type_boolean(void) {
     if (!schema) TEST_FAIL("type_boolean", "schema creation failed");
 
 (void)carquet_schema_add_column(schema, "bool_col", CARQUET_PHYSICAL_BOOLEAN, NULL,
-        CARQUET_REPETITION_REQUIRED, 0);
+        CARQUET_REPETITION_REQUIRED, 0, 0);
 
     /* Write test data with various patterns */
     carquet_writer_options_t opts;
@@ -199,7 +199,7 @@ static int test_type_int32(void) {
     if (!schema) TEST_FAIL("type_int32", "schema creation failed");
 
 (void)carquet_schema_add_column(schema, "int32_col", CARQUET_PHYSICAL_INT32, NULL,
-        CARQUET_REPETITION_REQUIRED, 0);
+        CARQUET_REPETITION_REQUIRED, 0, 0);
 
     carquet_writer_options_t opts;
     carquet_writer_options_init(&opts);
@@ -282,7 +282,7 @@ static int test_type_int64(void) {
     if (!schema) TEST_FAIL("type_int64", "schema creation failed");
 
 (void)carquet_schema_add_column(schema, "int64_col", CARQUET_PHYSICAL_INT64, NULL,
-        CARQUET_REPETITION_REQUIRED, 0);
+        CARQUET_REPETITION_REQUIRED, 0, 0);
 
     carquet_writer_options_t opts;
     carquet_writer_options_init(&opts);
@@ -360,7 +360,7 @@ static int test_type_float(void) {
     if (!schema) TEST_FAIL("type_float", "schema creation failed");
 
 (void)carquet_schema_add_column(schema, "float_col", CARQUET_PHYSICAL_FLOAT, NULL,
-        CARQUET_REPETITION_REQUIRED, 0);
+        CARQUET_REPETITION_REQUIRED, 0, 0);
 
     carquet_writer_options_t opts;
     carquet_writer_options_init(&opts);
@@ -453,7 +453,7 @@ static int test_type_double(void) {
     if (!schema) TEST_FAIL("type_double", "schema creation failed");
 
 (void)carquet_schema_add_column(schema, "double_col", CARQUET_PHYSICAL_DOUBLE, NULL,
-        CARQUET_REPETITION_REQUIRED, 0);
+        CARQUET_REPETITION_REQUIRED, 0, 0);
 
     carquet_writer_options_t opts;
     carquet_writer_options_init(&opts);
@@ -541,7 +541,7 @@ static int test_type_byte_array(void) {
     if (!schema) TEST_FAIL("type_byte_array", "schema creation failed");
 
 (void)carquet_schema_add_column(schema, "string_col", CARQUET_PHYSICAL_BYTE_ARRAY, NULL,
-        CARQUET_REPETITION_REQUIRED, 0);
+        CARQUET_REPETITION_REQUIRED, 0, 0);
 
     carquet_writer_options_t opts;
     carquet_writer_options_init(&opts);
@@ -604,7 +604,7 @@ static int test_edge_single_row(void) {
     if (!schema) TEST_FAIL("edge_single_row", "schema creation failed");
 
 (void)carquet_schema_add_column(schema, "id", CARQUET_PHYSICAL_INT32, NULL,
-        CARQUET_REPETITION_REQUIRED, 0);
+        CARQUET_REPETITION_REQUIRED, 0, 0);
 
     carquet_writer_options_t opts;
     carquet_writer_options_init(&opts);
@@ -654,7 +654,7 @@ static int test_edge_many_columns(void) {
     for (int i = 0; i < NUM_COLS; i++) {
         snprintf(col_name, sizeof(col_name), "col_%03d", i);
         carquet_status_t status = carquet_schema_add_column(schema, col_name, CARQUET_PHYSICAL_INT32, NULL,
-            CARQUET_REPETITION_REQUIRED, 0);
+            CARQUET_REPETITION_REQUIRED, 0, 0);
         if (status != CARQUET_OK) {
             printf("  Failed to add column %d: status=%d\n", i, status);
             carquet_schema_free(schema);
@@ -721,7 +721,7 @@ static int test_edge_many_row_groups(void) {
     if (!schema) TEST_FAIL("edge_many_row_groups", "schema creation failed");
 
 (void)carquet_schema_add_column(schema, "id", CARQUET_PHYSICAL_INT32, NULL,
-        CARQUET_REPETITION_REQUIRED, 0);
+        CARQUET_REPETITION_REQUIRED, 0, 0);
 
     carquet_writer_options_t opts;
     carquet_writer_options_init(&opts);
@@ -789,7 +789,7 @@ static int test_nullable_all_null(void) {
     if (!schema) TEST_FAIL("nullable_all_null", "schema creation failed");
 
 (void)carquet_schema_add_column(schema, "nullable_int", CARQUET_PHYSICAL_INT32, NULL,
-        CARQUET_REPETITION_OPTIONAL, 0);
+        CARQUET_REPETITION_OPTIONAL, 0, 0);
 
     carquet_writer_options_t opts;
     carquet_writer_options_init(&opts);
@@ -836,7 +836,7 @@ static int test_nullable_none_null(void) {
     if (!schema) TEST_FAIL("nullable_none_null", "schema creation failed");
 
 (void)carquet_schema_add_column(schema, "nullable_int", CARQUET_PHYSICAL_INT32, NULL,
-        CARQUET_REPETITION_OPTIONAL, 0);
+        CARQUET_REPETITION_OPTIONAL, 0, 0);
 
     carquet_writer_options_t opts;
     carquet_writer_options_init(&opts);
@@ -883,7 +883,7 @@ static int test_nullable_mixed(void) {
     if (!schema) TEST_FAIL("nullable_mixed", "schema creation failed");
 
 (void)carquet_schema_add_column(schema, "nullable_int", CARQUET_PHYSICAL_INT32, NULL,
-        CARQUET_REPETITION_OPTIONAL, 0);
+        CARQUET_REPETITION_OPTIONAL, 0, 0);
 
     carquet_writer_options_t opts;
     carquet_writer_options_init(&opts);
@@ -1029,7 +1029,7 @@ static int test_compression_roundtrip(carquet_compression_t compression, const c
     }
 
 (void)carquet_schema_add_column(schema, "data", CARQUET_PHYSICAL_INT32, NULL,
-        CARQUET_REPETITION_REQUIRED, 0);
+        CARQUET_REPETITION_REQUIRED, 0, 0);
 
     carquet_writer_options_t opts;
     carquet_writer_options_init(&opts);
@@ -1130,9 +1130,9 @@ static int test_stress_large_data(void) {
     if (!schema) TEST_FAIL("stress_large_data", "schema creation failed");
 
 (void)carquet_schema_add_column(schema, "id", CARQUET_PHYSICAL_INT64, NULL,
-        CARQUET_REPETITION_REQUIRED, 0);
+        CARQUET_REPETITION_REQUIRED, 0, 0);
 (void)carquet_schema_add_column(schema, "value", CARQUET_PHYSICAL_DOUBLE, NULL,
-        CARQUET_REPETITION_REQUIRED, 0);
+        CARQUET_REPETITION_REQUIRED, 0, 0);
 
     carquet_writer_options_t opts;
     carquet_writer_options_init(&opts);
@@ -1236,7 +1236,7 @@ static int test_interop_generate_files(void) {
 
         carquet_schema_t* schema = carquet_schema_create(&err);
 (void)carquet_schema_add_column(schema, "id", CARQUET_PHYSICAL_INT32, NULL,
-            CARQUET_REPETITION_REQUIRED, 0);
+            CARQUET_REPETITION_REQUIRED, 0, 0);
 
         carquet_writer_options_t opts;
         carquet_writer_options_init(&opts);
@@ -1259,11 +1259,11 @@ static int test_interop_generate_files(void) {
 
         carquet_schema_t* schema = carquet_schema_create(&err);
 (void)carquet_schema_add_column(schema, "int_col", CARQUET_PHYSICAL_INT64, NULL,
-            CARQUET_REPETITION_REQUIRED, 0);
+            CARQUET_REPETITION_REQUIRED, 0, 0);
 (void)carquet_schema_add_column(schema, "float_col", CARQUET_PHYSICAL_DOUBLE, NULL,
-            CARQUET_REPETITION_REQUIRED, 0);
+            CARQUET_REPETITION_REQUIRED, 0, 0);
 (void)carquet_schema_add_column(schema, "bool_col", CARQUET_PHYSICAL_BOOLEAN, NULL,
-            CARQUET_REPETITION_REQUIRED, 0);
+            CARQUET_REPETITION_REQUIRED, 0, 0);
 
         carquet_writer_options_t opts;
         carquet_writer_options_init(&opts);
@@ -1295,7 +1295,7 @@ static int test_interop_generate_files(void) {
 
         carquet_schema_t* schema = carquet_schema_create(&err);
 (void)carquet_schema_add_column(schema, "value", CARQUET_PHYSICAL_INT32, NULL,
-            CARQUET_REPETITION_REQUIRED, 0);
+            CARQUET_REPETITION_REQUIRED, 0, 0);
 
         carquet_writer_options_t opts;
         carquet_writer_options_init(&opts);
@@ -1333,7 +1333,7 @@ static int test_memory_double_free_protection(void) {
     if (!schema) TEST_FAIL("memory_double_free", "schema creation failed");
 
 (void)carquet_schema_add_column(schema, "id", CARQUET_PHYSICAL_INT32, NULL,
-        CARQUET_REPETITION_REQUIRED, 0);
+        CARQUET_REPETITION_REQUIRED, 0, 0);
 
     carquet_schema_free(schema);
     /* Note: We can't actually test double-free safely, but we verify single free works */
