@@ -188,16 +188,18 @@ static int write_nullable_data(const char* filename, carquet_schema_t* schema) {
     if (status != CARQUET_OK) goto error;
 
     /* Write optional columns WITH definition levels */
-    /* Note: Only non-null values are in the values array! */
-    status = carquet_writer_write_batch(writer, 2, ages, age_value_count,
+    /* Note: Only non-null values are in the values array, but num_values
+     * is the total number of logical rows (including NULLs). The def_levels
+     * array has one entry per logical row indicating null vs present. */
+    status = carquet_writer_write_batch(writer, 2, ages, NUM_ROWS,
                                         age_def_levels, NULL);
     if (status != CARQUET_OK) goto error;
 
-    status = carquet_writer_write_batch(writer, 3, scores, score_value_count,
+    status = carquet_writer_write_batch(writer, 3, scores, NUM_ROWS,
                                         score_def_levels, NULL);
     if (status != CARQUET_OK) goto error;
 
-    status = carquet_writer_write_batch(writer, 4, emails, email_value_count,
+    status = carquet_writer_write_batch(writer, 4, emails, NUM_ROWS,
                                         email_def_levels, NULL);
     if (status != CARQUET_OK) goto error;
 

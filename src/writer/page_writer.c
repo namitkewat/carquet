@@ -307,10 +307,26 @@ carquet_status_t carquet_page_writer_add_values(
         writer->num_nulls += (num_values - num_non_null);
     }
 
-    /* Encode definition levels */
-    if (writer->max_def_level > 0 && def_levels) {
-        encode_levels(def_levels, num_values, writer->max_def_level,
-                      &writer->def_levels_buffer);
+    /* Encode definition levels.
+     * If def_levels is NULL for an OPTIONAL column, generate all-present levels
+     * since Parquet requires definition levels for non-REQUIRED columns. */
+    if (writer->max_def_level > 0) {
+        if (def_levels) {
+            encode_levels(def_levels, num_values, writer->max_def_level,
+                          &writer->def_levels_buffer);
+        } else {
+            /* Auto-generate all-present definition levels */
+            int16_t* auto_def = malloc(num_values * sizeof(int16_t));
+            if (!auto_def) {
+                return CARQUET_ERROR_OUT_OF_MEMORY;
+            }
+            for (int64_t i = 0; i < num_values; i++) {
+                auto_def[i] = writer->max_def_level;
+            }
+            encode_levels(auto_def, num_values, writer->max_def_level,
+                          &writer->def_levels_buffer);
+            free(auto_def);
+        }
     }
 
     /* Encode repetition levels */
