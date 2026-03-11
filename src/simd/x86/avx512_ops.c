@@ -122,11 +122,12 @@ void carquet_avx512_byte_stream_split_encode_float(
      * Lane 2 (bits 256-383): byte 2 from each of 16 floats
      * Lane 3 (bits 384-511): byte 3 from each of 16 floats
      */
-    const __m512i perm_all = _mm512_set_epi8(
-        63, 59, 55, 51, 47, 43, 39, 35, 31, 27, 23, 19, 15, 11, 7, 3,  /* byte 3s */
-        62, 58, 54, 50, 46, 42, 38, 34, 30, 26, 22, 18, 14, 10, 6, 2,  /* byte 2s */
-        61, 57, 53, 49, 45, 41, 37, 33, 29, 25, 21, 17, 13, 9, 5, 1,   /* byte 1s */
-        60, 56, 52, 48, 44, 40, 36, 32, 28, 24, 20, 16, 12, 8, 4, 0);  /* byte 0s */
+    /* Use _mm512_set_epi32 instead of _mm512_set_epi8 for GCC 8 compatibility */
+    const __m512i perm_all = _mm512_set_epi32(
+        0x3F3B3733, 0x2F2B2723, 0x1F1B1713, 0x0F0B0703,  /* byte 3s */
+        0x3E3A3632, 0x2E2A2622, 0x1E1A1612, 0x0E0A0602,  /* byte 2s */
+        0x3D393531, 0x2D292521, 0x1D191511, 0x0D090501,   /* byte 1s */
+        0x3C383430, 0x2C282420, 0x1C181410, 0x0C080400);  /* byte 0s */
 
     for (; i + 16 <= count; i += 16) {
         __m512i v = _mm512_loadu_si512((const __m512i*)(src + i * 4));
@@ -145,11 +146,12 @@ void carquet_avx512_byte_stream_split_encode_float(
      * Step 1: shuffle_epi8 transposes within each 128-bit lane (4 floats -> 4 bytes per stream)
      * Step 2: permutexvar_epi32 rearranges dwords to group all byte 0s, byte 1s, etc.
      */
-    const __m512i intra_lane_shuf = _mm512_set_epi8(
-        15, 11, 7, 3, 14, 10, 6, 2, 13, 9, 5, 1, 12, 8, 4, 0,
-        15, 11, 7, 3, 14, 10, 6, 2, 13, 9, 5, 1, 12, 8, 4, 0,
-        15, 11, 7, 3, 14, 10, 6, 2, 13, 9, 5, 1, 12, 8, 4, 0,
-        15, 11, 7, 3, 14, 10, 6, 2, 13, 9, 5, 1, 12, 8, 4, 0);
+    /* Use _mm512_set_epi32 instead of _mm512_set_epi8 for GCC 8 compatibility */
+    const __m512i intra_lane_shuf = _mm512_set_epi32(
+        0x0F0B0703, 0x0E0A0602, 0x0D090501, 0x0C080400,
+        0x0F0B0703, 0x0E0A0602, 0x0D090501, 0x0C080400,
+        0x0F0B0703, 0x0E0A0602, 0x0D090501, 0x0C080400,
+        0x0F0B0703, 0x0E0A0602, 0x0D090501, 0x0C080400);
     const __m512i cross_lane_perm = _mm512_set_epi32(
         15, 11, 7, 3, 14, 10, 6, 2, 13, 9, 5, 1, 12, 8, 4, 0);
 
