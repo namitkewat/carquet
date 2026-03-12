@@ -44,6 +44,20 @@ static inline int portable_ctz(unsigned int v) {
 #endif
 }
 
+/* Portable 64-bit count trailing zeros (needed for 64-byte mask operations) */
+static inline int portable_ctz64(uint64_t v) {
+#if defined(__GNUC__) || defined(__clang__)
+    return __builtin_ctzll(v);
+#elif defined(_MSC_VER)
+    unsigned long index;
+    _BitScanForward64(&index, (unsigned __int64)v);
+    return (int)index;
+#else
+    if ((uint32_t)v) return portable_ctz((unsigned int)v);
+    return 32 + portable_ctz((unsigned int)(v >> 32));
+#endif
+}
+
 /* ============================================================================
  * Bit Unpacking - AVX-512 Optimized
  * ============================================================================
@@ -846,7 +860,7 @@ size_t carquet_avx512_match_length(const uint8_t* p, const uint8_t* match, const
         __m512i b = _mm512_loadu_si512((const void*)match);
         __mmask64 mask = _mm512_cmpeq_epi8_mask(a, b);
         if (mask != ~0ULL) {
-            return (size_t)(p - start) + (size_t)portable_ctz((unsigned int)(~mask));
+            return (size_t)(p - start) + (size_t)portable_ctz64(~mask);
         }
         p += 64;
         match += 64;
