@@ -28,6 +28,7 @@ static inline int msvc_ctz(unsigned int x) {
     return (int)index;
 }
 #define __builtin_ctz(x) msvc_ctz(x)
+#define __builtin_popcount(x) __popcnt(x)
 #endif
 #include <immintrin.h>
 
