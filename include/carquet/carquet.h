@@ -1,7 +1,7 @@
 /**
  * @file carquet.h
  * @brief Carquet - High-Performance Pure C Parquet Library
- * @version 0.1.4
+ * @version 0.2.0
  *
  * @copyright Copyright (c) 2025. All rights reserved.
  * @license MIT License
@@ -193,13 +193,13 @@ extern "C" {
 #define CARQUET_VERSION_MAJOR 0
 
 /** @brief Minor version number */
-#define CARQUET_VERSION_MINOR 1
+#define CARQUET_VERSION_MINOR 2
 
 /** @brief Patch version number */
-#define CARQUET_VERSION_PATCH 4
+#define CARQUET_VERSION_PATCH 0
 
 /** @brief Version string in "MAJOR.MINOR.PATCH" format */
-#define CARQUET_VERSION_STRING "0.1.4"
+#define CARQUET_VERSION_STRING "0.2.0"
 
 /** @brief Numeric version for compile-time comparisons: (MAJOR * 10000 + MINOR * 100 + PATCH) */
 #define CARQUET_VERSION_NUMBER (CARQUET_VERSION_MAJOR * 10000 + CARQUET_VERSION_MINOR * 100 + CARQUET_VERSION_PATCH)
@@ -649,6 +649,226 @@ CARQUET_API CARQUET_PURE CARQUET_NONNULL(1, 2)
 int32_t carquet_schema_find_column(
     const carquet_schema_t* schema,
     const char* name);
+
+/**
+ * @brief Get the accumulated maximum definition level for a leaf column.
+ *
+ * Returns the total definition level accounting for all optional/repeated
+ * ancestors in the schema tree. This is the value needed for encoding and
+ * decoding definition levels in Parquet pages.
+ *
+ * @param[in] schema Schema to query
+ * @param[in] leaf_index Leaf column index (0 to num_columns - 1)
+ * @return Maximum definition level, or -1 if index is invalid
+ *
+ * @note Thread-safe: Yes (read-only)
+ */
+CARQUET_API CARQUET_PURE CARQUET_NONNULL(1)
+int16_t carquet_schema_max_def_level(
+    const carquet_schema_t* schema,
+    int32_t leaf_index);
+
+/**
+ * @brief Get the accumulated maximum repetition level for a leaf column.
+ *
+ * Returns the total repetition level accounting for all repeated ancestors
+ * in the schema tree.
+ *
+ * @param[in] schema Schema to query
+ * @param[in] leaf_index Leaf column index (0 to num_columns - 1)
+ * @return Maximum repetition level, or -1 if index is invalid
+ *
+ * @note Thread-safe: Yes (read-only)
+ */
+CARQUET_API CARQUET_PURE CARQUET_NONNULL(1)
+int16_t carquet_schema_max_rep_level(
+    const carquet_schema_t* schema,
+    int32_t leaf_index);
+
+/**
+ * @brief Get the name of a leaf column by index.
+ *
+ * @param[in] schema Schema to query
+ * @param[in] leaf_index Leaf column index (0 to num_columns - 1)
+ * @return Column name, or NULL if index is invalid
+ *
+ * @note Thread-safe: Yes (read-only)
+ */
+CARQUET_API CARQUET_PURE CARQUET_NONNULL(1)
+const char* carquet_schema_column_name(
+    const carquet_schema_t* schema,
+    int32_t leaf_index);
+
+/**
+ * @brief Get the physical type of a leaf column by index.
+ *
+ * @param[in] schema Schema to query
+ * @param[in] leaf_index Leaf column index (0 to num_columns - 1)
+ * @return Physical type
+ *
+ * @note Thread-safe: Yes (read-only)
+ */
+CARQUET_API CARQUET_PURE CARQUET_NONNULL(1)
+carquet_physical_type_t carquet_schema_column_type(
+    const carquet_schema_t* schema,
+    int32_t leaf_index);
+
+/**
+ * @brief Get the full schema path for a leaf column.
+ *
+ * Returns the hierarchical path from root to leaf (excluding the root
+ * "schema" element). For flat schemas, this is just the column name.
+ * For nested schemas, this includes group names.
+ *
+ * Example: For column "city" under group "address", path is ["address", "city"].
+ *
+ * @param[in] schema Schema to query
+ * @param[in] leaf_index Leaf column index (0 to num_columns - 1)
+ * @param[out] path_out Array to receive path component pointers
+ * @param[in] max_depth Maximum number of components to return
+ * @return Number of path components written, or 0 on error
+ *
+ * @note Thread-safe: Yes (read-only)
+ * @note Returned pointers are valid until the schema is freed.
+ */
+CARQUET_API CARQUET_NONNULL(1, 3)
+int32_t carquet_schema_column_path(
+    const carquet_schema_t* schema,
+    int32_t leaf_index,
+    const char** path_out,
+    int32_t max_depth);
+
+/**
+ * @brief Add a LIST column to the schema using the standard 3-level encoding.
+ *
+ * Creates the standard Parquet LIST structure:
+ * @code
+ *   <name> (<list_repetition>, LIST) {
+ *     list (REPEATED) {
+ *       element (OPTIONAL, <element_type>)
+ *     }
+ *   }
+ * @endcode
+ *
+ * @param[in] schema Schema to modify
+ * @param[in] name List column name
+ * @param[in] element_type Physical type of list elements
+ * @param[in] element_logical_type Logical type of elements (may be NULL)
+ * @param[in] list_repetition Repetition of the list itself (OPTIONAL or REQUIRED)
+ * @param[in] type_length Type length for FIXED_LEN_BYTE_ARRAY elements (0 otherwise)
+ * @param[in] parent_index Parent group index (0 for root)
+ * @return Group index of the list container, or -1 on error
+ */
+CARQUET_API CARQUET_NONNULL(1, 2)
+int32_t carquet_schema_add_list(
+    carquet_schema_t* schema,
+    const char* name,
+    carquet_physical_type_t element_type,
+    const carquet_logical_type_t* element_logical_type,
+    carquet_field_repetition_t list_repetition,
+    int32_t type_length,
+    int32_t parent_index);
+
+/**
+ * @brief Add a MAP column to the schema using the standard encoding.
+ *
+ * Creates the standard Parquet MAP structure:
+ * @code
+ *   <name> (<map_repetition>, MAP) {
+ *     key_value (REPEATED) {
+ *       key (REQUIRED, <key_type>)
+ *       value (OPTIONAL, <value_type>)
+ *     }
+ *   }
+ * @endcode
+ *
+ * @param[in] schema Schema to modify
+ * @param[in] name Map column name
+ * @param[in] key_type Physical type of map keys
+ * @param[in] key_logical_type Logical type of keys (may be NULL)
+ * @param[in] key_type_length Type length for FIXED_LEN keys (0 otherwise)
+ * @param[in] value_type Physical type of map values
+ * @param[in] value_logical_type Logical type of values (may be NULL)
+ * @param[in] value_type_length Type length for FIXED_LEN values (0 otherwise)
+ * @param[in] map_repetition Repetition of the map itself (OPTIONAL or REQUIRED)
+ * @param[in] parent_index Parent group index (0 for root)
+ * @return Group index of the map container, or -1 on error
+ */
+CARQUET_API CARQUET_NONNULL(1, 2)
+int32_t carquet_schema_add_map(
+    carquet_schema_t* schema,
+    const char* name,
+    carquet_physical_type_t key_type,
+    const carquet_logical_type_t* key_logical_type,
+    int32_t key_type_length,
+    carquet_physical_type_t value_type,
+    const carquet_logical_type_t* value_logical_type,
+    int32_t value_type_length,
+    carquet_field_repetition_t map_repetition,
+    int32_t parent_index);
+
+/* ============================================================================
+ * Nested Data Helpers
+ * ============================================================================
+ *
+ * Utility functions for working with nested (repeated) Parquet data.
+ * These help reconstruct list boundaries from repetition levels.
+ */
+
+/**
+ * @brief Count logical rows from repetition levels.
+ *
+ * For repeated fields, the number of logical rows is the count of entries
+ * where rep_level == 0 (indicating a new top-level record).
+ *
+ * If rep_levels is NULL, returns num_values (flat column).
+ *
+ * @param[in] rep_levels Repetition levels array (may be NULL)
+ * @param[in] num_values Total number of values
+ * @return Number of logical rows
+ */
+CARQUET_API CARQUET_PURE
+int64_t carquet_count_rows(
+    const int16_t* rep_levels,
+    int64_t num_values);
+
+/**
+ * @brief Compute list offsets from repetition levels.
+ *
+ * Produces an Arrow-style offsets array where offsets[i] is the start
+ * index of list i, and offsets[num_lists] = num_values.
+ *
+ * @param[in] rep_levels Repetition levels array
+ * @param[in] num_values Total number of values
+ * @param[in] list_rep_level The repetition level that indicates a new list
+ *                           element (typically 1 for top-level lists)
+ * @param[out] offsets_out Output offsets array (must have space for num_lists + 1)
+ * @param[in] max_offsets Maximum entries in offsets_out
+ * @return Number of lists found
+ *
+ * @code{.c}
+ * // Read a list<int32> column
+ * int32_t values[100];
+ * int16_t rep_levels[100];
+ * int64_t count = carquet_column_read_batch(col, values, 100, NULL, rep_levels);
+ *
+ * // Reconstruct list boundaries
+ * int64_t offsets[50];
+ * int64_t num_lists = carquet_list_offsets(rep_levels, count, 1, offsets, 50);
+ *
+ * // Access list i: values[offsets[i]] .. values[offsets[i+1]-1]
+ * for (int64_t i = 0; i < num_lists; i++) {
+ *     printf("List %lld: %lld elements\n", i, offsets[i+1] - offsets[i]);
+ * }
+ * @endcode
+ */
+CARQUET_API CARQUET_NONNULL(1, 4)
+int64_t carquet_list_offsets(
+    const int16_t* rep_levels,
+    int64_t num_values,
+    int16_t list_rep_level,
+    int64_t* offsets_out,
+    int64_t max_offsets);
 
 /* ============================================================================
  * Schema Node Accessors
@@ -1540,8 +1760,8 @@ typedef struct carquet_writer_options {
     /**
      * @brief Compression level (codec-specific).
      *
-     * - ZSTD: 1-22 (default: 3)
-     * - GZIP: 1-9 (default: 6)
+     * - ZSTD: 1-22
+     * - GZIP: 1-9
      * - Others: ignored
      *
      * Default: 0 (use codec default)

@@ -563,7 +563,9 @@ void carquet_column_reader_free(carquet_column_reader_t* reader) {
 
     free(reader->page_buffer);
     free(reader->page_data_for_values);
-    free(reader->dictionary_data);
+    if (reader->dictionary_ownership == CARQUET_DATA_OWNED) {
+        free(reader->dictionary_data);
+    }
     free(reader->dictionary_offsets);
 
     /* Only free decoded_values if we own the memory (not a mmap view) */
@@ -575,6 +577,7 @@ void carquet_column_reader_free(carquet_column_reader_t* reader) {
     free(reader->decoded_def_levels);
     free(reader->decoded_rep_levels);
     free(reader->indices_buffer);
+    free(reader->decompress_buffer);
     free(reader);
 }
 

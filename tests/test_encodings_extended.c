@@ -165,6 +165,9 @@ carquet_status_t carquet_byte_stream_split_decode(
     uint8_t* values,
     int64_t count);
 
+extern void carquet_dispatch_unpack_bools(const uint8_t* input, uint8_t* output, int64_t count);
+extern void carquet_dispatch_pack_bools(const uint8_t* input, uint8_t* output, int64_t count);
+
 /* ============================================================================
  * Delta Encoding Tests
  * ============================================================================
@@ -726,6 +729,44 @@ static int test_byte_stream_split_generic(void) {
     return 0;
 }
 
+static int test_byte_stream_split_generic_32bit(void) {
+    uint8_t input[] = {
+        0x01, 0x02, 0x03, 0x04,
+        0x11, 0x12, 0x13, 0x14,
+        0x21, 0x22, 0x23, 0x24,
+        0x31, 0x32, 0x33, 0x34
+    };
+    uint8_t expected[] = {
+        0x01, 0x11, 0x21, 0x31,
+        0x02, 0x12, 0x22, 0x32,
+        0x03, 0x13, 0x23, 0x33,
+        0x04, 0x14, 0x24, 0x34
+    };
+    uint8_t encoded[32];
+    uint8_t output[sizeof(input)];
+    size_t bytes_written = 0;
+
+    carquet_status_t status = carquet_byte_stream_split_encode(
+        input, 4, 4, encoded, sizeof(encoded), &bytes_written);
+    if (status != CARQUET_OK) {
+        TEST_FAIL("byte_stream_split_generic_32bit", "encode failed");
+    }
+    if (memcmp(encoded, expected, sizeof(expected)) != 0) {
+        TEST_FAIL("byte_stream_split_generic_32bit", "encoded data mismatch");
+    }
+
+    status = carquet_byte_stream_split_decode(encoded, bytes_written, 4, output, 4);
+    if (status != CARQUET_OK) {
+        TEST_FAIL("byte_stream_split_generic_32bit", "decode failed");
+    }
+    if (memcmp(output, input, sizeof(input)) != 0) {
+        TEST_FAIL("byte_stream_split_generic_32bit", "decoded data mismatch");
+    }
+
+    TEST_PASS("byte_stream_split_generic_32bit");
+    return 0;
+}
+
 static int test_byte_stream_split_special_floats(void) {
     float input[] = {0.0f, -0.0f, INFINITY, -INFINITY, NAN};
     int count = 5;
@@ -753,6 +794,32 @@ static int test_byte_stream_split_special_floats(void) {
     if (!isnan(output[4])) TEST_FAIL("byte_stream_split_special_floats", "nan mismatch");
 
     TEST_PASS("byte_stream_split_special_floats");
+    return 0;
+}
+
+static int test_bool_pack_unpack_dispatch(void) {
+    uint8_t packed[] = {0xA5, 0x3C, 0x81};
+    uint8_t unpacked[24];
+    uint8_t repacked[3];
+    uint8_t expected[24];
+
+    for (int i = 0; i < 24; i++) {
+        expected[i] = (packed[i / 8] >> (i % 8)) & 1;
+    }
+
+    memset(unpacked, 0xFF, sizeof(unpacked));
+    carquet_dispatch_unpack_bools(packed, unpacked, 24);
+    if (memcmp(unpacked, expected, sizeof(expected)) != 0) {
+        TEST_FAIL("bool_pack_unpack_dispatch", "unpack mismatch");
+    }
+
+    memset(repacked, 0, sizeof(repacked));
+    carquet_dispatch_pack_bools(unpacked, repacked, 24);
+    if (memcmp(repacked, packed, sizeof(packed)) != 0) {
+        TEST_FAIL("bool_pack_unpack_dispatch", "pack mismatch");
+    }
+
+    TEST_PASS("bool_pack_unpack_dispatch");
     return 0;
 }
 
@@ -786,7 +853,9 @@ int main(void) {
     failures += test_byte_stream_split_float();
     failures += test_byte_stream_split_double();
     failures += test_byte_stream_split_generic();
+    failures += test_byte_stream_split_generic_32bit();
     failures += test_byte_stream_split_special_floats();
+    failures += test_bool_pack_unpack_dispatch();
 
     printf("\n");
     if (failures == 0) {

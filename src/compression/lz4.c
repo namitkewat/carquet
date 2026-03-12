@@ -11,6 +11,8 @@
 #include <stddef.h>
 #include <string.h>
 
+extern void carquet_dispatch_match_copy(uint8_t* dst, const uint8_t* src, size_t len, size_t offset);
+
 /* ============================================================================
  * Constants
  * ============================================================================
@@ -111,24 +113,8 @@ carquet_status_t carquet_lz4_decompress(
 
         const uint8_t* match = op - offset;
 
-        /* Handle overlapping copies */
-        if (offset >= 8) {
-            /* Fast path: no overlap, copy 8 bytes at a time */
-            while (match_len >= 8) {
-                memcpy(op, match, 8);
-                op += 8;
-                match += 8;
-                match_len -= 8;
-            }
-            while (match_len-- > 0) {
-                *op++ = *match++;
-            }
-        } else {
-            /* Slow path: potential overlap */
-            while (match_len-- > 0) {
-                *op++ = *match++;
-            }
-        }
+        carquet_dispatch_match_copy(op, match, match_len, offset);
+        op += match_len;
     }
 
     *dst_size = (size_t)(op - dst);

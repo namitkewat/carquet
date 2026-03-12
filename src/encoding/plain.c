@@ -7,6 +7,9 @@
 #include "core/endian.h"
 #include <string.h>
 
+extern void carquet_dispatch_unpack_bools(const uint8_t* input, uint8_t* output, int64_t count);
+extern void carquet_dispatch_pack_bools(const uint8_t* input, uint8_t* output, int64_t count);
+
 /* ============================================================================
  * PLAIN Decoding
  * ============================================================================
@@ -28,31 +31,7 @@ int64_t carquet_decode_plain_boolean(
         return -1;
     }
 
-    int64_t i = 0;
-    size_t byte_idx = 0;
-
-    /* Process full bytes */
-    while (i + 8 <= count) {
-        uint8_t byte = input[byte_idx++];
-        output[i++] = (byte >> 0) & 1;
-        output[i++] = (byte >> 1) & 1;
-        output[i++] = (byte >> 2) & 1;
-        output[i++] = (byte >> 3) & 1;
-        output[i++] = (byte >> 4) & 1;
-        output[i++] = (byte >> 5) & 1;
-        output[i++] = (byte >> 6) & 1;
-        output[i++] = (byte >> 7) & 1;
-    }
-
-    /* Process remaining bits */
-    if (i < count) {
-        uint8_t byte = input[byte_idx++];
-        int bit = 0;
-        while (i < count) {
-            output[i++] = (byte >> bit) & 1;
-            bit++;
-        }
-    }
+    carquet_dispatch_unpack_bools(input, output, count);
 
     return (int64_t)bytes_needed;
 }
@@ -260,12 +239,9 @@ carquet_status_t carquet_encode_plain_boolean(
         return CARQUET_ERROR_OUT_OF_MEMORY;
     }
 
-    memset(dest, 0, bytes_needed);
-
-    for (int64_t i = 0; i < count; i++) {
-        if (input[i]) {
-            dest[i / 8] |= (1 << (i % 8));
-        }
+    if (bytes_needed > 0) {
+        memset(dest, 0, bytes_needed);
+        carquet_dispatch_pack_bools(input, dest, count);
     }
 
     return CARQUET_OK;

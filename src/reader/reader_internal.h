@@ -131,6 +131,7 @@ struct carquet_column_reader {
     size_t dictionary_size;
     int32_t dictionary_count;
     uint32_t* dictionary_offsets;  /* Offset cache for O(1) BYTE_ARRAY lookup */
+    carquet_data_ownership_t dictionary_ownership; /* OWNED or VIEW */
 
     /* Retained page data for BYTE_ARRAY value pointers */
     uint8_t* page_data_for_values;
@@ -150,6 +151,8 @@ struct carquet_column_reader {
     /* Reusable buffers to reduce allocations */
     uint32_t* indices_buffer;   /* Reusable buffer for dictionary indices */
     size_t indices_capacity;    /* Capacity of indices buffer */
+    uint8_t* decompress_buffer; /* Reusable decompression buffer */
+    size_t decompress_capacity; /* Capacity of decompression buffer */
 };
 
 /* ============================================================================

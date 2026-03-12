@@ -8,6 +8,7 @@
  */
 
 #include <carquet/carquet.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stddef.h>
 #include <string.h>
@@ -28,6 +29,18 @@ typedef void (*gather_float_fn)(const float* dict, const uint32_t* indices,
                                  int64_t count, float* output);
 typedef void (*gather_double_fn)(const double* dict, const uint32_t* indices,
                                   int64_t count, double* output);
+typedef bool (*checked_gather_i32_fn)(const int32_t* dict, int32_t dict_count,
+                                       const uint32_t* indices, int64_t count,
+                                       int32_t* output);
+typedef bool (*checked_gather_i64_fn)(const int64_t* dict, int32_t dict_count,
+                                       const uint32_t* indices, int64_t count,
+                                       int64_t* output);
+typedef bool (*checked_gather_float_fn)(const float* dict, int32_t dict_count,
+                                         const uint32_t* indices, int64_t count,
+                                         float* output);
+typedef bool (*checked_gather_double_fn)(const double* dict, int32_t dict_count,
+                                          const uint32_t* indices, int64_t count,
+                                          double* output);
 
 typedef void (*byte_split_encode_float_fn)(const float* values, int64_t count,
                                             uint8_t* output);
@@ -61,6 +74,16 @@ typedef void (*fill_def_levels_fn)(int16_t* def_levels, int64_t count, int16_t v
  * ============================================================================
  */
 
+/* Portable software prefetch */
+#if defined(_MSC_VER)
+#include <intrin.h>
+#define CARQUET_PREFETCH(addr) _mm_prefetch((const char*)(addr), _MM_HINT_T1)
+#elif defined(__GNUC__) || defined(__clang__)
+#define CARQUET_PREFETCH(addr) __builtin_prefetch((addr), 0, 1)
+#else
+#define CARQUET_PREFETCH(addr) ((void)0)
+#endif
+
 static void scalar_prefix_sum_i32(int32_t* values, int64_t count, int32_t initial) {
     int32_t sum = initial;
     for (int64_t i = 0; i < count; i++) {
@@ -79,30 +102,96 @@ static void scalar_prefix_sum_i64(int64_t* values, int64_t count, int64_t initia
 
 static void scalar_gather_i32(const int32_t* dict, const uint32_t* indices,
                                int64_t count, int32_t* output) {
+    const int64_t prefetch_dist = 8;
     for (int64_t i = 0; i < count; i++) {
+        if (i + prefetch_dist < count) {
+            CARQUET_PREFETCH(&dict[indices[i + prefetch_dist]]);
+        }
         output[i] = dict[indices[i]];
     }
 }
 
 static void scalar_gather_i64(const int64_t* dict, const uint32_t* indices,
                                int64_t count, int64_t* output) {
+    const int64_t prefetch_dist = 8;
     for (int64_t i = 0; i < count; i++) {
+        if (i + prefetch_dist < count) {
+            CARQUET_PREFETCH(&dict[indices[i + prefetch_dist]]);
+        }
         output[i] = dict[indices[i]];
     }
 }
 
 static void scalar_gather_float(const float* dict, const uint32_t* indices,
                                  int64_t count, float* output) {
+    const int64_t prefetch_dist = 8;
     for (int64_t i = 0; i < count; i++) {
+        if (i + prefetch_dist < count) {
+            CARQUET_PREFETCH(&dict[indices[i + prefetch_dist]]);
+        }
         output[i] = dict[indices[i]];
     }
 }
 
 static void scalar_gather_double(const double* dict, const uint32_t* indices,
                                   int64_t count, double* output) {
+    const int64_t prefetch_dist = 8;
     for (int64_t i = 0; i < count; i++) {
+        if (i + prefetch_dist < count) {
+            CARQUET_PREFETCH(&dict[indices[i + prefetch_dist]]);
+        }
         output[i] = dict[indices[i]];
     }
+}
+
+static bool scalar_checked_gather_i32(const int32_t* dict, int32_t dict_count,
+                                       const uint32_t* indices, int64_t count,
+                                       int32_t* output) {
+    for (int64_t i = 0; i < count; i++) {
+        uint32_t idx = indices[i];
+        if (idx >= (uint32_t)dict_count) {
+            return false;
+        }
+        output[i] = dict[idx];
+    }
+    return true;
+}
+
+static bool scalar_checked_gather_i64(const int64_t* dict, int32_t dict_count,
+                                       const uint32_t* indices, int64_t count,
+                                       int64_t* output) {
+    for (int64_t i = 0; i < count; i++) {
+        uint32_t idx = indices[i];
+        if (idx >= (uint32_t)dict_count) {
+            return false;
+        }
+        output[i] = dict[idx];
+    }
+    return true;
+}
+
+static bool scalar_checked_gather_float(const float* dict, int32_t dict_count,
+                                         const uint32_t* indices, int64_t count,
+                                         float* output) {
+    return scalar_checked_gather_i32((const int32_t*)dict, dict_count, indices,
+                                     count, (int32_t*)output);
+}
+
+static bool scalar_checked_gather_double(const double* dict, int32_t dict_count,
+                                          const uint32_t* indices, int64_t count,
+                                          double* output) {
+    return scalar_checked_gather_i64((const int64_t*)dict, dict_count, indices,
+                                     count, (int64_t*)output);
+}
+
+static bool validate_gather_indices(const uint32_t* indices, int64_t count, int32_t dict_count) {
+    uint32_t limit = (uint32_t)dict_count;
+    for (int64_t i = 0; i < count; i++) {
+        if (indices[i] >= limit) {
+            return false;
+        }
+    }
+    return true;
 }
 
 static void scalar_byte_split_encode_float(const float* values, int64_t count,
@@ -384,6 +473,18 @@ extern void carquet_neon_gather_float(const float* dict, const uint32_t* indices
                                        int64_t count, float* output);
 extern void carquet_neon_gather_double(const double* dict, const uint32_t* indices,
                                         int64_t count, double* output);
+extern bool carquet_neon_checked_gather_i32(const int32_t* dict, int32_t dict_count,
+                                             const uint32_t* indices, int64_t count,
+                                             int32_t* output);
+extern bool carquet_neon_checked_gather_i64(const int64_t* dict, int32_t dict_count,
+                                             const uint32_t* indices, int64_t count,
+                                             int64_t* output);
+extern bool carquet_neon_checked_gather_float(const float* dict, int32_t dict_count,
+                                               const uint32_t* indices, int64_t count,
+                                               float* output);
+extern bool carquet_neon_checked_gather_double(const double* dict, int32_t dict_count,
+                                                const uint32_t* indices, int64_t count,
+                                                double* output);
 extern void carquet_neon_byte_stream_split_encode_float(const float* values, int64_t count,
                                                          uint8_t* output);
 extern void carquet_neon_byte_stream_split_decode_float(const uint8_t* data, int64_t count,
@@ -431,6 +532,10 @@ typedef struct {
     gather_i64_fn gather_i64;
     gather_float_fn gather_float;
     gather_double_fn gather_double;
+    checked_gather_i32_fn checked_gather_i32;
+    checked_gather_i64_fn checked_gather_i64;
+    checked_gather_float_fn checked_gather_float;
+    checked_gather_double_fn checked_gather_double;
     byte_split_encode_float_fn byte_split_encode_float;
     byte_split_decode_float_fn byte_split_decode_float;
     byte_split_encode_double_fn byte_split_encode_double;
@@ -469,6 +574,10 @@ void carquet_simd_dispatch_init(void) {
     g_dispatch.gather_i64 = scalar_gather_i64;
     g_dispatch.gather_float = scalar_gather_float;
     g_dispatch.gather_double = scalar_gather_double;
+    g_dispatch.checked_gather_i32 = scalar_checked_gather_i32;
+    g_dispatch.checked_gather_i64 = scalar_checked_gather_i64;
+    g_dispatch.checked_gather_float = scalar_checked_gather_float;
+    g_dispatch.checked_gather_double = scalar_checked_gather_double;
     g_dispatch.byte_split_encode_float = scalar_byte_split_encode_float;
     g_dispatch.byte_split_decode_float = scalar_byte_split_decode_float;
     g_dispatch.byte_split_encode_double = scalar_byte_split_encode_double;
@@ -543,17 +652,21 @@ void carquet_simd_dispatch_init(void) {
 
 #endif /* CARQUET_ARCH_X86 */
 
-#if defined(__aarch64__)
+#if defined(CARQUET_ARCH_ARM)
 
-    /* NEON is always available on AArch64 - register NEON functions first */
-#ifdef __ARM_NEON
-    /* NEON optimized functions - always enabled on AArch64 */
+    /* Register NEON functions when the compiler can emit them and the CPU has NEON. */
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+    if (cpu->has_neon) {
     g_dispatch.prefix_sum_i32 = carquet_neon_prefix_sum_i32;
     g_dispatch.prefix_sum_i64 = carquet_neon_prefix_sum_i64;
     g_dispatch.gather_i32 = carquet_neon_gather_i32;
     g_dispatch.gather_i64 = carquet_neon_gather_i64;
     g_dispatch.gather_float = carquet_neon_gather_float;
     g_dispatch.gather_double = carquet_neon_gather_double;
+    g_dispatch.checked_gather_i32 = carquet_neon_checked_gather_i32;
+    g_dispatch.checked_gather_i64 = carquet_neon_checked_gather_i64;
+    g_dispatch.checked_gather_float = carquet_neon_checked_gather_float;
+    g_dispatch.checked_gather_double = carquet_neon_checked_gather_double;
     g_dispatch.byte_split_encode_float = carquet_neon_byte_stream_split_encode_float;
     g_dispatch.byte_split_decode_float = carquet_neon_byte_stream_split_decode_float;
     g_dispatch.byte_split_encode_double = carquet_neon_byte_stream_split_encode_double;
@@ -567,10 +680,11 @@ void carquet_simd_dispatch_init(void) {
     g_dispatch.count_non_nulls = carquet_neon_count_non_nulls;
     g_dispatch.build_null_bitmap = carquet_neon_build_null_bitmap;
     g_dispatch.fill_def_levels = carquet_neon_fill_def_levels;
+    }
 #endif
 
     /* SVE overrides NEON if available (better performance on supporting hardware) */
-#ifdef __ARM_FEATURE_SVE
+#if defined(__ARM_FEATURE_SVE)
     if (cpu->has_sve) {
         g_dispatch.prefix_sum_i32 = carquet_sve_prefix_sum_i32;
         g_dispatch.prefix_sum_i64 = carquet_sve_prefix_sum_i64;
@@ -581,7 +695,7 @@ void carquet_simd_dispatch_init(void) {
     }
 #endif
 
-#endif /* AArch64 */
+#endif /* ARM */
 
     g_dispatch_initialized = 1;
 }
@@ -623,6 +737,74 @@ void carquet_dispatch_gather_double(const double* dict, const uint32_t* indices,
                                      int64_t count, double* output) {
     if (!g_dispatch_initialized) carquet_simd_dispatch_init();
     g_dispatch.gather_double(dict, indices, count, output);
+}
+
+bool carquet_dispatch_checked_gather_i32(const int32_t* dict, int32_t dict_count,
+                                          const uint32_t* indices, int64_t count,
+                                          int32_t* output) {
+    if (!g_dispatch_initialized) carquet_simd_dispatch_init();
+#if defined(CARQUET_ARCH_ARM)
+    if (g_dispatch.checked_gather_i32 &&
+        g_dispatch.checked_gather_i32 != scalar_checked_gather_i32) {
+        return g_dispatch.checked_gather_i32(dict, dict_count, indices, count, output);
+    }
+#endif
+    if (!validate_gather_indices(indices, count, dict_count)) {
+        return false;
+    }
+    g_dispatch.gather_i32(dict, indices, count, output);
+    return true;
+}
+
+bool carquet_dispatch_checked_gather_i64(const int64_t* dict, int32_t dict_count,
+                                          const uint32_t* indices, int64_t count,
+                                          int64_t* output) {
+    if (!g_dispatch_initialized) carquet_simd_dispatch_init();
+#if defined(CARQUET_ARCH_ARM)
+    if (g_dispatch.checked_gather_i64 &&
+        g_dispatch.checked_gather_i64 != scalar_checked_gather_i64) {
+        return g_dispatch.checked_gather_i64(dict, dict_count, indices, count, output);
+    }
+#endif
+    if (!validate_gather_indices(indices, count, dict_count)) {
+        return false;
+    }
+    g_dispatch.gather_i64(dict, indices, count, output);
+    return true;
+}
+
+bool carquet_dispatch_checked_gather_float(const float* dict, int32_t dict_count,
+                                            const uint32_t* indices, int64_t count,
+                                            float* output) {
+    if (!g_dispatch_initialized) carquet_simd_dispatch_init();
+#if defined(CARQUET_ARCH_ARM)
+    if (g_dispatch.checked_gather_float &&
+        g_dispatch.checked_gather_float != scalar_checked_gather_float) {
+        return g_dispatch.checked_gather_float(dict, dict_count, indices, count, output);
+    }
+#endif
+    if (!validate_gather_indices(indices, count, dict_count)) {
+        return false;
+    }
+    g_dispatch.gather_float(dict, indices, count, output);
+    return true;
+}
+
+bool carquet_dispatch_checked_gather_double(const double* dict, int32_t dict_count,
+                                             const uint32_t* indices, int64_t count,
+                                             double* output) {
+    if (!g_dispatch_initialized) carquet_simd_dispatch_init();
+#if defined(CARQUET_ARCH_ARM)
+    if (g_dispatch.checked_gather_double &&
+        g_dispatch.checked_gather_double != scalar_checked_gather_double) {
+        return g_dispatch.checked_gather_double(dict, dict_count, indices, count, output);
+    }
+#endif
+    if (!validate_gather_indices(indices, count, dict_count)) {
+        return false;
+    }
+    g_dispatch.gather_double(dict, indices, count, output);
+    return true;
 }
 
 void carquet_dispatch_byte_split_encode_float(const float* values, int64_t count,

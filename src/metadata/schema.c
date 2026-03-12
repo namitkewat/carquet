@@ -355,7 +355,13 @@ carquet_field_repetition_t carquet_schema_node_repetition(const carquet_schema_n
 int16_t carquet_schema_node_max_def_level(const carquet_schema_node_t* node) {
     /* node is nonnull per API contract */
     const parquet_schema_element_t* elem = (const parquet_schema_element_t*)node;
-    return (elem->repetition_type == CARQUET_REPETITION_OPTIONAL) ? 1 : 0;
+    /* This returns only this node's direct contribution.
+     * For accumulated levels, use carquet_schema_max_def_level(). */
+    if (elem->repetition_type == CARQUET_REPETITION_OPTIONAL ||
+        elem->repetition_type == CARQUET_REPETITION_REPEATED) {
+        return 1;
+    }
+    return 0;
 }
 
 int16_t carquet_schema_node_max_rep_level(const carquet_schema_node_t* node) {
@@ -368,4 +374,230 @@ int32_t carquet_schema_node_type_length(const carquet_schema_node_t* node) {
     /* node is nonnull per API contract */
     const parquet_schema_element_t* elem = (const parquet_schema_element_t*)node;
     return elem->type_length;
+}
+
+/* ============================================================================
+ * Schema-Level Accessors (accumulated levels for leaf columns)
+ * ============================================================================
+ */
+
+int16_t carquet_schema_max_def_level(
+    const carquet_schema_t* schema,
+    int32_t leaf_index) {
+
+    /* schema is nonnull per API contract */
+    if (leaf_index < 0 || leaf_index >= schema->num_leaves) {
+        return -1;
+    }
+    return schema->max_def_levels[leaf_index];
+}
+
+int16_t carquet_schema_max_rep_level(
+    const carquet_schema_t* schema,
+    int32_t leaf_index) {
+
+    /* schema is nonnull per API contract */
+    if (leaf_index < 0 || leaf_index >= schema->num_leaves) {
+        return -1;
+    }
+    return schema->max_rep_levels[leaf_index];
+}
+
+const char* carquet_schema_column_name(
+    const carquet_schema_t* schema,
+    int32_t leaf_index) {
+
+    /* schema is nonnull per API contract */
+    if (leaf_index < 0 || leaf_index >= schema->num_leaves) {
+        return NULL;
+    }
+    int32_t elem_idx = schema->leaf_indices[leaf_index];
+    return schema->elements[elem_idx].name;
+}
+
+carquet_physical_type_t carquet_schema_column_type(
+    const carquet_schema_t* schema,
+    int32_t leaf_index) {
+
+    /* schema is nonnull per API contract */
+    if (leaf_index < 0 || leaf_index >= schema->num_leaves) {
+        return CARQUET_PHYSICAL_BOOLEAN; /* safe default */
+    }
+    int32_t elem_idx = schema->leaf_indices[leaf_index];
+    return schema->elements[elem_idx].type;
+}
+
+int32_t carquet_schema_column_path(
+    const carquet_schema_t* schema,
+    int32_t leaf_index,
+    const char** path_out,
+    int32_t max_depth) {
+
+    /* schema and path_out are nonnull per API contract */
+    if (leaf_index < 0 || leaf_index >= schema->num_leaves || max_depth <= 0) {
+        return 0;
+    }
+
+    /* Walk from leaf to root, collecting names (excluding root "schema") */
+    const char* components[64];
+    int32_t depth = 0;
+
+    int32_t elem_idx = schema->leaf_indices[leaf_index];
+    while (elem_idx > 0 && depth < 64) {
+        components[depth++] = schema->elements[elem_idx].name;
+        elem_idx = schema->parent_indices[elem_idx];
+    }
+
+    /* Reverse into output (root-first order) */
+    int32_t result_len = depth < max_depth ? depth : max_depth;
+    for (int32_t i = 0; i < result_len; i++) {
+        path_out[i] = components[depth - 1 - i];
+    }
+
+    return result_len;
+}
+
+/* ============================================================================
+ * LIST / MAP Schema Helpers
+ * ============================================================================
+ */
+
+int32_t carquet_schema_add_list(
+    carquet_schema_t* schema,
+    const char* name,
+    carquet_physical_type_t element_type,
+    const carquet_logical_type_t* element_logical_type,
+    carquet_field_repetition_t list_repetition,
+    int32_t type_length,
+    int32_t parent_index) {
+
+    /* Create the outer group with LIST annotation:
+     *   <name> (<list_repetition>, LIST) {
+     *     list (REPEATED) {
+     *       element (<element_type>)
+     *     }
+     *   }
+     */
+
+    /* Outer group: the list container */
+    int32_t outer = carquet_schema_add_group(schema, name, list_repetition, parent_index);
+    if (outer < 0) return -1;
+
+    /* Set LIST logical type on the outer group */
+    schema->elements[outer].has_logical_type = true;
+    schema->elements[outer].logical_type.id = CARQUET_LOGICAL_LIST;
+
+    /* Inner repeated group "list" */
+    int32_t inner = carquet_schema_add_group(schema, "list", CARQUET_REPETITION_REPEATED, outer);
+    if (inner < 0) return -1;
+
+    /* Element leaf column */
+    carquet_status_t status = carquet_schema_add_column(
+        schema, "element", element_type, element_logical_type,
+        CARQUET_REPETITION_OPTIONAL, type_length, inner);
+    if (status != CARQUET_OK) return -1;
+
+    return outer;
+}
+
+int32_t carquet_schema_add_map(
+    carquet_schema_t* schema,
+    const char* name,
+    carquet_physical_type_t key_type,
+    const carquet_logical_type_t* key_logical_type,
+    int32_t key_type_length,
+    carquet_physical_type_t value_type,
+    const carquet_logical_type_t* value_logical_type,
+    int32_t value_type_length,
+    carquet_field_repetition_t map_repetition,
+    int32_t parent_index) {
+
+    /* Create the standard MAP schema:
+     *   <name> (<map_repetition>, MAP) {
+     *     key_value (REPEATED) {
+     *       key (REQUIRED, <key_type>)
+     *       value (OPTIONAL, <value_type>)
+     *     }
+     *   }
+     */
+
+    /* Outer group: the map container */
+    int32_t outer = carquet_schema_add_group(schema, name, map_repetition, parent_index);
+    if (outer < 0) return -1;
+
+    /* Set MAP logical type on the outer group */
+    schema->elements[outer].has_logical_type = true;
+    schema->elements[outer].logical_type.id = CARQUET_LOGICAL_MAP;
+
+    /* Inner repeated group "key_value" */
+    int32_t kv = carquet_schema_add_group(schema, "key_value", CARQUET_REPETITION_REPEATED, outer);
+    if (kv < 0) return -1;
+
+    /* Key column (always required) */
+    carquet_status_t status = carquet_schema_add_column(
+        schema, "key", key_type, key_logical_type,
+        CARQUET_REPETITION_REQUIRED, key_type_length, kv);
+    if (status != CARQUET_OK) return -1;
+
+    /* Value column (optional) */
+    status = carquet_schema_add_column(
+        schema, "value", value_type, value_logical_type,
+        CARQUET_REPETITION_OPTIONAL, value_type_length, kv);
+    if (status != CARQUET_OK) return -1;
+
+    return outer;
+}
+
+/* ============================================================================
+ * Nested Data Helpers
+ * ============================================================================
+ */
+
+int64_t carquet_count_rows(
+    const int16_t* rep_levels,
+    int64_t num_values) {
+
+    if (!rep_levels || num_values <= 0) {
+        return num_values > 0 ? num_values : 0;
+    }
+
+    int64_t rows = 0;
+    for (int64_t i = 0; i < num_values; i++) {
+        if (rep_levels[i] == 0) rows++;
+    }
+    return rows;
+}
+
+int64_t carquet_list_offsets(
+    const int16_t* rep_levels,
+    int64_t num_values,
+    int16_t list_rep_level,
+    int64_t* offsets_out,
+    int64_t max_offsets) {
+
+    /* rep_levels and offsets_out are nonnull per API contract */
+    if (num_values <= 0 || max_offsets <= 0) {
+        return 0;
+    }
+
+    /* offsets_out is an Arrow-style offsets array:
+     * offsets[i] = start index of list element i
+     * offsets[num_lists] = num_values (one past the last)
+     * Number of lists = num entries where rep_level < list_rep_level */
+    int64_t num_lists = 0;
+    for (int64_t i = 0; i < num_values; i++) {
+        if (rep_levels[i] < list_rep_level) {
+            if (num_lists < max_offsets) {
+                offsets_out[num_lists] = i;
+            }
+            num_lists++;
+        }
+    }
+
+    /* Write the final offset (one past end) */
+    if (num_lists < max_offsets) {
+        offsets_out[num_lists] = num_values;
+    }
+
+    return num_lists;
 }

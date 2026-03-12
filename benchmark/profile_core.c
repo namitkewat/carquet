@@ -6,7 +6,7 @@
  * It can run in two modes:
  *
  * 1. READ-ONLY MODE (recommended for profiling):
- *    Uses pre-generated Parquet files from generate_test_files.py
+ *    Uses pre-generated Parquet files from generate_test_files
  *    ./profile_core --read-only <path_to_profile_data>
  *
  * 2. FULL MODE (write + read):
@@ -14,7 +14,7 @@
  *    ./profile_core [iterations] [rows_per_iter]
  *
  * Usage for profiling:
- *    python benchmark/generate_test_files.py benchmark/profile_data 10000000
+ *    ./generate_test_files benchmark/profile_data 10000000
  *    sample ./profile_core 30 -wait -f profile.txt &
  *    ./profile_core --read-only benchmark/profile_data --iterations 20
  */
@@ -407,7 +407,7 @@ static void print_usage(const char* prog) {
     printf("  %s --read-only <data_dir> [--iterations N]\n", prog);
     printf("  %s [iterations] [rows_per_iter]\n", prog);
     printf("\nExamples:\n");
-    printf("  python benchmark/generate_test_files.py benchmark/profile_data 10000000\n");
+    printf("  ./generate_test_files benchmark/profile_data 10000000\n");
     printf("  %s --read-only benchmark/profile_data --iterations 20\n", prog);
     printf("  %s 5 2000000\n", prog);
 }

@@ -14,7 +14,22 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <stdlib.h>
+#include <stdbool.h>
 #include <string.h>
+
+/* SIMD-dispatched gather functions for dictionary lookups */
+extern void carquet_dispatch_gather_i32(const int32_t* dict, const uint32_t* indices, int64_t count, int32_t* output);
+extern void carquet_dispatch_gather_i64(const int64_t* dict, const uint32_t* indices, int64_t count, int64_t* output);
+extern void carquet_dispatch_gather_float(const float* dict, const uint32_t* indices, int64_t count, float* output);
+extern void carquet_dispatch_gather_double(const double* dict, const uint32_t* indices, int64_t count, double* output);
+extern bool carquet_dispatch_checked_gather_i32(const int32_t* dict, int32_t dict_count,
+                                                 const uint32_t* indices, int64_t count, int32_t* output);
+extern bool carquet_dispatch_checked_gather_i64(const int64_t* dict, int32_t dict_count,
+                                                 const uint32_t* indices, int64_t count, int64_t* output);
+extern bool carquet_dispatch_checked_gather_float(const float* dict, int32_t dict_count,
+                                                   const uint32_t* indices, int64_t count, float* output);
+extern bool carquet_dispatch_checked_gather_double(const double* dict, int32_t dict_count,
+                                                    const uint32_t* indices, int64_t count, double* output);
 
 /* ============================================================================
  * Dictionary Builder
@@ -24,6 +39,7 @@
 typedef struct dict_entry {
     uint8_t* data;
     size_t size;
+    uint32_t hash;
     uint32_t index;
     struct dict_entry* next;
 } dict_entry_t;
@@ -42,6 +58,33 @@ typedef struct {
     bool is_variable_length;
 } dict_builder_t;
 
+#define DICT_BUILDER_INITIAL_BUCKETS 1024U
+#define DICT_BUILDER_MAX_LOAD_NUM 3U
+#define DICT_BUILDER_MAX_LOAD_DEN 4U
+
+static carquet_status_t dict_builder_rehash(dict_builder_t* builder, size_t new_bucket_count) {
+    dict_entry_t** new_buckets = calloc(new_bucket_count, sizeof(dict_entry_t*));
+    if (!new_buckets) {
+        return CARQUET_ERROR_OUT_OF_MEMORY;
+    }
+
+    for (size_t i = 0; i < builder->num_buckets; i++) {
+        dict_entry_t* entry = builder->buckets[i];
+        while (entry) {
+            dict_entry_t* next = entry->next;
+            size_t bucket = entry->hash % new_bucket_count;
+            entry->next = new_buckets[bucket];
+            new_buckets[bucket] = entry;
+            entry = next;
+        }
+    }
+
+    free(builder->buckets);
+    builder->buckets = new_buckets;
+    builder->num_buckets = new_bucket_count;
+    return CARQUET_OK;
+}
+
 static uint32_t dict_hash(const uint8_t* data, size_t size) {
     uint32_t h = 0x811c9dc5;
     for (size_t i = 0; i < size; i++) {
@@ -52,11 +95,12 @@ static uint32_t dict_hash(const uint8_t* data, size_t size) {
 }
 
 static carquet_status_t dict_builder_init(dict_builder_t* builder,
+                                           size_t expected_count,
                                            size_t value_size,
                                            bool is_variable_length) {
     memset(builder, 0, sizeof(*builder));
 
-    builder->num_buckets = 1024;
+    builder->num_buckets = DICT_BUILDER_INITIAL_BUCKETS;
     builder->buckets = calloc(builder->num_buckets, sizeof(dict_entry_t*));
     if (!builder->buckets) {
         return CARQUET_ERROR_OUT_OF_MEMORY;
@@ -68,7 +112,7 @@ static carquet_status_t dict_builder_init(dict_builder_t* builder,
         return status;
     }
 
-    builder->indices_capacity = 1024;
+    builder->indices_capacity = expected_count > 0 ? expected_count : 1024;
     builder->indices = malloc(builder->indices_capacity * sizeof(uint32_t));
     if (!builder->indices) {
         carquet_buffer_destroy(&builder->dict_buffer);
@@ -88,7 +132,6 @@ static void dict_builder_destroy(dict_builder_t* builder) {
             dict_entry_t* entry = builder->buckets[i];
             while (entry) {
                 dict_entry_t* next = entry->next;
-                free(entry->data);
                 free(entry);
                 entry = next;
             }
@@ -118,27 +161,34 @@ static carquet_status_t dict_builder_add(dict_builder_t* builder,
     size_t bucket = hash % builder->num_buckets;
 
     for (dict_entry_t* entry = builder->buckets[bucket]; entry; entry = entry->next) {
-        if (entry->size == value_size && memcmp(entry->data, value, value_size) == 0) {
+        if (entry->hash == hash &&
+            entry->size == value_size &&
+            memcmp(entry->data, value, value_size) == 0) {
             /* Found existing entry */
             builder->indices[builder->indices_count++] = entry->index;
             return CARQUET_OK;
         }
     }
 
+    if ((builder->count + 1) * DICT_BUILDER_MAX_LOAD_DEN >
+        builder->num_buckets * DICT_BUILDER_MAX_LOAD_NUM) {
+        carquet_status_t status = dict_builder_rehash(builder, builder->num_buckets * 2);
+        if (status != CARQUET_OK) {
+            return status;
+        }
+        bucket = hash % builder->num_buckets;
+    }
+
     /* Add new entry */
-    dict_entry_t* new_entry = malloc(sizeof(dict_entry_t));
+    dict_entry_t* new_entry = malloc(sizeof(dict_entry_t) + value_size);
     if (!new_entry) {
         return CARQUET_ERROR_OUT_OF_MEMORY;
     }
 
-    new_entry->data = malloc(value_size);
-    if (!new_entry->data) {
-        free(new_entry);
-        return CARQUET_ERROR_OUT_OF_MEMORY;
-    }
-
+    new_entry->data = (uint8_t*)(new_entry + 1);
     memcpy(new_entry->data, value, value_size);
     new_entry->size = value_size;
+    new_entry->hash = hash;
     new_entry->index = (uint32_t)builder->count;
     new_entry->next = builder->buckets[bucket];
     builder->buckets[bucket] = new_entry;
@@ -180,7 +230,7 @@ carquet_status_t carquet_dictionary_encode_int32(
     carquet_buffer_t* indices_output) {
 
     dict_builder_t builder;
-    carquet_status_t status = dict_builder_init(&builder, sizeof(int32_t), false);
+    carquet_status_t status = dict_builder_init(&builder, (size_t)count, sizeof(int32_t), false);
     if (status != CARQUET_OK) {
         return status;
     }
@@ -220,7 +270,7 @@ carquet_status_t carquet_dictionary_encode_int64(
     carquet_buffer_t* indices_output) {
 
     dict_builder_t builder;
-    carquet_status_t status = dict_builder_init(&builder, sizeof(int64_t), false);
+    carquet_status_t status = dict_builder_init(&builder, (size_t)count, sizeof(int64_t), false);
     if (status != CARQUET_OK) {
         return status;
     }
@@ -254,7 +304,7 @@ carquet_status_t carquet_dictionary_encode_float(
     carquet_buffer_t* indices_output) {
 
     dict_builder_t builder;
-    carquet_status_t status = dict_builder_init(&builder, sizeof(float), false);
+    carquet_status_t status = dict_builder_init(&builder, (size_t)count, sizeof(float), false);
     if (status != CARQUET_OK) {
         return status;
     }
@@ -288,7 +338,7 @@ carquet_status_t carquet_dictionary_encode_double(
     carquet_buffer_t* indices_output) {
 
     dict_builder_t builder;
-    carquet_status_t status = dict_builder_init(&builder, sizeof(double), false);
+    carquet_status_t status = dict_builder_init(&builder, (size_t)count, sizeof(double), false);
     if (status != CARQUET_OK) {
         return status;
     }
@@ -322,7 +372,7 @@ carquet_status_t carquet_dictionary_encode_byte_array(
     carquet_buffer_t* indices_output) {
 
     dict_builder_t builder;
-    carquet_status_t status = dict_builder_init(&builder, 0, true);
+    carquet_status_t status = dict_builder_init(&builder, (size_t)count, 0, true);
     if (status != CARQUET_OK) {
         return status;
     }
@@ -393,14 +443,21 @@ carquet_status_t carquet_dictionary_decode_int32(
         return CARQUET_ERROR_DECODE;
     }
 
-    /* Look up values (read as little-endian for big-endian compatibility) */
+    /* Parquet stores dictionary values in little-endian format.
+     * On little-endian systems (all x86, all modern ARM), we can cast
+     * dict_data directly to int32_t* and use SIMD gather. */
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+    /* Big-endian: use scalar path with endian conversion */
     for (int64_t i = 0; i < decoded; i++) {
-        if ((int32_t)indices[i] >= dict_count) {
-            free(indices);
-            return CARQUET_ERROR_DECODE;
-        }
         output[i] = carquet_read_i32_le(dict_data + indices[i] * sizeof(int32_t));
     }
+#else
+    if (!carquet_dispatch_checked_gather_i32((const int32_t*)dict_data, dict_count,
+                                             indices, decoded, output)) {
+        free(indices);
+        return CARQUET_ERROR_DECODE;
+    }
+#endif
 
     free(indices);
     return CARQUET_OK;
@@ -446,14 +503,20 @@ carquet_status_t carquet_dictionary_decode_int64(
         return CARQUET_ERROR_DECODE;
     }
 
-    /* Look up values (read as little-endian for big-endian compatibility) */
+    /* Parquet stores dictionary values in little-endian format.
+     * On little-endian systems, we can cast dict_data directly and use SIMD gather. */
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+    /* Big-endian: use scalar path with endian conversion */
     for (int64_t i = 0; i < decoded; i++) {
-        if ((int32_t)indices[i] >= dict_count) {
-            free(indices);
-            return CARQUET_ERROR_DECODE;
-        }
         output[i] = carquet_read_i64_le(dict_data + indices[i] * sizeof(int64_t));
     }
+#else
+    if (!carquet_dispatch_checked_gather_i64((const int64_t*)dict_data, dict_count,
+                                             indices, decoded, output)) {
+        free(indices);
+        return CARQUET_ERROR_DECODE;
+    }
+#endif
 
     free(indices);
     return CARQUET_OK;
@@ -499,14 +562,20 @@ carquet_status_t carquet_dictionary_decode_float(
         return CARQUET_ERROR_DECODE;
     }
 
-    /* Look up values (read as little-endian for big-endian compatibility) */
+    /* Parquet stores dictionary values in little-endian format.
+     * On little-endian systems, we can cast dict_data directly and use SIMD gather. */
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+    /* Big-endian: use scalar path with endian conversion */
     for (int64_t i = 0; i < decoded; i++) {
-        if ((int32_t)indices[i] >= dict_count) {
-            free(indices);
-            return CARQUET_ERROR_DECODE;
-        }
         output[i] = carquet_read_f32_le(dict_data + indices[i] * sizeof(float));
     }
+#else
+    if (!carquet_dispatch_checked_gather_float((const float*)dict_data, dict_count,
+                                               indices, decoded, output)) {
+        free(indices);
+        return CARQUET_ERROR_DECODE;
+    }
+#endif
 
     free(indices);
     return CARQUET_OK;
@@ -552,14 +621,20 @@ carquet_status_t carquet_dictionary_decode_double(
         return CARQUET_ERROR_DECODE;
     }
 
-    /* Look up values (read as little-endian for big-endian compatibility) */
+    /* Parquet stores dictionary values in little-endian format.
+     * On little-endian systems, we can cast dict_data directly and use SIMD gather. */
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+    /* Big-endian: use scalar path with endian conversion */
     for (int64_t i = 0; i < decoded; i++) {
-        if ((int32_t)indices[i] >= dict_count) {
-            free(indices);
-            return CARQUET_ERROR_DECODE;
-        }
         output[i] = carquet_read_f64_le(dict_data + indices[i] * sizeof(double));
     }
+#else
+    if (!carquet_dispatch_checked_gather_double((const double*)dict_data, dict_count,
+                                                indices, decoded, output)) {
+        free(indices);
+        return CARQUET_ERROR_DECODE;
+    }
+#endif
 
     free(indices);
     return CARQUET_OK;

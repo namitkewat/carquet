@@ -16,6 +16,7 @@
  */
 
 #include <carquet/error.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stddef.h>
 #include <string.h>
@@ -304,18 +305,12 @@ void carquet_neon_byte_stream_split_encode_float(
         /* Single table lookup transposes all 4 streams */
         uint8x16_t transposed = vqtbl1q_u8(v, idx);
 
-        /* Extract each 32-bit lane containing one stream */
-        uint32x4_t t = vreinterpretq_u32_u8(transposed);
-        uint32_t t0 = vgetq_lane_u32(t, 0);
-        uint32_t t1 = vgetq_lane_u32(t, 1);
-        uint32_t t2 = vgetq_lane_u32(t, 2);
-        uint32_t t3 = vgetq_lane_u32(t, 3);
-
-        /* Store to transposed positions */
-        memcpy(output + 0 * count + i, &t0, sizeof(uint32_t));
-        memcpy(output + 1 * count + i, &t1, sizeof(uint32_t));
-        memcpy(output + 2 * count + i, &t2, sizeof(uint32_t));
-        memcpy(output + 3 * count + i, &t3, sizeof(uint32_t));
+        /* Store one 32-bit stream per lane without scalar extraction. */
+        uint32x4_t streams = vreinterpretq_u32_u8(transposed);
+        vst1q_lane_u32((uint32_t*)(output + i), streams, 0);
+        vst1q_lane_u32((uint32_t*)(output + count + i), streams, 1);
+        vst1q_lane_u32((uint32_t*)(output + 2 * count + i), streams, 2);
+        vst1q_lane_u32((uint32_t*)(output + 3 * count + i), streams, 3);
     }
 
     /* Handle remaining values */
@@ -337,31 +332,26 @@ void carquet_neon_byte_stream_split_decode_float(
     uint8_t* dst = (uint8_t*)values;
     int64_t i = 0;
 
+    /* Same permutation as encode: it is its own inverse for 4x4 transpose. */
+    static const uint8_t tbl_transpose[16] = {
+        0, 4, 8, 12,
+        1, 5, 9, 13,
+        2, 6, 10, 14,
+        3, 7, 11, 15
+    };
+    const uint8x16_t idx = vld1q_u8(tbl_transpose);
+
     /* Process 4 floats at a time */
     for (; i + 4 <= count; i += 4) {
-        /* Load 4 bytes from each stream (use memcpy for unaligned access) */
-        uint32_t b0, b1, b2, b3;
-        memcpy(&b0, data + 0 * count + i, sizeof(uint32_t));
-        memcpy(&b1, data + 1 * count + i, sizeof(uint32_t));
-        memcpy(&b2, data + 2 * count + i, sizeof(uint32_t));
-        memcpy(&b3, data + 3 * count + i, sizeof(uint32_t));
+        uint32x4_t streams = vdupq_n_u32(0);
+        streams = vld1q_lane_u32((const uint32_t*)(data + i), streams, 0);
+        streams = vld1q_lane_u32((const uint32_t*)(data + count + i), streams, 1);
+        streams = vld1q_lane_u32((const uint32_t*)(data + 2 * count + i), streams, 2);
+        streams = vld1q_lane_u32((const uint32_t*)(data + 3 * count + i), streams, 3);
 
-        uint8x8_t bytes0 = vreinterpret_u8_u32(vdup_n_u32(b0));
-        uint8x8_t bytes1 = vreinterpret_u8_u32(vdup_n_u32(b1));
-        uint8x8_t bytes2 = vreinterpret_u8_u32(vdup_n_u32(b2));
-        uint8x8_t bytes3 = vreinterpret_u8_u32(vdup_n_u32(b3));
-
-        /* Interleave bytes back into floats */
-        uint8x8x2_t zip01 = vzip_u8(bytes0, bytes1);
-        uint8x8x2_t zip23 = vzip_u8(bytes2, bytes3);
-
-        uint16x4_t lo16 = vreinterpret_u16_u8(zip01.val[0]);
-        uint16x4_t hi16 = vreinterpret_u16_u8(zip23.val[0]);
-
-        uint16x4x2_t zip_final = vzip_u16(lo16, hi16);
-
-        vst1_u8(dst + i * 4, vreinterpret_u8_u16(zip_final.val[0]));
-        vst1_u8(dst + i * 4 + 8, vreinterpret_u8_u16(zip_final.val[1]));
+        uint8x16_t packed = vreinterpretq_u8_u32(streams);
+        uint8x16_t restored = vqtbl1q_u8(packed, idx);
+        vst1q_u8(dst + i * 4, restored);
     }
 
     /* Handle remaining values */
@@ -410,26 +400,16 @@ void carquet_neon_byte_stream_split_encode_double(
         /* Single table lookup transposes all 8 streams */
         uint8x16_t transposed = vqtbl1q_u8(v, idx);
 
-        /* Extract each 16-bit lane containing one stream (2 bytes) */
-        uint16x8_t t = vreinterpretq_u16_u8(transposed);
-        uint16_t t0 = vgetq_lane_u16(t, 0);
-        uint16_t t1 = vgetq_lane_u16(t, 1);
-        uint16_t t2 = vgetq_lane_u16(t, 2);
-        uint16_t t3 = vgetq_lane_u16(t, 3);
-        uint16_t t4 = vgetq_lane_u16(t, 4);
-        uint16_t t5 = vgetq_lane_u16(t, 5);
-        uint16_t t6 = vgetq_lane_u16(t, 6);
-        uint16_t t7 = vgetq_lane_u16(t, 7);
-
-        /* Store to transposed positions */
-        memcpy(output + 0 * count + i, &t0, sizeof(uint16_t));
-        memcpy(output + 1 * count + i, &t1, sizeof(uint16_t));
-        memcpy(output + 2 * count + i, &t2, sizeof(uint16_t));
-        memcpy(output + 3 * count + i, &t3, sizeof(uint16_t));
-        memcpy(output + 4 * count + i, &t4, sizeof(uint16_t));
-        memcpy(output + 5 * count + i, &t5, sizeof(uint16_t));
-        memcpy(output + 6 * count + i, &t6, sizeof(uint16_t));
-        memcpy(output + 7 * count + i, &t7, sizeof(uint16_t));
+        /* Store one 16-bit stream per lane without scalar extraction. */
+        uint16x8_t streams = vreinterpretq_u16_u8(transposed);
+        vst1q_lane_u16((uint16_t*)(output + i), streams, 0);
+        vst1q_lane_u16((uint16_t*)(output + count + i), streams, 1);
+        vst1q_lane_u16((uint16_t*)(output + 2 * count + i), streams, 2);
+        vst1q_lane_u16((uint16_t*)(output + 3 * count + i), streams, 3);
+        vst1q_lane_u16((uint16_t*)(output + 4 * count + i), streams, 4);
+        vst1q_lane_u16((uint16_t*)(output + 5 * count + i), streams, 5);
+        vst1q_lane_u16((uint16_t*)(output + 6 * count + i), streams, 6);
+        vst1q_lane_u16((uint16_t*)(output + 7 * count + i), streams, 7);
     }
 
     /* Handle remaining values */
@@ -452,58 +432,27 @@ void carquet_neon_byte_stream_split_decode_double(
     uint8_t* dst = (uint8_t*)values;
     int64_t i = 0;
 
+    static const uint8_t tbl_restore[16] = {
+        0, 2, 4, 6, 8, 10, 12, 14,
+        1, 3, 5, 7, 9, 11, 13, 15
+    };
+    const uint8x16_t idx = vld1q_u8(tbl_restore);
+
     /* Process 2 doubles at a time */
     for (; i + 2 <= count; i += 2) {
-        /* Load 2 bytes from each of the 8 streams */
-        uint16_t b0, b1, b2, b3, b4, b5, b6, b7;
-        memcpy(&b0, data + 0 * count + i, sizeof(uint16_t));
-        memcpy(&b1, data + 1 * count + i, sizeof(uint16_t));
-        memcpy(&b2, data + 2 * count + i, sizeof(uint16_t));
-        memcpy(&b3, data + 3 * count + i, sizeof(uint16_t));
-        memcpy(&b4, data + 4 * count + i, sizeof(uint16_t));
-        memcpy(&b5, data + 5 * count + i, sizeof(uint16_t));
-        memcpy(&b6, data + 6 * count + i, sizeof(uint16_t));
-        memcpy(&b7, data + 7 * count + i, sizeof(uint16_t));
+        uint16x8_t streams = vdupq_n_u16(0);
+        streams = vld1q_lane_u16((const uint16_t*)(data + i), streams, 0);
+        streams = vld1q_lane_u16((const uint16_t*)(data + count + i), streams, 1);
+        streams = vld1q_lane_u16((const uint16_t*)(data + 2 * count + i), streams, 2);
+        streams = vld1q_lane_u16((const uint16_t*)(data + 3 * count + i), streams, 3);
+        streams = vld1q_lane_u16((const uint16_t*)(data + 4 * count + i), streams, 4);
+        streams = vld1q_lane_u16((const uint16_t*)(data + 5 * count + i), streams, 5);
+        streams = vld1q_lane_u16((const uint16_t*)(data + 6 * count + i), streams, 6);
+        streams = vld1q_lane_u16((const uint16_t*)(data + 7 * count + i), streams, 7);
 
-        /* Create vectors with each byte pair */
-        uint8x8_t bytes0 = vreinterpret_u8_u16(vdup_n_u16(b0));
-        uint8x8_t bytes1 = vreinterpret_u8_u16(vdup_n_u16(b1));
-        uint8x8_t bytes2 = vreinterpret_u8_u16(vdup_n_u16(b2));
-        uint8x8_t bytes3 = vreinterpret_u8_u16(vdup_n_u16(b3));
-        uint8x8_t bytes4 = vreinterpret_u8_u16(vdup_n_u16(b4));
-        uint8x8_t bytes5 = vreinterpret_u8_u16(vdup_n_u16(b5));
-        uint8x8_t bytes6 = vreinterpret_u8_u16(vdup_n_u16(b6));
-        uint8x8_t bytes7 = vreinterpret_u8_u16(vdup_n_u16(b7));
-
-        /* Interleave bytes to reconstruct doubles:
-         * Input:  b0=[a0,b0], b1=[a1,b1], ..., b7=[a7,b7]
-         * Output: [a0,a1,a2,a3,a4,a5,a6,a7, b0,b1,b2,b3,b4,b5,b6,b7]
-         */
-
-        /* Interleave pairs of byte streams */
-        uint8x8x2_t zip01 = vzip_u8(bytes0, bytes1);  /* [a0,a1,b0,b1,...] */
-        uint8x8x2_t zip23 = vzip_u8(bytes2, bytes3);
-        uint8x8x2_t zip45 = vzip_u8(bytes4, bytes5);
-        uint8x8x2_t zip67 = vzip_u8(bytes6, bytes7);
-
-        /* Now interleave 16-bit pairs */
-        uint16x4_t lo01 = vreinterpret_u16_u8(zip01.val[0]);
-        uint16x4_t lo23 = vreinterpret_u16_u8(zip23.val[0]);
-        uint16x4_t lo45 = vreinterpret_u16_u8(zip45.val[0]);
-        uint16x4_t lo67 = vreinterpret_u16_u8(zip67.val[0]);
-
-        uint16x4x2_t zip0123 = vzip_u16(lo01, lo23);
-        uint16x4x2_t zip4567 = vzip_u16(lo45, lo67);
-
-        /* Interleave 32-bit pairs */
-        uint32x2_t lo0123 = vreinterpret_u32_u16(zip0123.val[0]);
-        uint32x2_t lo4567 = vreinterpret_u32_u16(zip4567.val[0]);
-
-        uint32x2x2_t zip_final = vzip_u32(lo0123, lo4567);
-
-        /* Store the two doubles */
-        vst1_u8(dst + i * 8, vreinterpret_u8_u32(zip_final.val[0]));
-        vst1_u8(dst + i * 8 + 8, vreinterpret_u8_u32(zip_final.val[1]));
+        uint8x16_t packed = vreinterpretq_u8_u16(streams);
+        uint8x16_t restored = vqtbl1q_u8(packed, idx);
+        vst1q_u8(dst + i * 8, restored);
     }
 
     /* Handle remaining values */
@@ -647,6 +596,83 @@ void carquet_neon_gather_i32(const int32_t* dict, const uint32_t* indices,
     }
 }
 
+bool carquet_neon_checked_gather_i32(const int32_t* dict, int32_t dict_count,
+                                      const uint32_t* indices, int64_t count,
+                                      int32_t* output) {
+    int64_t i = 0;
+    uint32x4_t max_index = vdupq_n_u32((uint32_t)dict_count - 1U);
+
+    for (; i + 8 <= count; i += 8) {
+        uint32x4_t idx0 = vld1q_u32(indices + i);
+        uint32x4_t idx1 = vld1q_u32(indices + i + 4);
+
+        if (vmaxvq_u32(idx0) > vgetq_lane_u32(max_index, 0) ||
+            vmaxvq_u32(idx1) > vgetq_lane_u32(max_index, 0)) {
+            for (int64_t j = i; j < i + 8; j++) {
+                uint32_t idx = indices[j];
+                if (idx >= (uint32_t)dict_count) {
+                    return false;
+                }
+                output[j] = dict[idx];
+            }
+            continue;
+        }
+
+        __builtin_prefetch(indices + i + 16, 0, 1);
+        __builtin_prefetch(dict + vgetq_lane_u32(idx0, 0), 0, 0);
+        __builtin_prefetch(dict + vgetq_lane_u32(idx0, 2), 0, 0);
+        __builtin_prefetch(dict + vgetq_lane_u32(idx1, 0), 0, 0);
+        __builtin_prefetch(dict + vgetq_lane_u32(idx1, 2), 0, 0);
+
+        int32x4_t result0 = {
+            dict[vgetq_lane_u32(idx0, 0)],
+            dict[vgetq_lane_u32(idx0, 1)],
+            dict[vgetq_lane_u32(idx0, 2)],
+            dict[vgetq_lane_u32(idx0, 3)]
+        };
+        int32x4_t result1 = {
+            dict[vgetq_lane_u32(idx1, 0)],
+            dict[vgetq_lane_u32(idx1, 1)],
+            dict[vgetq_lane_u32(idx1, 2)],
+            dict[vgetq_lane_u32(idx1, 3)]
+        };
+        vst1q_s32(output + i, result0);
+        vst1q_s32(output + i + 4, result1);
+    }
+
+    for (; i + 4 <= count; i += 4) {
+        uint32x4_t idx = vld1q_u32(indices + i);
+        if (vmaxvq_u32(idx) > vgetq_lane_u32(max_index, 0)) {
+            for (int64_t j = i; j < i + 4; j++) {
+                uint32_t lane = indices[j];
+                if (lane >= (uint32_t)dict_count) {
+                    return false;
+                }
+                output[j] = dict[lane];
+            }
+            continue;
+        }
+
+        int32x4_t result = {
+            dict[vgetq_lane_u32(idx, 0)],
+            dict[vgetq_lane_u32(idx, 1)],
+            dict[vgetq_lane_u32(idx, 2)],
+            dict[vgetq_lane_u32(idx, 3)]
+        };
+        vst1q_s32(output + i, result);
+    }
+
+    for (; i < count; i++) {
+        uint32_t idx = indices[i];
+        if (idx >= (uint32_t)dict_count) {
+            return false;
+        }
+        output[i] = dict[idx];
+    }
+
+    return true;
+}
+
 /**
  * Gather int64 values from dictionary using indices (NEON).
  */
@@ -681,6 +707,52 @@ void carquet_neon_gather_i64(const int64_t* dict, const uint32_t* indices,
     }
 }
 
+bool carquet_neon_checked_gather_i64(const int64_t* dict, int32_t dict_count,
+                                      const uint32_t* indices, int64_t count,
+                                      int64_t* output) {
+    int64_t i = 0;
+    uint32x4_t max_index = vdupq_n_u32((uint32_t)dict_count - 1U);
+
+    for (; i + 4 <= count; i += 4) {
+        uint32x4_t idx = vld1q_u32(indices + i);
+        if (vmaxvq_u32(idx) > vgetq_lane_u32(max_index, 0)) {
+            for (int64_t j = i; j < i + 4; j++) {
+                uint32_t lane = indices[j];
+                if (lane >= (uint32_t)dict_count) {
+                    return false;
+                }
+                output[j] = dict[lane];
+            }
+            continue;
+        }
+
+        __builtin_prefetch(indices + i + 8, 0, 1);
+        __builtin_prefetch(dict + vgetq_lane_u32(idx, 0), 0, 0);
+        __builtin_prefetch(dict + vgetq_lane_u32(idx, 2), 0, 0);
+
+        int64x2_t result0 = {
+            dict[vgetq_lane_u32(idx, 0)],
+            dict[vgetq_lane_u32(idx, 1)]
+        };
+        int64x2_t result1 = {
+            dict[vgetq_lane_u32(idx, 2)],
+            dict[vgetq_lane_u32(idx, 3)]
+        };
+        vst1q_s64(output + i, result0);
+        vst1q_s64(output + i + 2, result1);
+    }
+
+    for (; i < count; i++) {
+        uint32_t idx = indices[i];
+        if (idx >= (uint32_t)dict_count) {
+            return false;
+        }
+        output[i] = dict[idx];
+    }
+
+    return true;
+}
+
 /**
  * Gather float values from dictionary using indices (NEON).
  * Note: float and int32 are both 4 bytes, so we reuse gather_i32 via cast.
@@ -689,6 +761,13 @@ void carquet_neon_gather_float(const float* dict, const uint32_t* indices,
                                 int64_t count, float* output) {
     /* Data movement doesn't care about type - reuse int32 implementation */
     carquet_neon_gather_i32((const int32_t*)dict, indices, count, (int32_t*)output);
+}
+
+bool carquet_neon_checked_gather_float(const float* dict, int32_t dict_count,
+                                        const uint32_t* indices, int64_t count,
+                                        float* output) {
+    return carquet_neon_checked_gather_i32((const int32_t*)dict, dict_count,
+                                           indices, count, (int32_t*)output);
 }
 
 /**
@@ -701,10 +780,27 @@ void carquet_neon_gather_double(const double* dict, const uint32_t* indices,
     carquet_neon_gather_i64((const int64_t*)dict, indices, count, (int64_t*)output);
 }
 
+bool carquet_neon_checked_gather_double(const double* dict, int32_t dict_count,
+                                         const uint32_t* indices, int64_t count,
+                                         double* output) {
+    return carquet_neon_checked_gather_i64((const int64_t*)dict, dict_count,
+                                           indices, count, (int64_t*)output);
+}
+
 /* ============================================================================
  * Boolean Packing/Unpacking - NEON Optimized
  * ============================================================================
  */
+
+static inline uint8_t carquet_neon_pack_bool_octet(uint8x8_t bools) {
+    static const uint8_t bit_positions[8] = {1, 2, 4, 8, 16, 32, 64, 128};
+    uint8x8_t masked = vand_u8(bools, vdup_n_u8(1));
+    uint8x8_t weighted = vmul_u8(masked, vld1_u8(bit_positions));
+    uint16x4_t sum16 = vpaddl_u8(weighted);
+    uint32x2_t sum32 = vpaddl_u16(sum16);
+    uint64x1_t sum64 = vpaddl_u32(sum32);
+    return (uint8_t)vget_lane_u64(sum64, 0);
+}
 
 /**
  * Unpack boolean values from packed bits to byte array using NEON.
@@ -713,41 +809,65 @@ void carquet_neon_gather_double(const double* dict, const uint32_t* indices,
 void carquet_neon_unpack_bools(const uint8_t* input, uint8_t* output, int64_t count) {
     int64_t i = 0;
 
-    /* Process 64 bools (8 bytes) at a time using NEON */
+    static const uint8_t nibble_bit0[16] = {0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1};
+    static const uint8_t nibble_bit1[16] = {0,0,1,1,0,0,1,1,0,0,1,1,0,0,1,1};
+    static const uint8_t nibble_bit2[16] = {0,0,0,0,1,1,1,1,0,0,0,0,1,1,1,1};
+    static const uint8_t nibble_bit3[16] = {0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1};
+    const uint8x8_t tbl0 = vld1_u8(nibble_bit0);
+    const uint8x8_t tbl1 = vld1_u8(nibble_bit1);
+    const uint8x8_t tbl2 = vld1_u8(nibble_bit2);
+    const uint8x8_t tbl3 = vld1_u8(nibble_bit3);
+
+    /* Process 8 packed bytes -> 64 unpacked bools. */
     for (; i + 64 <= count; i += 64) {
-        int byte_idx = (int)(i / 8);
-        uint8x8_t packed = vld1_u8(input + byte_idx);
+        uint8x8_t packed = vld1_u8(input + (i / 8));
+        uint8x8_t low = vand_u8(packed, vdup_n_u8(0x0F));
+        uint8x8_t high = vshr_n_u8(packed, 4);
 
-        /* For each byte, expand to 8 output bytes */
-        for (int b = 0; b < 8; b++) {
-            uint8_t byte_val = vget_lane_u8(packed, 0);
-            packed = vext_u8(packed, packed, 1);  /* Rotate */
+        uint8x8_t lo0 = vtbl1_u8(tbl0, low);
+        uint8x8_t lo1 = vtbl1_u8(tbl1, low);
+        uint8x8_t lo2 = vtbl1_u8(tbl2, low);
+        uint8x8_t lo3 = vtbl1_u8(tbl3, low);
+        uint8x8_t hi0 = vtbl1_u8(tbl0, high);
+        uint8x8_t hi1 = vtbl1_u8(tbl1, high);
+        uint8x8_t hi2 = vtbl1_u8(tbl2, high);
+        uint8x8_t hi3 = vtbl1_u8(tbl3, high);
 
-            /* Expand each bit to a byte */
-            static const uint8_t bit_masks[8] = {1, 2, 4, 8, 16, 32, 64, 128};
-            uint8x8_t byte_vec = vdup_n_u8(byte_val);
-            uint8x8_t masks = vld1_u8(bit_masks);
-            uint8x8_t masked = vand_u8(byte_vec, masks);
-            uint8x8_t cmp = vceq_u8(masked, masks);
-            uint8x8_t result = vand_u8(cmp, vdup_n_u8(1));
+        uint8x8x2_t zip01 = vzip_u8(lo0, lo1);
+        uint8x8x2_t zip23 = vzip_u8(lo2, lo3);
+        uint16x4x2_t zip0123a = vzip_u16(vreinterpret_u16_u8(zip01.val[0]),
+                                         vreinterpret_u16_u8(zip23.val[0]));
+        uint16x4x2_t zip0123b = vzip_u16(vreinterpret_u16_u8(zip01.val[1]),
+                                         vreinterpret_u16_u8(zip23.val[1]));
 
-            vst1_u8(output + i + b * 8, result);
-        }
+        vst1_u8(output + i, vreinterpret_u8_u16(zip0123a.val[0]));
+        vst1_u8(output + i + 8, vreinterpret_u8_u16(zip0123a.val[1]));
+        vst1_u8(output + i + 16, vreinterpret_u8_u16(zip0123b.val[0]));
+        vst1_u8(output + i + 24, vreinterpret_u8_u16(zip0123b.val[1]));
+
+        uint8x8x2_t zip45 = vzip_u8(hi0, hi1);
+        uint8x8x2_t zip67 = vzip_u8(hi2, hi3);
+        uint16x4x2_t zip4567a = vzip_u16(vreinterpret_u16_u8(zip45.val[0]),
+                                         vreinterpret_u16_u8(zip67.val[0]));
+        uint16x4x2_t zip4567b = vzip_u16(vreinterpret_u16_u8(zip45.val[1]),
+                                         vreinterpret_u16_u8(zip67.val[1]));
+
+        vst1_u8(output + i + 32, vreinterpret_u8_u16(zip4567a.val[0]));
+        vst1_u8(output + i + 40, vreinterpret_u8_u16(zip4567a.val[1]));
+        vst1_u8(output + i + 48, vreinterpret_u8_u16(zip4567b.val[0]));
+        vst1_u8(output + i + 56, vreinterpret_u8_u16(zip4567b.val[1]));
     }
 
-    /* Process 8 bools (1 byte) at a time */
     for (; i + 8 <= count; i += 8) {
-        int byte_idx = (int)(i / 8);
-        uint8_t byte_val = input[byte_idx];
-
-        uint8x8_t byte_vec = vdup_n_u8(byte_val);
-        static const uint8_t bit_masks[8] = {1, 2, 4, 8, 16, 32, 64, 128};
-        uint8x8_t masks = vld1_u8(bit_masks);
-        uint8x8_t masked = vand_u8(byte_vec, masks);
-        uint8x8_t cmp = vceq_u8(masked, masks);
-        uint8x8_t result = vand_u8(cmp, vdup_n_u8(1));
-
-        vst1_u8(output + i, result);
+        uint8_t byte_val = input[i / 8];
+        output[i + 0] = (uint8_t)(byte_val & 1U);
+        output[i + 1] = (uint8_t)((byte_val >> 1) & 1U);
+        output[i + 2] = (uint8_t)((byte_val >> 2) & 1U);
+        output[i + 3] = (uint8_t)((byte_val >> 3) & 1U);
+        output[i + 4] = (uint8_t)((byte_val >> 4) & 1U);
+        output[i + 5] = (uint8_t)((byte_val >> 5) & 1U);
+        output[i + 6] = (uint8_t)((byte_val >> 6) & 1U);
+        output[i + 7] = (uint8_t)((byte_val >> 7) & 1U);
     }
 
     /* Handle remaining */
@@ -764,25 +884,14 @@ void carquet_neon_unpack_bools(const uint8_t* input, uint8_t* output, int64_t co
 void carquet_neon_pack_bools(const uint8_t* input, uint8_t* output, int64_t count) {
     int64_t i = 0;
 
-    /* Process 8 bools at a time */
+    for (; i + 16 <= count; i += 16) {
+        uint8x16_t bools = vld1q_u8(input + i);
+        output[i / 8] = carquet_neon_pack_bool_octet(vget_low_u8(bools));
+        output[i / 8 + 1] = carquet_neon_pack_bool_octet(vget_high_u8(bools));
+    }
+
     for (; i + 8 <= count; i += 8) {
-        uint8x8_t bools = vld1_u8(input + i);
-
-        /* Multiply by bit positions and sum */
-        static const uint8_t bit_positions[8] = {1, 2, 4, 8, 16, 32, 64, 128};
-        uint8x8_t positions = vld1_u8(bit_positions);
-
-        /* AND with 1 to ensure boolean, then multiply */
-        uint8x8_t masked = vand_u8(bools, vdup_n_u8(1));
-        uint8x8_t weighted = vmul_u8(masked, positions);
-
-        /* Horizontal add - NEON doesn't have direct horizontal add for u8,
-           so we use pairwise operations */
-        uint16x4_t sum16 = vpaddl_u8(weighted);
-        uint32x2_t sum32 = vpaddl_u16(sum16);
-        uint64x1_t sum64 = vpaddl_u32(sum32);
-
-        output[i / 8] = (uint8_t)vget_lane_u64(sum64, 0);
+        output[i / 8] = carquet_neon_pack_bool_octet(vld1_u8(input + i));
     }
 
     /* Handle remaining */

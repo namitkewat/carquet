@@ -35,6 +35,8 @@
 
 static pthread_key_t tls_dctx_key;
 static pthread_once_t tls_dctx_once = PTHREAD_ONCE_INIT;
+static pthread_key_t tls_cctx_key;
+static pthread_once_t tls_cctx_once = PTHREAD_ONCE_INIT;
 
 static void destroy_dctx(void* ctx) {
     if (ctx) {
@@ -42,8 +44,18 @@ static void destroy_dctx(void* ctx) {
     }
 }
 
+static void destroy_cctx(void* ctx) {
+    if (ctx) {
+        ZSTD_freeCCtx((ZSTD_CCtx*)ctx);
+    }
+}
+
 static void init_tls_key(void) {
     pthread_key_create(&tls_dctx_key, destroy_dctx);
+}
+
+static void init_cctx_key(void) {
+    pthread_key_create(&tls_cctx_key, destroy_cctx);
 }
 
 static ZSTD_DCtx* get_dctx(void) {
@@ -58,12 +70,26 @@ static ZSTD_DCtx* get_dctx(void) {
     return dctx;
 }
 
+static ZSTD_CCtx* get_cctx(void) {
+    pthread_once(&tls_cctx_once, init_cctx_key);
+    ZSTD_CCtx* cctx = (ZSTD_CCtx*)pthread_getspecific(tls_cctx_key);
+    if (!cctx) {
+        cctx = ZSTD_createCCtx();
+        if (cctx) {
+            pthread_setspecific(tls_cctx_key, cctx);
+        }
+    }
+    return cctx;
+}
+
 #else
 /* Use thread-local storage for modern systems */
 #ifdef _MSC_VER
 static __declspec(thread) ZSTD_DCtx* tls_dctx = NULL;
+static __declspec(thread) ZSTD_CCtx* tls_cctx = NULL;
 #else
 static __thread ZSTD_DCtx* tls_dctx = NULL;
+static __thread ZSTD_CCtx* tls_cctx = NULL;
 #endif
 
 static ZSTD_DCtx* get_dctx(void) {
@@ -72,17 +98,32 @@ static ZSTD_DCtx* get_dctx(void) {
     }
     return tls_dctx;
 }
+
+static ZSTD_CCtx* get_cctx(void) {
+    if (!tls_cctx) {
+        tls_cctx = ZSTD_createCCtx();
+    }
+    return tls_cctx;
+}
 #endif /* CARQUET_USE_PTHREAD_TLS */
 
 #else
-/* No OpenMP - use global context */
+/* No OpenMP - use global contexts */
 static ZSTD_DCtx* global_dctx = NULL;
+static ZSTD_CCtx* global_cctx = NULL;
 
 static ZSTD_DCtx* get_dctx(void) {
     if (!global_dctx) {
         global_dctx = ZSTD_createDCtx();
     }
     return global_dctx;
+}
+
+static ZSTD_CCtx* get_cctx(void) {
+    if (!global_cctx) {
+        global_cctx = ZSTD_createCCtx();
+    }
+    return global_cctx;
 }
 #endif /* _OPENMP */
 
@@ -133,6 +174,30 @@ int carquet_zstd_compress(
     if (level < 1) level = 1;
     if (level > ZSTD_maxCLevel()) level = ZSTD_maxCLevel();
 
+    /* Use cached context for repeated compressions (e.g., per-page).
+     * Only enable multi-threading for large inputs (>4MB) where the
+     * parallelism overhead is worthwhile. */
+    ZSTD_CCtx* cctx = get_cctx();
+    if (cctx) {
+        ZSTD_CCtx_setParameter(cctx, ZSTD_c_compressionLevel, level);
+
+        /* Only use multi-threading for large inputs where parallelism
+         * outweighs coordination overhead. For typical 1MB pages, single-
+         * threaded with a cached context is faster. */
+        if (src_size > 4 * 1024 * 1024) {
+            ZSTD_CCtx_setParameter(cctx, ZSTD_c_nbWorkers, 4);
+        } else {
+            ZSTD_CCtx_setParameter(cctx, ZSTD_c_nbWorkers, 0);
+        }
+
+        size_t result = ZSTD_compress2(cctx, dst, dst_capacity, src, src_size);
+        if (!ZSTD_isError(result)) {
+            *dst_size = result;
+            return CARQUET_OK;
+        }
+    }
+
+    /* Fallback to simple API */
     size_t result = ZSTD_compress(dst, dst_capacity, src, src_size, level);
     if (ZSTD_isError(result)) {
         return CARQUET_ERROR_COMPRESSION;

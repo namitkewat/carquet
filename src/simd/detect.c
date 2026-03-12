@@ -15,7 +15,7 @@
 #endif
 
 /* Linux ARM SVE detection via getauxval */
-#if defined(__linux__) && defined(__aarch64__)
+#if defined(__linux__) && (defined(__aarch64__) || defined(__arm64__))
 #include <sys/auxv.h>
 #ifndef HWCAP_SVE
 #define HWCAP_SVE (1 << 22)
@@ -29,11 +29,31 @@
 #endif
 
 static carquet_cpu_info_t g_cpu_info = {0};
-static volatile int g_initialized = 0;
+static int g_initialized = 0;
 
 /* External initialization functions for compression tables */
 extern void carquet_gzip_init_tables(void);
 extern void carquet_zstd_init_tables(void);
+
+static int carquet_is_initialized(void) {
+#if defined(__GNUC__) || defined(__clang__)
+    return __atomic_load_n(&g_initialized, __ATOMIC_ACQUIRE);
+#elif defined(_MSC_VER)
+    return _InterlockedCompareExchange((volatile long*)&g_initialized, 1, 1);
+#else
+    return g_initialized;
+#endif
+}
+
+static void carquet_set_initialized(void) {
+#if defined(__GNUC__) || defined(__clang__)
+    __atomic_store_n(&g_initialized, 1, __ATOMIC_RELEASE);
+#elif defined(_MSC_VER)
+    _InterlockedExchange((volatile long*)&g_initialized, 1);
+#else
+    g_initialized = 1;
+#endif
+}
 
 #if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
 
@@ -79,11 +99,15 @@ static void detect_x86_features(void) {
 #endif
 }
 
-#elif defined(__aarch64__) || defined(_M_ARM64)
+#elif defined(__aarch64__) || defined(__arm64__) || defined(_M_ARM64)
 
 static void detect_arm_features(void) {
-    /* NEON is always available on AArch64 */
+    /* NEON is baseline on 64-bit ARM and available when compiled with NEON support. */
+#if defined(__aarch64__) || defined(__arm64__) || defined(_M_ARM64) || defined(__ARM_NEON) || defined(__ARM_NEON__)
     g_cpu_info.has_neon = 1;
+#else
+    g_cpu_info.has_neon = 0;
+#endif
 
     /* SVE detection */
     g_cpu_info.has_sve = 0;
@@ -125,7 +149,7 @@ static void detect_arm_features(void) {
 
 carquet_status_t carquet_init(void) {
     /* Fast path: already initialized */
-    if (g_initialized) {
+    if (carquet_is_initialized()) {
         return CARQUET_OK;
     }
 
@@ -134,8 +158,14 @@ carquet_status_t carquet_init(void) {
 
 #if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
     detect_x86_features();
-#elif defined(__aarch64__) || defined(_M_ARM64) || defined(__arm__) || defined(_M_ARM)
+#elif defined(__aarch64__) || defined(__arm64__) || defined(_M_ARM64) || defined(__arm__) || defined(_M_ARM)
     detect_arm_features();
+#endif
+
+#if defined(__aarch64__) || defined(__arm64__) || defined(_M_ARM64)
+    if (!g_cpu_info.has_neon) {
+        g_cpu_info.has_neon = 1;
+    }
 #endif
 
     /* Initialize compression lookup tables.
@@ -147,21 +177,21 @@ carquet_status_t carquet_init(void) {
     /* Use memory barrier to ensure all writes are visible before flag is set.
      * Note: For full thread safety, callers should ensure carquet_init()
      * is called once before spawning threads that use carquet. */
-#if defined(__GNUC__) || defined(__clang__)
-    __atomic_store_n(&g_initialized, 1, __ATOMIC_RELEASE);
-#elif defined(_MSC_VER)
-    _InterlockedExchange((volatile long*)&g_initialized, 1);
-#else
-    g_initialized = 1;
-#endif
+    carquet_set_initialized();
 
     return CARQUET_OK;
 }
 
 const carquet_cpu_info_t* carquet_get_cpu_info(void) {
-    if (!g_initialized) {
+    if (!carquet_is_initialized()) {
         carquet_status_t status = carquet_init();
         (void)status; /* Ignore - we'll return info regardless */
     }
+
+#if defined(__aarch64__) || defined(__arm64__) || defined(_M_ARM64)
+    if (!g_cpu_info.has_neon) {
+        g_cpu_info.has_neon = 1;
+    }
+#endif
     return &g_cpu_info;
 }

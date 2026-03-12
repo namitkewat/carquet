@@ -147,9 +147,9 @@ carquet_mmap_info_t* carquet_mmap_open(const char* path, carquet_error_t* error)
         return NULL;
     }
 
-    /* Advise the kernel about access pattern - use MADV_RANDOM for Parquet
-     * since we typically seek to specific column chunks rather than reading sequentially */
-    madvise(mmap_info->data, mmap_info->size, MADV_RANDOM);
+    /* Analytics scans walk column chunks in file-offset order and benefit from
+     * sequential readahead more than random-page heuristics. */
+    madvise(mmap_info->data, mmap_info->size, MADV_SEQUENTIAL);
 
     mmap_info->is_valid = true;
     return mmap_info;

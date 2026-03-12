@@ -141,6 +141,18 @@ carquet_status_t carquet_byte_stream_split_encode(
         return CARQUET_ERROR_ENCODE;
     }
 
+    if (type_length == 4) {
+        carquet_dispatch_byte_split_encode_float((const float*)values, count, output);
+        *bytes_written = required_size;
+        return CARQUET_OK;
+    }
+
+    if (type_length == 8) {
+        carquet_dispatch_byte_split_encode_double((const double*)values, count, output);
+        *bytes_written = required_size;
+        return CARQUET_OK;
+    }
+
     /* Transpose: put byte 0 of all values, then byte 1, etc. */
     for (int b = 0; b < type_length; b++) {
         for (int64_t i = 0; i < count; i++) {
@@ -166,6 +178,16 @@ carquet_status_t carquet_byte_stream_split_decode(
     size_t required_size = (size_t)count * (size_t)type_length;
     if (data_size < required_size) {
         return CARQUET_ERROR_DECODE;
+    }
+
+    if (type_length == 4) {
+        carquet_dispatch_byte_split_decode_float(data, count, (float*)values);
+        return CARQUET_OK;
+    }
+
+    if (type_length == 8) {
+        carquet_dispatch_byte_split_decode_double(data, count, (double*)values);
+        return CARQUET_OK;
     }
 
     /* Un-transpose: gather byte streams back into values */

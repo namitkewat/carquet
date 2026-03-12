@@ -68,11 +68,41 @@ extern carquet_status_t carquet_row_group_writer_finalize(
     size_t* size,
     int64_t num_rows);
 
+extern carquet_status_t carquet_row_group_writer_write_to_file(
+    carquet_row_group_writer_t* writer,
+    FILE* file,
+    size_t* total_size,
+    int64_t num_rows);
+
 extern int carquet_row_group_writer_num_columns(const carquet_row_group_writer_t* writer);
 extern int64_t carquet_row_group_writer_num_rows(const carquet_row_group_writer_t* writer);
 extern int64_t carquet_row_group_writer_total_byte_size(const carquet_row_group_writer_t* writer);
 extern const column_chunk_info_t* carquet_row_group_writer_get_column_info(
     const carquet_row_group_writer_t* writer, int index);
+
+extern void carquet_row_group_writer_set_options(
+    carquet_row_group_writer_t* writer,
+    bool write_bloom_filters, bool write_page_index,
+    int32_t compression_level);
+
+/* Bloom filter and page index accessors */
+typedef struct carquet_bloom_filter carquet_bloom_filter_t;
+typedef struct carquet_column_index_builder carquet_column_index_builder_t;
+typedef struct carquet_offset_index_builder carquet_offset_index_builder_t;
+
+extern carquet_bloom_filter_t* carquet_row_group_writer_get_bloom_filter(
+    const carquet_row_group_writer_t* writer, int index);
+extern carquet_column_index_builder_t* carquet_row_group_writer_get_column_index(
+    const carquet_row_group_writer_t* writer, int index);
+extern carquet_offset_index_builder_t* carquet_row_group_writer_get_offset_index(
+    const carquet_row_group_writer_t* writer, int index);
+
+extern const uint8_t* carquet_bloom_filter_data(const carquet_bloom_filter_t* filter);
+extern size_t carquet_bloom_filter_size(const carquet_bloom_filter_t* filter);
+extern carquet_status_t carquet_column_index_serialize(
+    const carquet_column_index_builder_t* builder, carquet_buffer_t* output);
+extern carquet_status_t carquet_offset_index_serialize(
+    const carquet_offset_index_builder_t* builder, carquet_buffer_t* output);
 
 /* ============================================================================
  * Writer Schema Structure (for building)
@@ -271,15 +301,28 @@ static carquet_status_t ensure_row_group(carquet_writer_t* writer) {
         return CARQUET_OK;
     }
 
+    size_t target_page_size = (size_t)writer->options.page_size;
+    if (writer->options.compression == CARQUET_COMPRESSION_ZSTD &&
+        target_page_size == 1024 * 1024) {
+        target_page_size = 4 * 1024 * 1024;
+    }
+
     writer->current_row_group = carquet_row_group_writer_create(
         NULL,  /* Schema not used directly */
         writer->options.compression,
-        (size_t)writer->options.page_size,
+        target_page_size,
         writer->file_offset);
 
     if (!writer->current_row_group) {
         return CARQUET_ERROR_OUT_OF_MEMORY;
     }
+
+    /* Pass optional feature flags */
+    carquet_row_group_writer_set_options(
+        writer->current_row_group,
+        writer->options.write_bloom_filters,
+        writer->options.write_page_index,
+        writer->options.compression_level);
 
     /* Add all columns to the row group writer */
     for (int32_t i = 0; i < writer->num_columns; i++) {
@@ -312,21 +355,15 @@ static carquet_status_t flush_row_group(carquet_writer_t* writer) {
         return CARQUET_OK;
     }
 
-    /* Finalize the row group */
-    const uint8_t* data;
+    /* Finalize and write each column directly to file, avoiding
+     * an intermediate copy of the entire row group into one buffer */
     size_t size;
-    carquet_status_t status = carquet_row_group_writer_finalize(
-        writer->current_row_group, &data, &size, writer->current_row_group_rows);
+    carquet_status_t status = carquet_row_group_writer_write_to_file(
+        writer->current_row_group, writer->file, &size,
+        writer->current_row_group_rows);
 
     if (status != CARQUET_OK) {
         return status;
-    }
-
-    /* Write row group data to file */
-    if (size > 0) {
-        if (fwrite(data, 1, size, writer->file) != size) {
-            return CARQUET_ERROR_FILE_WRITE;
-        }
     }
 
     /* Store row group metadata */
@@ -364,6 +401,44 @@ static carquet_status_t flush_row_group(carquet_writer_t* writer) {
         return CARQUET_ERROR_OUT_OF_MEMORY;
     }
 
+    /* Build parent map once for all columns (heap-allocated for large schemas) */
+    int32_t* parent_map = malloc(writer->num_schema_elements * sizeof(int32_t));
+    if (!parent_map) {
+        return CARQUET_ERROR_OUT_OF_MEMORY;
+    }
+    memset(parent_map, -1, writer->num_schema_elements * sizeof(int32_t));
+    {
+        /* DFS traversal using a stack of (element_idx, remaining_children) */
+        int32_t* stack_idx = malloc(writer->num_schema_elements * sizeof(int32_t));
+        int32_t* stack_rem = malloc(writer->num_schema_elements * sizeof(int32_t));
+        if (!stack_idx || !stack_rem) {
+            free(parent_map);
+            free(stack_idx);
+            free(stack_rem);
+            return CARQUET_ERROR_OUT_OF_MEMORY;
+        }
+        int32_t sp = 0;
+        stack_idx[0] = 0;
+        stack_rem[0] = writer->schema_elements[0].num_children;
+
+        for (int32_t idx = 1; idx < writer->num_schema_elements; idx++) {
+            parent_map[idx] = stack_idx[sp];
+            stack_rem[sp]--;
+
+            while (sp >= 0 && stack_rem[sp] == 0) {
+                sp--;
+            }
+
+            if (writer->schema_elements[idx].num_children > 0) {
+                sp++;
+                stack_idx[sp] = idx;
+                stack_rem[sp] = writer->schema_elements[idx].num_children;
+            }
+        }
+        free(stack_idx);
+        free(stack_rem);
+    }
+
     for (int i = 0; i < num_cols; i++) {
         const column_chunk_info_t* col_info = carquet_row_group_writer_get_column_info(
             writer->current_row_group, i);
@@ -390,17 +465,179 @@ static carquet_status_t flush_row_group(carquet_writer_t* writer) {
             meta->encodings[1] = CARQUET_ENCODING_RLE;
         }
 
-        /* Path in schema */
-        meta->path_len = 1;
-        meta->path_in_schema = carquet_arena_calloc(&writer->arena, 1, sizeof(char*));
-        if (meta->path_in_schema && col_info->path) {
-            meta->path_in_schema[0] = carquet_arena_strdup(&writer->arena, col_info->path);
+        /* Path in schema - build full hierarchical path for nested columns */
+        {
+            const char* path_components[64];
+            int32_t path_depth = 0;
+
+            /* Find the leaf element index in the stored schema */
+            int32_t leaf_elem_idx = -1;
+            int32_t leaf_count = 0;
+            for (int32_t si = 0; si < writer->num_schema_elements; si++) {
+                if (writer->schema_elements[si].num_children == 0) {
+                    if (leaf_count == i) {
+                        leaf_elem_idx = si;
+                        break;
+                    }
+                    leaf_count++;
+                }
+            }
+
+            if (leaf_elem_idx >= 0) {
+                /* Walk up from leaf to root */
+                int32_t cur = leaf_elem_idx;
+                while (cur > 0 && path_depth < 64) {
+                    path_components[path_depth++] = writer->schema_elements[cur].name;
+                    cur = parent_map[cur];
+                }
+            }
+
+            if (path_depth > 0) {
+                meta->path_len = path_depth;
+                meta->path_in_schema = carquet_arena_calloc(&writer->arena, path_depth, sizeof(char*));
+                if (meta->path_in_schema) {
+                    /* Reverse to root-first order */
+                    for (int32_t pi = 0; pi < path_depth; pi++) {
+                        meta->path_in_schema[pi] = carquet_arena_strdup(
+                            &writer->arena, path_components[path_depth - 1 - pi]);
+                    }
+                }
+            } else {
+                /* Fallback: just use column name */
+                meta->path_len = 1;
+                meta->path_in_schema = carquet_arena_calloc(&writer->arena, 1, sizeof(char*));
+                if (meta->path_in_schema && col_info->path) {
+                    meta->path_in_schema[0] = carquet_arena_strdup(&writer->arena, col_info->path);
+                }
+            }
         }
     }
+
+    free(parent_map);
 
     writer->num_row_groups++;
     writer->file_offset += (int64_t)size;
     writer->total_rows += writer->current_row_group_rows;
+
+    /* Write bloom filters for each column (after row group data) */
+    if (writer->options.write_bloom_filters) {
+        for (int i = 0; i < num_cols; i++) {
+            carquet_bloom_filter_t* bf = carquet_row_group_writer_get_bloom_filter(
+                writer->current_row_group, i);
+            if (!bf) continue;
+
+            const uint8_t* bf_data = carquet_bloom_filter_data(bf);
+            size_t bf_size = carquet_bloom_filter_size(bf);
+            if (!bf_data || bf_size == 0) continue;
+
+            /* Write Bloom Filter Header (Thrift):
+             * numBytes: i32, algorithm: MURMUR3_X64_128, hash: XXHASH, compression: UNCOMPRESSED */
+            carquet_buffer_t bf_header;
+            carquet_buffer_init(&bf_header);
+            {
+                thrift_encoder_t enc;
+                thrift_encoder_init(&enc, &bf_header);
+                thrift_write_struct_begin(&enc);
+                /* Field 1: numBytes (i32) */
+                thrift_write_field_header(&enc, THRIFT_TYPE_I32, 1);
+                thrift_write_i32(&enc, (int32_t)bf_size);
+                /* Field 2: algorithm (BloomFilterAlgorithm struct) */
+                thrift_write_field_header(&enc, THRIFT_TYPE_STRUCT, 2);
+                thrift_write_struct_begin(&enc);
+                /* Field 1: SPLIT_BLOCK_BLOOM_FILTER (empty struct) */
+                thrift_write_field_header(&enc, THRIFT_TYPE_STRUCT, 1);
+                thrift_write_struct_begin(&enc);
+                thrift_write_struct_end(&enc);
+                thrift_write_struct_end(&enc);
+                /* Field 3: hash (BloomFilterHash struct) */
+                thrift_write_field_header(&enc, THRIFT_TYPE_STRUCT, 3);
+                thrift_write_struct_begin(&enc);
+                /* Field 1: XXHASH (empty struct) */
+                thrift_write_field_header(&enc, THRIFT_TYPE_STRUCT, 1);
+                thrift_write_struct_begin(&enc);
+                thrift_write_struct_end(&enc);
+                thrift_write_struct_end(&enc);
+                /* Field 4: compression (BloomFilterCompression struct) */
+                thrift_write_field_header(&enc, THRIFT_TYPE_STRUCT, 4);
+                thrift_write_struct_begin(&enc);
+                /* Field 1: UNCOMPRESSED (empty struct) */
+                thrift_write_field_header(&enc, THRIFT_TYPE_STRUCT, 1);
+                thrift_write_struct_begin(&enc);
+                thrift_write_struct_end(&enc);
+                thrift_write_struct_end(&enc);
+                thrift_write_struct_end(&enc);
+            }
+
+            /* Record offset in column metadata */
+            parquet_column_chunk_t* chunk = &rg_info->metadata.columns[i];
+            chunk->metadata.has_bloom_filter_offset = true;
+            chunk->metadata.bloom_filter_offset = writer->file_offset;
+            chunk->metadata.has_bloom_filter_length = true;
+            chunk->metadata.bloom_filter_length = (int32_t)(bf_header.size + bf_size);
+
+            /* Write header + data */
+            if (fwrite(bf_header.data, 1, bf_header.size, writer->file) != bf_header.size) {
+                carquet_buffer_destroy(&bf_header);
+                return CARQUET_ERROR_FILE_WRITE;
+            }
+            writer->file_offset += (int64_t)bf_header.size;
+            carquet_buffer_destroy(&bf_header);
+
+            if (fwrite(bf_data, 1, bf_size, writer->file) != bf_size) {
+                return CARQUET_ERROR_FILE_WRITE;
+            }
+            writer->file_offset += (int64_t)bf_size;
+        }
+    }
+
+    /* Write column indexes and offset indexes (after bloom filters) */
+    if (writer->options.write_page_index) {
+        for (int i = 0; i < num_cols; i++) {
+            parquet_column_chunk_t* chunk = &rg_info->metadata.columns[i];
+
+            /* Column index */
+            carquet_column_index_builder_t* ci = carquet_row_group_writer_get_column_index(
+                writer->current_row_group, i);
+            if (ci) {
+                carquet_buffer_t ci_buf;
+                carquet_buffer_init(&ci_buf);
+                carquet_column_index_serialize(ci, &ci_buf);
+                if (ci_buf.size > 0) {
+                    chunk->has_column_index_offset = true;
+                    chunk->column_index_offset = writer->file_offset;
+                    chunk->has_column_index_length = true;
+                    chunk->column_index_length = (int32_t)ci_buf.size;
+                    if (fwrite(ci_buf.data, 1, ci_buf.size, writer->file) != ci_buf.size) {
+                        carquet_buffer_destroy(&ci_buf);
+                        return CARQUET_ERROR_FILE_WRITE;
+                    }
+                    writer->file_offset += (int64_t)ci_buf.size;
+                }
+                carquet_buffer_destroy(&ci_buf);
+            }
+
+            /* Offset index */
+            carquet_offset_index_builder_t* oi = carquet_row_group_writer_get_offset_index(
+                writer->current_row_group, i);
+            if (oi) {
+                carquet_buffer_t oi_buf;
+                carquet_buffer_init(&oi_buf);
+                carquet_offset_index_serialize(oi, &oi_buf);
+                if (oi_buf.size > 0) {
+                    chunk->has_offset_index_offset = true;
+                    chunk->offset_index_offset = writer->file_offset;
+                    chunk->has_offset_index_length = true;
+                    chunk->offset_index_length = (int32_t)oi_buf.size;
+                    if (fwrite(oi_buf.data, 1, oi_buf.size, writer->file) != oi_buf.size) {
+                        carquet_buffer_destroy(&oi_buf);
+                        return CARQUET_ERROR_FILE_WRITE;
+                    }
+                    writer->file_offset += (int64_t)oi_buf.size;
+                }
+                carquet_buffer_destroy(&oi_buf);
+            }
+        }
+    }
 
     /* Cleanup current row group */
     carquet_row_group_writer_destroy(writer->current_row_group);
@@ -649,9 +886,20 @@ carquet_status_t carquet_writer_write_batch(
 
     writer->column_values_written[column_index] += num_values;
 
-    /* Track rows (use column 0 as reference) */
+    /* Track rows (use column 0 as reference).
+     * For repeated columns (max_rep_level > 0), the number of logical rows
+     * is the count of rep_level == 0 entries (new top-level records).
+     * For non-repeated columns, num_values == num_rows. */
     if (column_index == 0) {
-        writer->current_row_group_rows += num_values;
+        if (rep_levels && writer->columns[0].max_rep_level > 0) {
+            int64_t rows = 0;
+            for (int64_t i = 0; i < num_values; i++) {
+                if (rep_levels[i] == 0) rows++;
+            }
+            writer->current_row_group_rows += rows;
+        } else {
+            writer->current_row_group_rows += num_values;
+        }
     }
 
     return CARQUET_OK;
@@ -812,4 +1060,3 @@ void carquet_writer_abort(carquet_writer_t* writer) {
     carquet_arena_destroy(&writer->arena);
     free(writer);
 }
-

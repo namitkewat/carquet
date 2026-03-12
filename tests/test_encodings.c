@@ -99,6 +99,35 @@ static int test_plain_boolean(void) {
     return 0;
 }
 
+static int test_plain_boolean_large(void) {
+    uint8_t input[73];
+    uint8_t output[73];
+
+    for (int i = 0; i < 73; i++) {
+        input[i] = (uint8_t)(((i * 5) + 3) & 1);
+    }
+
+    carquet_buffer_t buf;
+    carquet_buffer_init(&buf);
+
+    assert(carquet_encode_plain_boolean(input, 73, &buf) == CARQUET_OK);
+    assert(carquet_buffer_size(&buf) == 10);  /* 73 bits = 10 bytes */
+
+    int64_t bytes = carquet_decode_plain_boolean(
+        carquet_buffer_data_const(&buf), carquet_buffer_size(&buf),
+        output, 73);
+    (void)bytes;
+
+    assert(bytes == 10);
+    for (int i = 0; i < 73; i++) {
+        assert(output[i] == input[i]);
+    }
+
+    carquet_buffer_destroy(&buf);
+    TEST_PASS("plain_boolean_large");
+    return 0;
+}
+
 static int test_plain_double(void) {
     double input[] = {0.0, 1.0, -1.0, 3.14159265359, 1e100};
     int count = sizeof(input) / sizeof(input[0]);
@@ -270,6 +299,7 @@ int main(void) {
     failures += test_plain_int32();
     failures += test_plain_int64();
     failures += test_plain_boolean();
+    failures += test_plain_boolean_large();
     failures += test_plain_double();
 
     /* RLE encoding tests */

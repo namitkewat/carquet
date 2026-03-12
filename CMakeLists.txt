@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(carquet VERSION 0.1.4 LANGUAGES C)
+project(carquet VERSION 0.2.0 LANGUAGES C)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -117,7 +117,7 @@ check_c_source_compiles("
 " CARQUET_ARCH_X86)
 
 check_c_source_compiles("
-    #if defined(__aarch64__) || defined(_M_ARM64) || defined(__arm__) || defined(_M_ARM)
+    #if defined(__aarch64__) || defined(__arm64__) || defined(_M_ARM64) || defined(__arm__) || defined(_M_ARM)
     int main() { return 0; }
     #else
     #error Not ARM
@@ -130,8 +130,22 @@ if(CARQUET_COMPILER_GCC_LIKE)
 
     # Debug/Release flags
     set(CMAKE_C_FLAGS_DEBUG "-g -O0 -DCARQUET_DEBUG")
-    set(CMAKE_C_FLAGS_RELEASE "-O3 -DNDEBUG")
+    set(CMAKE_C_FLAGS_RELEASE "-O3 -DNDEBUG -flto")
     set(CMAKE_C_FLAGS_RELWITHDEBINFO "-O2 -g -DNDEBUG")
+
+    # When using LTO, ensure ar/ranlib match the compiler toolchain
+    # (Apple's ranlib can't parse LLVM bitcode from Homebrew LLVM)
+    if(CMAKE_C_COMPILER MATCHES "llvm")
+        get_filename_component(_LLVM_BIN_DIR "${CMAKE_C_COMPILER}" DIRECTORY)
+        find_program(_LLVM_AR llvm-ar HINTS "${_LLVM_BIN_DIR}" NO_DEFAULT_PATH)
+        find_program(_LLVM_RANLIB llvm-ranlib HINTS "${_LLVM_BIN_DIR}" NO_DEFAULT_PATH)
+        if(_LLVM_AR)
+            set(CMAKE_AR "${_LLVM_AR}" CACHE FILEPATH "Archiver" FORCE)
+        endif()
+        if(_LLVM_RANLIB)
+            set(CMAKE_RANLIB "${_LLVM_RANLIB}" CACHE FILEPATH "Ranlib" FORCE)
+        endif()
+    endif()
 elseif(CARQUET_COMPILER_MSVC)
     # MSVC warning levels and options
     add_compile_options(/W3 /wd4996 /wd4244 /wd4267)
@@ -140,6 +154,12 @@ elseif(CARQUET_COMPILER_MSVC)
     set(CMAKE_C_FLAGS_DEBUG "/Zi /Od /DCARQUET_DEBUG")
     set(CMAKE_C_FLAGS_RELEASE "/O2 /DNDEBUG")
     set(CMAKE_C_FLAGS_RELWITHDEBINFO "/O2 /Zi /DNDEBUG")
+endif()
+
+# Optional native architecture optimization
+option(CARQUET_NATIVE_ARCH "Build with -march=native for maximum performance" OFF)
+if(CARQUET_NATIVE_ARCH AND CARQUET_COMPILER_GCC_LIKE)
+    add_compile_options(-march=native)
 endif()
 
 # Source files
@@ -178,6 +198,12 @@ set(CARQUET_SIMD_SOURCES
     src/simd/detect.c
     src/simd/dispatch.c
 )
+
+# Runtime CPU feature detection must stay correct under mixed LLVM/macOS toolchains.
+# Excluding this tiny unit from LTO avoids miscompiled feature flags on Apple Silicon.
+if(CARQUET_COMPILER_GCC_LIKE)
+    set_source_files_properties(src/simd/detect.c PROPERTIES COMPILE_FLAGS "-fno-lto")
+endif()
 
 set(CARQUET_READER_SOURCES
     src/reader/file_reader.c
@@ -344,6 +370,8 @@ if(CARQUET_BUILD_TESTS)
         add_executable(${TEST_NAME} ${TEST_SOURCE})
         target_link_libraries(${TEST_NAME} PRIVATE carquet)
         target_include_directories(${TEST_NAME} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        # Tests use assert() for validation — keep assertions enabled in all build types
+        target_compile_options(${TEST_NAME} PRIVATE -UNDEBUG)
         if(CARQUET_COMPILER_GCC_LIKE)
             target_compile_options(${TEST_NAME} PRIVATE -Wno-unused-result)
         endif()
@@ -367,6 +395,12 @@ if(CARQUET_BUILD_TESTS)
     add_carquet_test(test_edge_malformed tests/test_edge_malformed.c)
     add_carquet_test(test_edge_boundaries tests/test_edge_boundaries.c)
     add_carquet_test(test_edge_io tests/test_edge_io.c)
+
+    # Nested schema tests
+    add_carquet_test(test_nested tests/test_nested.c)
+
+    # Bloom filter and page index tests
+    add_carquet_test(test_bloom_page_index tests/test_bloom_page_index.c)
 
     # Memory mapping tests
     add_carquet_test(test_mmap tests/test_mmap.c)
@@ -400,6 +434,13 @@ if(CARQUET_BUILD_BENCHMARKS)
     endif()
     if(CARQUET_COMPILER_GCC_LIKE)
         target_compile_options(benchmark_carquet PRIVATE -Wno-unused-result)
+    endif()
+
+    # Test file generator (C replacement for generate_test_files.py - no extra deps)
+    add_executable(generate_test_files benchmark/generate_test_files.c)
+    target_link_libraries(generate_test_files PRIVATE carquet)
+    if(CARQUET_COMPILER_GCC_LIKE)
+        target_compile_options(generate_test_files PRIVATE -Wno-unused-result)
     endif()
 
     # Profiling benchmark for CPU profiling (sample, Instruments, perf)

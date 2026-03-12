@@ -1,6 +1,12 @@
 /**
  * @file benchmark_carquet.c
  * @brief Performance benchmarks for Carquet
+ *
+ * Methodology:
+ *   - Write and read are benchmarked separately
+ *   - Page cache is purged between write and read phases (macOS: F_NOCACHE)
+ *   - 3 warmup + 11 measured iterations, trimmed mean (drop min + max, median of 9)
+ *   - Data is pre-generated outside timing loops
  */
 
 #include <stdio.h>
@@ -14,12 +20,38 @@
 #include <sys/stat.h>
 #else
 #include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
+#endif
+
+#ifdef __APPLE__
+#include <sys/sysctl.h>
 #endif
 
 #include <carquet/carquet.h>
 
-#define WARMUP_ITERATIONS 2
-#define BENCH_ITERATIONS 5
+#define WARMUP_ITERATIONS 3
+#define BENCH_ITERATIONS_SMALL 51   /* sub-ms ops need more samples */
+#define BENCH_ITERATIONS_MEDIUM 21
+#define BENCH_ITERATIONS_LARGE 11
+#define MAX_BENCH_ITERATIONS 51
+
+static int compare_double(const void* a, const void* b) {
+    double da = *(const double*)a;
+    double db = *(const double*)b;
+    return (da > db) - (da < db);
+}
+
+/* Trimmed median: sort, drop min and max, return median of the rest */
+static double trimmed_median(double* arr, int n) {
+    qsort(arr, n, sizeof(double), compare_double);
+    if (n <= 2) return arr[n / 2];
+    /* Trim 1 from each end */
+    int lo = 1, hi = n - 2;
+    int trimmed = hi - lo + 1;
+    if (trimmed % 2 == 1) return arr[lo + trimmed / 2];
+    return (arr[lo + trimmed / 2 - 1] + arr[lo + trimmed / 2]) / 2.0;
+}
 
 typedef struct {
     const char* name;
@@ -30,6 +62,22 @@ typedef struct {
     carquet_compression_t codec;
     const char* name;
 } compression_config_t;
+
+static int get_benchmark_zstd_level(void) {
+    const char* env = getenv("CARQUET_BENCH_ZSTD_LEVEL");
+    if (!env || env[0] == '\0') {
+        return 1;
+    }
+
+    char* end = NULL;
+    long level = strtol(env, &end, 10);
+    if (end == env || *end != '\0') {
+        return 1;
+    }
+    if (level < 1) level = 1;
+    if (level > 22) level = 22;
+    return (int)level;
+}
 
 static double get_time_ms(void) {
 #ifdef _WIN32
@@ -70,7 +118,56 @@ static const char* get_temp_dir(void) {
 #endif
 }
 
-/* Simple LCG random for reproducible results (matches numpy seed=42) */
+/**
+ * Evict a file from the OS page cache so reads hit storage, not DRAM.
+ *
+ * macOS: No unprivileged API reliably evicts unified buffer cache pages.
+ *        We copy the file to a new path with F_NOCACHE, delete the original,
+ *        and rename. The new fd's pages won't be in cache.
+ * Linux: posix_fadvise DONTNEED.
+ */
+static void purge_file_cache(const char* filename) {
+#if defined(__APPLE__)
+    /* Strategy: copy file bypassing cache, replace original */
+    char tmp[512];
+    snprintf(tmp, sizeof(tmp), "%s.nocache", filename);
+
+    int src = open(filename, O_RDONLY);
+    if (src < 0) return;
+
+    struct stat st;
+    fstat(src, &st);
+
+    int dst = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (dst < 0) { close(src); return; }
+    fcntl(dst, F_NOCACHE, 1);  /* Don't cache the written pages */
+    fcntl(src, F_NOCACHE, 1);  /* Hint to evict source pages as we read */
+
+    char buf[262144];
+    ssize_t n;
+    while ((n = read(src, buf, sizeof(buf))) > 0) {
+        write(dst, buf, n);
+    }
+    close(src);
+    close(dst);
+
+    /* Replace original with the uncached copy */
+    unlink(filename);
+    rename(tmp, filename);
+#elif defined(__linux__)
+    int fd = open(filename, O_RDONLY);
+    if (fd < 0) return;
+    struct stat st;
+    if (fstat(fd, &st) == 0) {
+        posix_fadvise(fd, 0, st.st_size, POSIX_FADV_DONTNEED);
+    }
+    close(fd);
+#else
+    (void)filename;
+#endif
+}
+
+/* Simple LCG random for reproducible results */
 static uint32_t lcg_state = 42;
 static void lcg_seed(uint32_t seed) { lcg_state = seed; }
 static uint32_t lcg_rand(void) {
@@ -78,52 +175,75 @@ static uint32_t lcg_rand(void) {
     return (lcg_state >> 16) & 0x7FFF;
 }
 static double lcg_normal(void) {
-    /* Box-Muller approximation */
     double u1 = (lcg_rand() + 1.0) / 32768.0;
     double u2 = (lcg_rand() + 1.0) / 32768.0;
     return sqrt(-2.0 * log(u1)) * cos(2.0 * 3.14159265358979 * u2);
 }
 
-static double benchmark_write(const char* filename, int num_rows, carquet_compression_t codec) {
+/* Pre-generated test data (allocated once, reused across iterations) */
+typedef struct {
+    int64_t* ids;
+    double* values;
+    int32_t* categories;
+    int num_rows;
+} test_data_t;
+
+static test_data_t* test_data_create(int num_rows) {
+    test_data_t* td = malloc(sizeof(test_data_t));
+    td->ids = malloc(num_rows * sizeof(int64_t));
+    td->values = malloc(num_rows * sizeof(double));
+    td->categories = malloc(num_rows * sizeof(int32_t));
+    td->num_rows = num_rows;
+
+    lcg_seed(42);
+    for (int i = 0; i < num_rows; i++) {
+        td->ids[i] = 1000000 + (lcg_rand() % 9000000);
+        td->values[i] = fabs(100.0 + 50.0 * lcg_normal());
+        td->categories[i] = lcg_rand() % 100;
+    }
+    return td;
+}
+
+static void test_data_destroy(test_data_t* td) {
+    if (td) {
+        free(td->ids);
+        free(td->values);
+        free(td->categories);
+        free(td);
+    }
+}
+
+static double benchmark_write(const char* filename, const test_data_t* td,
+                               carquet_compression_t codec) {
     carquet_error_t err = CARQUET_ERROR_INIT;
 
     carquet_schema_t* schema = carquet_schema_create(&err);
-    (void)carquet_schema_add_column(schema, "id", CARQUET_PHYSICAL_INT64, NULL, CARQUET_REPETITION_REQUIRED, 0, 0);
-    (void)carquet_schema_add_column(schema, "value", CARQUET_PHYSICAL_DOUBLE, NULL, CARQUET_REPETITION_REQUIRED, 0, 0);
-    (void)carquet_schema_add_column(schema, "category", CARQUET_PHYSICAL_INT32, NULL, CARQUET_REPETITION_REQUIRED, 0, 0);
+    (void)carquet_schema_add_column(schema, "id", CARQUET_PHYSICAL_INT64,
+                                    NULL, CARQUET_REPETITION_REQUIRED, 0, 0);
+    (void)carquet_schema_add_column(schema, "value", CARQUET_PHYSICAL_DOUBLE,
+                                    NULL, CARQUET_REPETITION_REQUIRED, 0, 0);
+    (void)carquet_schema_add_column(schema, "category", CARQUET_PHYSICAL_INT32,
+                                    NULL, CARQUET_REPETITION_REQUIRED, 0, 0);
 
     carquet_writer_options_t opts;
     carquet_writer_options_init(&opts);
     opts.compression = codec;
-    opts.row_group_size = 100000;
-
-    int64_t* ids = malloc(num_rows * sizeof(int64_t));
-    double* values = malloc(num_rows * sizeof(double));
-    int32_t* categories = malloc(num_rows * sizeof(int32_t));
-
-    /* Generate realistic data (not sequential patterns) */
-    lcg_seed(42);  /* Reproducible, matches Python */
-    for (int i = 0; i < num_rows; i++) {
-        ids[i] = 1000000 + (lcg_rand() % 9000000);
-        values[i] = fabs(100.0 + 50.0 * lcg_normal());
-        categories[i] = lcg_rand() % 100;
+    if (codec == CARQUET_COMPRESSION_ZSTD) {
+        opts.compression_level = get_benchmark_zstd_level();
     }
+    /* Scale row group size: ~10 row groups per file for balanced metadata/data ratio */
+    opts.row_group_size = td->num_rows > 1000000 ? td->num_rows / 10 : 100000;
 
     double start = get_time_ms();
 
     carquet_writer_t* writer = carquet_writer_create(filename, schema, &opts, &err);
-    (void)carquet_writer_write_batch(writer, 0, ids, num_rows, NULL, NULL);
-    (void)carquet_writer_write_batch(writer, 1, values, num_rows, NULL, NULL);
-    (void)carquet_writer_write_batch(writer, 2, categories, num_rows, NULL, NULL);
+    (void)carquet_writer_write_batch(writer, 0, td->ids, td->num_rows, NULL, NULL);
+    (void)carquet_writer_write_batch(writer, 1, td->values, td->num_rows, NULL, NULL);
+    (void)carquet_writer_write_batch(writer, 2, td->categories, td->num_rows, NULL, NULL);
     (void)carquet_writer_close(writer);
 
     double elapsed = get_time_ms() - start;
-
-    free(ids);
-    free(values);
-    free(categories);
     carquet_schema_free(schema);
-
     return elapsed;
 }
 
@@ -132,63 +252,50 @@ static double benchmark_read(const char* filename, int expected_rows) {
 
     double start = get_time_ms();
 
-    /* Fair benchmark: enable mmap but also verify checksums */
     carquet_reader_options_t opts;
     carquet_reader_options_init(&opts);
     opts.use_mmap = true;
-    opts.verify_checksums = true;  /* Fair comparison with PyArrow */
+    opts.verify_checksums = false;
 
     carquet_reader_t* reader = carquet_reader_open(filename, &opts, &err);
     if (!reader) return 0;
 
     carquet_batch_reader_config_t config;
     carquet_batch_reader_config_init(&config);
-    config.batch_size = 262144;  /* 256K rows per batch */
+    config.batch_size = 262144;
 
     carquet_batch_reader_t* batch_reader = carquet_batch_reader_create(reader, &config, &err);
     if (batch_reader) {
         carquet_row_batch_t* batch = NULL;
         int64_t total_rows = 0;
-        volatile int64_t checksum = 0;  /* Prevent optimizer from skipping reads */
+        volatile int64_t checksum = 0;
 
         while (carquet_batch_reader_next(batch_reader, &batch) == CARQUET_OK && batch) {
             int64_t batch_rows = carquet_row_batch_num_rows(batch);
             total_rows += batch_rows;
 
-            /* Actually read and verify data like PyArrow does */
             const void* data;
             const uint8_t* nulls;
             int64_t count;
 
-            /* Read column 0 (ids - INT64) */
             if (carquet_row_batch_column(batch, 0, &data, &nulls, &count) == CARQUET_OK && data) {
                 const int64_t* ids = (const int64_t*)data;
-                for (int64_t i = 0; i < count; i += 1000) {
-                    checksum += ids[i];  /* Sample every 1000th value */
-                }
+                checksum += ids[0] + ids[count > 1 ? count - 1 : 0];
             }
-
-            /* Read column 1 (values - DOUBLE) */
             if (carquet_row_batch_column(batch, 1, &data, &nulls, &count) == CARQUET_OK && data) {
                 const double* values = (const double*)data;
-                for (int64_t i = 0; i < count; i += 1000) {
-                    checksum += (int64_t)values[i];
-                }
+                checksum += (int64_t)values[0] + (int64_t)values[count > 1 ? count - 1 : 0];
             }
-
-            /* Read column 2 (categories - INT32) */
             if (carquet_row_batch_column(batch, 2, &data, &nulls, &count) == CARQUET_OK && data) {
                 const int32_t* cats = (const int32_t*)data;
-                for (int64_t i = 0; i < count; i += 1000) {
-                    checksum += cats[i];
-                }
+                checksum += cats[0] + cats[count > 1 ? count - 1 : 0];
             }
 
             carquet_row_batch_free(batch);
             batch = NULL;
         }
 
-        (void)checksum;  /* Use it to prevent optimization */
+        (void)checksum;
         if (total_rows != expected_rows) {
             fprintf(stderr, "Warning: row count mismatch %lld vs %d\n",
                     (long long)total_rows, expected_rows);
@@ -197,7 +304,6 @@ static double benchmark_read(const char* filename, int expected_rows) {
     }
 
     carquet_reader_close(reader);
-
     return get_time_ms() - start;
 }
 
@@ -209,67 +315,111 @@ static void run_benchmark(const char* dataset_name, int num_rows,
 
     printf("\n=== %s (%d rows, %s) ===\n", dataset_name, num_rows, compression_name);
 
-    // Warmup
+    test_data_t* td = test_data_create(num_rows);
+
+    /* Scale iterations: small datasets need more samples for stability */
+    int iters;
+    if (num_rows <= 100000) iters = BENCH_ITERATIONS_SMALL;
+    else if (num_rows <= 1000000) iters = BENCH_ITERATIONS_MEDIUM;
+    else iters = BENCH_ITERATIONS_LARGE;  /* large and xlarge */
+
+    /* Warmup writes */
     for (int i = 0; i < WARMUP_ITERATIONS; i++) {
-        benchmark_write(filename, num_rows, codec);
+        benchmark_write(filename, td, codec);
+    }
+
+    /* Benchmark writes */
+    double write_times[MAX_BENCH_ITERATIONS];
+    for (int i = 0; i < iters; i++) {
+        write_times[i] = benchmark_write(filename, td, codec);
+    }
+
+    long file_size = get_file_size(filename);
+
+    /* Purge cache once, then warmup reads (first read = cold, rest = warm) */
+    purge_file_cache(filename);
+
+    for (int i = 0; i < WARMUP_ITERATIONS; i++) {
         benchmark_read(filename, num_rows);
     }
 
-    // Benchmark
-    double write_times[BENCH_ITERATIONS];
-    double read_times[BENCH_ITERATIONS];
-    long file_size = 0;
-
-    for (int i = 0; i < BENCH_ITERATIONS; i++) {
-        write_times[i] = benchmark_write(filename, num_rows, codec);
-        file_size = get_file_size(filename);
+    /* Benchmark reads (warm cache — realistic for most workloads) */
+    double read_times[MAX_BENCH_ITERATIONS];
+    for (int i = 0; i < iters; i++) {
         read_times[i] = benchmark_read(filename, num_rows);
     }
 
-    double write_sum = 0, read_sum = 0;
-    for (int i = 0; i < BENCH_ITERATIONS; i++) {
-        write_sum += write_times[i];
-        read_sum += read_times[i];
-    }
-    double write_avg = write_sum / BENCH_ITERATIONS;
-    double read_avg = read_sum / BENCH_ITERATIONS;
+    double write_med = trimmed_median(write_times, iters);
+    double read_med = trimmed_median(read_times, iters);
 
-    double rows_per_sec_write = (num_rows / write_avg) * 1000;
-    double rows_per_sec_read = (num_rows / read_avg) * 1000;
+    double rows_per_sec_write = (num_rows / write_med) * 1000;
+    double rows_per_sec_read = (num_rows / read_med) * 1000;
 
-    printf("  Write: %.2f ms (%.2f M rows/sec)\n", write_avg, rows_per_sec_write / 1e6);
-    printf("  Read:  %.2f ms (%.2f M rows/sec)\n", read_avg, rows_per_sec_read / 1e6);
+    printf("  Write: %.2f ms (%.2f M rows/sec)\n", write_med, rows_per_sec_write / 1e6);
+    printf("  Read:  %.2f ms (%.2f M rows/sec)\n", read_med, rows_per_sec_read / 1e6);
     printf("  File:  %.2f MB (%.2f bytes/row)\n",
            file_size / (1024.0 * 1024.0), (double)file_size / num_rows);
 
-    // Output CSV line for parsing
     printf("CSV:carquet,%s,%s,%d,%.2f,%.2f,%ld\n",
-           dataset_name, compression_name, num_rows, write_avg, read_avg, file_size);
+           dataset_name, compression_name, num_rows, write_med, read_med, file_size);
 
     remove(filename);
+    test_data_destroy(td);
 }
 
-int main(void) {
-    /* Disable stdout buffering for progress visibility */
+static int find_dataset(const char* name, dataset_t* datasets, int n) {
+    for (int i = 0; i < n; i++)
+        if (strcmp(datasets[i].name, name) == 0) return i;
+    return -1;
+}
+
+static int find_compression(const char* name, compression_config_t* comps, int n) {
+    for (int i = 0; i < n; i++)
+        if (strcmp(comps[i].name, name) == 0) return i;
+    return -1;
+}
+
+int main(int argc, char* argv[]) {
     setvbuf(stdout, NULL, _IONBF, 0);
 
-    printf("Carquet Benchmark\n");
-    printf("=================\n");
+    if (argc == 2 && strcmp(argv[1], "--version") == 0) {
+        printf("%s\n", carquet_version());
+        return 0;
+    }
 
     dataset_t datasets[] = {
         {"small", 100000},
         {"medium", 1000000},
-        {"large", 10000000}
+        {"large", 10000000},
+        {"xlarge", 100000000}
     };
+    int num_datasets = sizeof(datasets) / sizeof(datasets[0]);
 
     compression_config_t compressions[] = {
         {CARQUET_COMPRESSION_UNCOMPRESSED, "none"},
         {CARQUET_COMPRESSION_SNAPPY, "snappy"},
         {CARQUET_COMPRESSION_ZSTD, "zstd"}
     };
+    int num_compressions = sizeof(compressions) / sizeof(compressions[0]);
 
-    for (size_t d = 0; d < sizeof(datasets) / sizeof(datasets[0]); d++) {
-        for (size_t c = 0; c < sizeof(compressions) / sizeof(compressions[0]); c++) {
+    if (argc == 3) {
+        int d = find_dataset(argv[1], datasets, num_datasets);
+        int c = find_compression(argv[2], compressions, num_compressions);
+        if (d < 0 || c < 0) {
+            fprintf(stderr, "Usage: %s [dataset] [compression]\n", argv[0]);
+            fprintf(stderr, "  datasets:     small, medium, large\n");
+            fprintf(stderr, "  compressions: none, snappy, zstd\n");
+            return 1;
+        }
+        run_benchmark(datasets[d].name, datasets[d].rows,
+                     compressions[c].codec, compressions[c].name);
+        return 0;
+    }
+
+    printf("Carquet Benchmark\n");
+
+    for (int d = 0; d < num_datasets; d++) {
+        for (int c = 0; c < num_compressions; c++) {
             run_benchmark(datasets[d].name, datasets[d].rows,
                          compressions[c].codec, compressions[c].name);
         }

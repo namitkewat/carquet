@@ -15,13 +15,13 @@ static int test_version(void) {
     const char* ver = carquet_version();
     (void)ver;
     assert(ver != NULL);
-    assert(strcmp(ver, "0.1.2") == 0);
+    assert(strcmp(ver, "0.2.0") == 0);
 
     int major, minor, patch;
     carquet_version_components(&major, &minor, &patch);
     assert(major == 0);
-    assert(minor == 1);
-    assert(patch == 2);
+    assert(minor == 2);
+    assert(patch == 0);
 
     TEST_PASS("version");
     return 0;
@@ -39,12 +39,16 @@ static int test_cpu_detection(void) {
     printf("    AVX:     %s\n", info->has_avx ? "yes" : "no");
     printf("    AVX2:    %s\n", info->has_avx2 ? "yes" : "no");
     printf("    AVX-512: %s\n", info->has_avx512f ? "yes" : "no");
-#elif defined(__aarch64__) || defined(__arm__)
+#elif defined(__aarch64__) || defined(__arm64__) || defined(__arm__)
     printf("    NEON:    %s\n", info->has_neon ? "yes" : "no");
     printf("    SVE:     %s\n", info->has_sve ? "yes" : "no");
     if (info->has_sve) {
         printf("    SVE len: %d bits\n", info->sve_vector_length);
     }
+
+#if defined(__aarch64__) || defined(__arm64__)
+    assert(info->has_neon);
+#endif
 #else
     printf("    (no architecture-specific features)\n");
 #endif

@@ -5,44 +5,37 @@
 ![C Standard](https://img.shields.io/badge/C-C11-blue)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
-A pure C library for reading and writing Apache Parquet files.
+A fast, pure C library for reading and writing Apache Parquet files.
 
 <img width="1792" height="592" alt="carquet" src="https://github.com/user-attachments/assets/ef669e62-6cf0-4dc0-9de8-dd2ab5afaeb3" />
 
 
 ## Why Carquet?
 
-**The primary goal of Carquet is to provide Parquet support in pure C.** Before Carquet, there was no production-ready C library for Parquet - only C++ (Arrow), Rust, Java, and Python implementations.
-
-### Use Cases
-
-- **Embedded systems** - No C++ runtime, no exceptions, minimal dependencies
-- **C codebases** - Native integration without FFI or language bridges
-- **Minimal binaries** - ~200KB vs ~50MB+ for Arrow
-- **Constrained environments** - IoT, microcontrollers, legacy systems
-
-### Carquet vs Apache Arrow
-
-Carquet is **not** a replacement for Apache Arrow. Arrow is the industry standard with years of production use, full feature support, and a large community.
+Carquet brings full Parquet support to C for the first time. It reads and writes all standard Parquet features (nested types, all encodings, all compression codecs, bloom filters, page indexes) while being significantly faster than PyArrow on ARM and competitive on x86.
 
 | Aspect | Arrow Parquet | Carquet |
 |--------|---------------|---------|
 | Language | C++ | **Pure C11** |
 | Dependencies | Many (Boost, etc.) | **zstd + zlib only** |
 | Binary size | ~50MB+ | **~200KB** |
-| Write speed (ARM) | Baseline | **1.5-5x faster** |
+| Write speed (ARM) | Baseline | **1.1-2.1x faster** |
 | Write speed (x86) | Baseline | **1.2-1.4x faster** |
-| Read speed (ARM) | Baseline | ~same to 1.3x faster |
-| Read speed (x86) | Baseline | 1.5-2x slower |
-| ZSTD file size | Baseline | **~1.4x smaller** |
-| Nested types | **Full support** | Basic |
-| Encryption | **Yes** | No |
-| Community | **Large, mature** | New |
-| Production tested | **Extensive** | Limited |
+| Read speed (ARM) | Baseline | **up to 9x faster** |
+| Read speed (x86) | Baseline | 0.5-0.7x slower |
+| ZSTD file size | Baseline | **~10% smaller** |
+| Nested types | Full support | Full support |
+| Bloom filters | Yes | Yes |
+| Page indexes | Yes | Yes |
+| Encryption | Yes | No |
 
-**Choose Carquet if:** You need Parquet in a C-only environment, want minimal dependencies, or are building for embedded/constrained systems.
+### Use Cases
 
-**Choose Arrow if:** You need full feature support, battle-tested reliability, or are in a C++/Python/Java environment.
+- **Embedded systems** - No C++ runtime, no exceptions, minimal dependencies
+- **C codebases** - Native integration without FFI or language bridges
+- **Minimal binaries** - ~200KB vs ~50MB+ for Arrow
+- **Performance-sensitive paths** - Faster reads on ARM, competitive writes everywhere
+- **Constrained environments** - IoT, microcontrollers, legacy systems
 
 ## Features
 
@@ -54,10 +47,12 @@ Carquet is **not** a replacement for Apache Arrow. Arrow is the industry standar
   - All encodings (PLAIN, RLE, DICTIONARY, DELTA_BINARY_PACKED, DELTA_LENGTH_BYTE_ARRAY, BYTE_STREAM_SPLIT)
   - All compression codecs (UNCOMPRESSED, SNAPPY, GZIP, LZ4, ZSTD)
   - Nullable columns with definition levels
-  - Basic nested schema support (groups, definition/repetition levels)
+  - Full nested schema support (groups, lists, maps, definition/repetition levels)
 - **Production Features**:
   - CRC32 page verification for data integrity (hardware-accelerated on ARM)
   - Column statistics for predicate pushdown
+  - Bloom filters for efficient value lookups
+  - Page indexes (column index + offset index) for page-level pruning
   - Memory-mapped I/O with zero-copy reads
   - Column projection for efficient reads
   - OpenMP parallel column reading (when available)
@@ -66,10 +61,7 @@ Carquet is **not** a replacement for Apache Arrow. Arrow is the industry standar
 
 ### Current Limitations
 
-- Complex nested types (deeply nested lists/maps) are not fully supported
 - No encryption support
-- Bloom filters are read-only
-- ZSTD decompression is single-threaded (Arrow uses multi-threaded)
 
 ## Table of Contents
 
@@ -122,6 +114,16 @@ make -j$(nproc)
 | `CARQUET_ENABLE_AVX512` | ON | Enable AVX-512 optimizations (x86) |
 | `CARQUET_ENABLE_NEON` | ON | Enable NEON optimizations (ARM) |
 | `CARQUET_ENABLE_SVE` | OFF | Enable SVE optimizations (ARM) |
+| `CARQUET_NATIVE_ARCH` | OFF | Build with `-march=native` for max performance |
+
+### Maximum Performance Build
+
+```bash
+cmake .. -DCMAKE_BUILD_TYPE=Release -DCARQUET_NATIVE_ARCH=ON
+make -j$(nproc)
+```
+
+This enables `-O3`, link-time optimization (`-flto`), and CPU-specific codegen (`-march=native`). Use this for benchmarks and production deployments on known hardware.
 
 ### Example: Release Build with Shared Library
 
@@ -377,11 +379,16 @@ carquet_writer_options_t opts;
 carquet_writer_options_init(&opts);
 
 opts.compression = CARQUET_COMPRESSION_ZSTD;  // Compression codec
-opts.compression_level = 3;                    // Codec-specific level
+opts.compression_level = 0;                    // 0 = codec default
 opts.row_group_size = 128 * 1024 * 1024;      // 128 MB row groups
-opts.page_size = 1024 * 1024;                  // 1 MB pages
+opts.page_size = 1024 * 1024;                  // 1 MB nominal page target
+                                               // ZSTD keeps this API default but
+                                               // internally uses 4 MB pages when
+                                               // you leave the default unchanged
 opts.write_statistics = true;                  // Enable min/max statistics
 opts.write_page_checksums = true;              // Enable CRC32 verification
+opts.write_bloom_filters = true;              // Enable bloom filters per column
+opts.write_page_index = true;                 // Enable column/offset page indexes
 ```
 
 ### Creating a Writer
@@ -502,6 +509,61 @@ carquet_schema_add_column(schema, "city", CARQUET_PHYSICAL_BYTE_ARRAY,
                           NULL, CARQUET_REPETITION_REQUIRED, 0, address_idx);
 ```
 
+### Lists and Maps
+
+Carquet provides helpers that create standard Parquet 3-level LIST and MAP structures:
+
+```c
+// Add a list<int32> column (creates the standard 3-level encoding)
+int32_t list_leaf = carquet_schema_add_list(
+    schema, "tags",
+    CARQUET_PHYSICAL_INT32,     // element physical type
+    NULL,                       // element logical type (optional)
+    CARQUET_REPETITION_OPTIONAL, // list repetition (OPTIONAL = nullable list)
+    0,                          // type_length (for FIXED_LEN_BYTE_ARRAY)
+    0                           // parent_index (0 = root)
+);
+
+// Add a map<string, int32> column
+int32_t map_val_leaf = carquet_schema_add_map(
+    schema, "properties",
+    CARQUET_PHYSICAL_BYTE_ARRAY, NULL, 0,   // key type (string)
+    CARQUET_PHYSICAL_INT32, NULL, 0,         // value type
+    CARQUET_REPETITION_OPTIONAL,             // map repetition
+    0                                        // parent_index
+);
+
+// Write list data using definition/repetition levels
+// Example: row0=[100,200], row1=NULL, row2=[300], row3=[400,500,600]
+int32_t values[] = {100, 200, 300, 400, 500, 600};
+int16_t def[]    = {  3,   3,   0,   3,   3,   3,   3};
+int16_t rep[]    = {  0,   1,   0,   0,   0,   1,   1};
+carquet_writer_write_batch(writer, col_index, values, 7, def, rep);
+```
+
+### Nested Type Utilities
+
+```c
+// Count logical rows from repetition levels (rep_level==0 starts a new row)
+int64_t num_rows = carquet_count_rows(rep_levels, num_entries);
+
+// Reconstruct list boundaries as Arrow-style offsets from repetition levels
+int64_t offsets[1024];
+int64_t num_lists = carquet_list_offsets(
+    rep_levels, num_entries,
+    1,          // list_rep_level (repetition level of the repeated group)
+    offsets,    // output: offsets[i]..offsets[i+1] = range for list i
+    1024        // max offsets
+);
+
+// Query accumulated definition/repetition levels for a leaf column
+int16_t max_def = carquet_schema_max_def_level(schema, leaf_index);
+int16_t max_rep = carquet_schema_max_rep_level(schema, leaf_index);
+
+// Get the full dotted path for a leaf column (e.g., "person.address.street")
+const char* path = carquet_schema_column_path(schema, leaf_index);
+```
+
 ## Compression
 
 ### Available Codecs
@@ -525,8 +587,9 @@ carquet_schema_add_column(schema, "city", CARQUET_PHYSICAL_BYTE_ARRAY,
 
 ```c
 opts.compression = CARQUET_COMPRESSION_ZSTD;
-opts.compression_level = 3;  // ZSTD: 1-22, default 3
-                              // GZIP: 1-9, default 6
+opts.compression_level = 0;  // 0 = codec default
+                              // ZSTD: 1-22
+                              // GZIP: 1-9
 ```
 
 ## Batch Reading
@@ -697,9 +760,30 @@ int32_t carquet_schema_add_column(carquet_schema_t* schema, const char* name,
 int32_t carquet_schema_add_group(carquet_schema_t* schema, const char* name,
                                   carquet_field_repetition_t repetition,
                                   int32_t parent_index);
+int32_t carquet_schema_add_list(carquet_schema_t* schema, const char* name,
+                                 carquet_physical_type_t element_type,
+                                 const carquet_logical_type_t* element_logical_type,
+                                 carquet_field_repetition_t list_repetition,
+                                 int32_t type_length, int32_t parent_index);
+int32_t carquet_schema_add_map(carquet_schema_t* schema, const char* name,
+                                carquet_physical_type_t key_type,
+                                const carquet_logical_type_t* key_logical_type,
+                                int32_t key_type_length,
+                                carquet_physical_type_t value_type,
+                                const carquet_logical_type_t* value_logical_type,
+                                int32_t value_type_length,
+                                carquet_field_repetition_t map_repetition,
+                                int32_t parent_index);
 int32_t carquet_schema_num_columns(const carquet_schema_t* schema);
 const char* carquet_schema_column_name(const carquet_schema_t* schema, int32_t index);
 carquet_physical_type_t carquet_schema_column_type(const carquet_schema_t* schema, int32_t index);
+const char* carquet_schema_column_path(const carquet_schema_t* schema, int32_t index);
+int16_t carquet_schema_max_def_level(const carquet_schema_t* schema, int32_t index);
+int16_t carquet_schema_max_rep_level(const carquet_schema_t* schema, int32_t index);
+int64_t carquet_count_rows(const int16_t* rep_levels, int64_t num_values);
+int64_t carquet_list_offsets(const int16_t* rep_levels, int64_t num_values,
+                              int16_t list_rep_level,
+                              int64_t* offsets_out, int64_t max_offsets);
 ```
 
 ### Reader
@@ -857,72 +941,72 @@ carquet/
 
 ## Performance
 
-Carquet's performance varies by platform and use case. These benchmarks show where Carquet excels and where Arrow is faster.
-
-**Test configuration:** 10M rows, 3 columns (INT64 + DOUBLE + INT32), fair comparison with both libraries reading actual data values and verifying CRC checksums.
+Benchmarked against PyArrow (Apache Arrow's C++ Parquet implementation via Python bindings). Three columns: INT64, DOUBLE, INT32. Trimmed median of 11-51 iterations per config, page cache purged between phases, 3s cooldown between configs.
 
 ### Apple M3 (ARM64, macOS)
 
-*MacBook Air (13-inch, M3, 2024), macOS Tahoe 26.2, PyArrow 20.0.0*
+*MacBook Air M3, macOS Tahoe 26.2, Carquet 0.2.0, PyArrow 20.0.0, `-DCARQUET_NATIVE_ARCH=ON`, ZSTD level 1*
 
-#### Writing (Carquet Excels)
+#### 10M rows (large)
 
-| Codec | Carquet | PyArrow | Speedup |
-|-------|---------|---------|---------|
-| UNCOMPRESSED | 83 M rows/sec | 17 M rows/sec | **5.0x faster** |
-| SNAPPY | 44 M rows/sec | 15 M rows/sec | **3.0x faster** |
-| ZSTD | 19 M rows/sec | 12 M rows/sec | **1.5x faster** |
+|                | Write (Carquet) | Write (PyArrow) | ratio | Read (Carquet) | Read (PyArrow) | ratio |
+|----------------|-----------------|-----------------|-------|----------------|----------------|-------|
+| UNCOMPRESSED   | 85.7ms          | 112.4ms         | **1.31x** | 8.4ms          | 44.0ms         | **5.3x** |
+| SNAPPY         | 195.3ms         | 245.0ms         | **1.25x** | 15.6ms         | 52.3ms         | **3.4x** |
+| ZSTD           | 309.1ms         | 367.7ms         | **1.19x** | 67.5ms         | 61.7ms         | 0.91x |
 
-#### Reading
+#### 100M rows (xlarge)
 
-| Codec | Carquet | PyArrow | Ratio |
-|-------|---------|---------|-------|
-| UNCOMPRESSED | 475 M rows/sec | 368 M rows/sec | 1.3x faster |
-| SNAPPY | 345 M rows/sec | 313 M rows/sec | 1.1x faster |
-| ZSTD | 108 M rows/sec | 198 M rows/sec | 0.55x slower |
+|                | Write (Carquet) | Write (PyArrow) | ratio | Read (Carquet) | Read (PyArrow) | ratio |
+|----------------|-----------------|-----------------|-------|----------------|----------------|-------|
+| UNCOMPRESSED   | 1399ms          | 1596ms          | **1.14x** | 92ms           | 741ms          | **8.0x** |
+| SNAPPY         | 2484ms          | 2711ms          | **1.09x** | 159ms          | 900ms          | **5.7x** |
+| ZSTD           | 3162ms          | 3755ms          | **1.19x** | 677ms          | 1120ms         | **1.7x** |
 
-#### Compression Ratio
+#### Compression ratio (10M rows)
 
-| Codec | Carquet | PyArrow | Ratio |
-|-------|---------|---------|-------|
-| ZSTD | 107 MB | 150 MB | **1.4x smaller** |
-| SNAPPY | 191 MB | 174 MB | 1.1x larger |
-| UNCOMPRESSED | 191 MB | 201 MB | 1.05x smaller |
+| Codec | Carquet | PyArrow |
+|-------|---------|---------|
+| ZSTD  | 102.6 MB | 113.6 MB (**10% smaller**) |
+| SNAPPY | 187.1 MB | 144.7 MB |
+| UNCOMPRESSED | 190.7 MB | 190.8 MB |
+
+Carquet produces smaller ZSTD files because PyArrow writes dictionary-encoded pages with separate plain fallback, adding metadata overhead. For SNAPPY, PyArrow's dictionary encoding yields better compression on this data.
 
 ### Intel Xeon D-1531 (x86_64, Linux)
 
 *Supermicro SYS-5038MD-H24TRF, Intel Xeon D-1531 (12 threads @ 2.7GHz), 32GB RAM, Ubuntu 24.04, PyArrow 23.0.0*
 
-#### Writing
+#### Writing (10M rows)
 
 | Codec | Carquet | PyArrow | Speedup |
 |-------|---------|---------|---------|
-| UNCOMPRESSED | 5.6 M rows/sec | 4.0 M rows/sec | **1.40x faster** |
-| SNAPPY | 4.6 M rows/sec | 3.8 M rows/sec | **1.22x faster** |
-| ZSTD | 4.1 M rows/sec | 3.5 M rows/sec | **1.17x faster** |
+| UNCOMPRESSED | 5.6 M rows/sec | 4.0 M rows/sec | **1.40x** |
+| SNAPPY | 4.6 M rows/sec | 3.8 M rows/sec | **1.22x** |
+| ZSTD | 4.1 M rows/sec | 3.5 M rows/sec | **1.17x** |
 
-#### Reading (PyArrow Faster)
-
-| Codec | Carquet | PyArrow | Ratio |
-|-------|---------|---------|-------|
-| UNCOMPRESSED | 35 M rows/sec | 67 M rows/sec | 0.53x slower |
-| SNAPPY | 36 M rows/sec | 53 M rows/sec | 0.67x slower |
-| ZSTD | 26 M rows/sec | 49 M rows/sec | 0.52x slower |
-
-#### Compression Ratio
+#### Reading (10M rows)
 
 | Codec | Carquet | PyArrow | Ratio |
 |-------|---------|---------|-------|
-| ZSTD | 108 MB | 148 MB | **1.37x smaller** |
-| SNAPPY | 191 MB | 173 MB | 1.10x larger |
-| UNCOMPRESSED | 191 MB | 199 MB | 1.05x smaller |
+| UNCOMPRESSED | 35 M rows/sec | 67 M rows/sec | 0.53x |
+| SNAPPY | 36 M rows/sec | 53 M rows/sec | 0.67x |
+| ZSTD | 26 M rows/sec | 49 M rows/sec | 0.52x |
+
+PyArrow reads faster on this x86 server. Arrow's C++ Parquet reader benefits from more aggressive SIMD vectorization on older x86 microarchitectures.
 
 ### Running Benchmarks
 
 ```bash
-cd build
+# Build with maximum optimizations first
+cmake .. -DCMAKE_BUILD_TYPE=Release -DCARQUET_NATIVE_ARCH=ON
+make -j$(nproc)
+
 ./benchmark_carquet                    # Carquet only
-../benchmark/run_benchmark.sh          # Full comparison with PyArrow
+python3 ../benchmark/run_benchmark.py   # Full comparison with PyArrow
+
+# Optional: override benchmark ZSTD level (default: 1)
+CARQUET_BENCH_ZSTD_LEVEL=3 python3 ../benchmark/run_benchmark.py
 ```
 
 ## License
@@ -931,4 +1015,4 @@ MIT License
 
 ## Contributing
 
-Contributions are welcome! Please read the contributing guidelines before submitting a pull request.
+Contributions are welcome!

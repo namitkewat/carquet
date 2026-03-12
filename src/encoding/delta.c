@@ -8,11 +8,14 @@
 #include <carquet/error.h>
 #include <carquet/types.h>
 #include "core/bitpack.h"
-#include "core/endian.h"
 #include <stdint.h>
 #include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
+
+/* SIMD-dispatched prefix sum functions for delta decoding */
+extern void carquet_dispatch_prefix_sum_i32(int32_t* values, int64_t count, int32_t initial);
+extern void carquet_dispatch_prefix_sum_i64(int64_t* values, int64_t count, int64_t initial);
 
 /* ============================================================================
  * Constants
@@ -214,33 +217,6 @@ static carquet_status_t delta_decoder_read_mini_block(delta_decoder_t* dec) {
     return CARQUET_OK;
 }
 
-static carquet_status_t delta_decoder_next(delta_decoder_t* dec, int64_t* value) {
-    if (dec->values_decoded >= dec->total_values) {
-        return CARQUET_ERROR_END_OF_DATA;
-    }
-
-    /* First value is special */
-    if (dec->values_decoded == 0) {
-        *value = dec->first_value;
-        dec->values_decoded++;
-        return CARQUET_OK;
-    }
-
-    /* Read from mini-block */
-    if (dec->mini_block_pos >= dec->values_in_mini_block) {
-        carquet_status_t status = delta_decoder_read_mini_block(dec);
-        if (status != CARQUET_OK) return status;
-    }
-
-    int64_t delta = dec->mini_block_values[dec->mini_block_pos++];
-    /* Use unsigned addition to avoid overflow UB, then reinterpret as signed */
-    dec->last_value = (int64_t)((uint64_t)dec->last_value + (uint64_t)delta);
-    *value = dec->last_value;
-    dec->values_decoded++;
-
-    return CARQUET_OK;
-}
-
 /* ============================================================================
  * Public API
  * ============================================================================
@@ -259,14 +235,27 @@ carquet_status_t carquet_delta_decode_int32(
         return status;
     }
 
-    for (int32_t i = 0; i < num_values; i++) {
-        int64_t val;
-        status = delta_decoder_next(&dec, &val);
-        if (status != CARQUET_OK) {
-            return status;
-        }
-        values[i] = (int32_t)val;
+    if (num_values == 0) {
+        if (bytes_consumed) *bytes_consumed = dec.pos;
+        return CARQUET_OK;
     }
+
+    /* First value is special (not a delta) */
+    values[0] = (int32_t)dec.first_value;
+    dec.values_decoded = 1;
+
+    /* Decode remaining values as raw deltas directly into output buffer */
+    for (int32_t i = 1; i < num_values; i++) {
+        if (dec.mini_block_pos >= dec.values_in_mini_block) {
+            status = delta_decoder_read_mini_block(&dec);
+            if (status != CARQUET_OK) return status;
+        }
+        values[i] = (int32_t)dec.mini_block_values[dec.mini_block_pos++];
+        dec.values_decoded++;
+    }
+
+    /* Convert deltas to absolute values using SIMD-dispatched prefix sum */
+    carquet_dispatch_prefix_sum_i32(values + 1, num_values - 1, values[0]);
 
     if (bytes_consumed) {
         *bytes_consumed = dec.pos;
@@ -288,12 +277,27 @@ carquet_status_t carquet_delta_decode_int64(
         return status;
     }
 
-    for (int32_t i = 0; i < num_values; i++) {
-        status = delta_decoder_next(&dec, &values[i]);
-        if (status != CARQUET_OK) {
-            return status;
-        }
+    if (num_values == 0) {
+        if (bytes_consumed) *bytes_consumed = dec.pos;
+        return CARQUET_OK;
     }
+
+    /* First value is special (not a delta) */
+    values[0] = dec.first_value;
+    dec.values_decoded = 1;
+
+    /* Decode remaining values as raw deltas directly into output buffer */
+    for (int32_t i = 1; i < num_values; i++) {
+        if (dec.mini_block_pos >= dec.values_in_mini_block) {
+            status = delta_decoder_read_mini_block(&dec);
+            if (status != CARQUET_OK) return status;
+        }
+        values[i] = dec.mini_block_values[dec.mini_block_pos++];
+        dec.values_decoded++;
+    }
+
+    /* Convert deltas to absolute values using SIMD-dispatched prefix sum */
+    carquet_dispatch_prefix_sum_i64(values + 1, num_values - 1, values[0]);
 
     if (bytes_consumed) {
         *bytes_consumed = dec.pos;
