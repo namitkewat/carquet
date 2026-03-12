@@ -819,53 +819,20 @@ static inline uint8_t carquet_neon_pack_bool_octet(uint8x8_t bools) {
 void carquet_neon_unpack_bools(const uint8_t* input, uint8_t* output, int64_t count) {
     int64_t i = 0;
 
-    static const uint8_t nibble_bit0[16] = {0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1};
-    static const uint8_t nibble_bit1[16] = {0,0,1,1,0,0,1,1,0,0,1,1,0,0,1,1};
-    static const uint8_t nibble_bit2[16] = {0,0,0,0,1,1,1,1,0,0,0,0,1,1,1,1};
-    static const uint8_t nibble_bit3[16] = {0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1};
-    const uint8x8_t tbl0 = vld1_u8(nibble_bit0);
-    const uint8x8_t tbl1 = vld1_u8(nibble_bit1);
-    const uint8x8_t tbl2 = vld1_u8(nibble_bit2);
-    const uint8x8_t tbl3 = vld1_u8(nibble_bit3);
+    /* Broadcast each packed byte, AND with bit masks, normalize to 0/1.
+     * Processes 8 packed bytes → 64 unpacked bools per iteration. */
+    static const uint8_t bit_mask_data[8] = {1, 2, 4, 8, 16, 32, 64, 128};
+    const uint8x8_t bit_masks = vld1_u8(bit_mask_data);
+    const uint8x8_t ones = vdup_n_u8(1);
 
-    /* Process 8 packed bytes -> 64 unpacked bools. */
     for (; i + 64 <= count; i += 64) {
-        uint8x8_t packed = vld1_u8(input + (i / 8));
-        uint8x8_t low = vand_u8(packed, vdup_n_u8(0x0F));
-        uint8x8_t high = vshr_n_u8(packed, 4);
-
-        uint8x8_t lo0 = vtbl1_u8(tbl0, low);
-        uint8x8_t lo1 = vtbl1_u8(tbl1, low);
-        uint8x8_t lo2 = vtbl1_u8(tbl2, low);
-        uint8x8_t lo3 = vtbl1_u8(tbl3, low);
-        uint8x8_t hi0 = vtbl1_u8(tbl0, high);
-        uint8x8_t hi1 = vtbl1_u8(tbl1, high);
-        uint8x8_t hi2 = vtbl1_u8(tbl2, high);
-        uint8x8_t hi3 = vtbl1_u8(tbl3, high);
-
-        uint8x8x2_t zip01 = vzip_u8(lo0, lo1);
-        uint8x8x2_t zip23 = vzip_u8(lo2, lo3);
-        uint16x4x2_t zip0123a = vzip_u16(vreinterpret_u16_u8(zip01.val[0]),
-                                         vreinterpret_u16_u8(zip23.val[0]));
-        uint16x4x2_t zip0123b = vzip_u16(vreinterpret_u16_u8(zip01.val[1]),
-                                         vreinterpret_u16_u8(zip23.val[1]));
-
-        vst1_u8(output + i, vreinterpret_u8_u16(zip0123a.val[0]));
-        vst1_u8(output + i + 8, vreinterpret_u8_u16(zip0123a.val[1]));
-        vst1_u8(output + i + 16, vreinterpret_u8_u16(zip0123b.val[0]));
-        vst1_u8(output + i + 24, vreinterpret_u8_u16(zip0123b.val[1]));
-
-        uint8x8x2_t zip45 = vzip_u8(hi0, hi1);
-        uint8x8x2_t zip67 = vzip_u8(hi2, hi3);
-        uint16x4x2_t zip4567a = vzip_u16(vreinterpret_u16_u8(zip45.val[0]),
-                                         vreinterpret_u16_u8(zip67.val[0]));
-        uint16x4x2_t zip4567b = vzip_u16(vreinterpret_u16_u8(zip45.val[1]),
-                                         vreinterpret_u16_u8(zip67.val[1]));
-
-        vst1_u8(output + i + 32, vreinterpret_u8_u16(zip4567a.val[0]));
-        vst1_u8(output + i + 40, vreinterpret_u8_u16(zip4567a.val[1]));
-        vst1_u8(output + i + 48, vreinterpret_u8_u16(zip4567b.val[0]));
-        vst1_u8(output + i + 56, vreinterpret_u8_u16(zip4567b.val[1]));
+        const uint8_t* src = input + (i / 8);
+        for (int b = 0; b < 8; b++) {
+            uint8x8_t v = vdup_n_u8(src[b]);
+            uint8x8_t bits = vand_u8(v, bit_masks);
+            uint8x8_t result = vmin_u8(bits, ones);
+            vst1_u8(output + i + b * 8, result);
+        }
     }
 
     for (; i + 8 <= count; i += 8) {

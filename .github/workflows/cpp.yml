@@ -78,10 +78,9 @@ jobs:
     steps:
      - name: Install build dependencies
        run: |
-          dnf install -y epel-release
           dnf install -y \
             gcc gcc-c++ \
-            cmake ninja-build make git \
+            cmake make git \
             pkgconf-pkg-config \
             zlib-devel libzstd-devel lz4-devel
 
@@ -89,7 +88,7 @@ jobs:
 
      - name: Configure
        run: |
-          cmake -S . -B build -G Ninja \
+          cmake -S . -B build \
             -DCMAKE_BUILD_TYPE=RelWithDebInfo \
             -DCARQUET_BUILD_TESTS=ON
 
