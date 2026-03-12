@@ -13,4 +13,5 @@ dependencies:
   - zstd
   - zlib
   - zlib-ng
+  - lz4-c
 
