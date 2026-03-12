@@ -74,17 +74,16 @@ void carquet_avx512_bitunpack8_16bit(const uint8_t* input, uint32_t* values) {
  * Unpack 8 4-bit values to 32-bit using AVX-512.
  */
 void carquet_avx512_bitunpack8_4bit(const uint8_t* input, uint32_t* values) {
-    uint8_t expanded[16];
-    uint32_t tmp[16];
-
+    /* 8 x 4-bit values = 4 input bytes, expand nibbles to bytes then widen */
+    uint8_t expanded[8];
     for (int i = 0; i < 4; i++) {
         uint8_t byte = input[i];
         expanded[i * 2] = (uint8_t)(byte & 0x0F);
         expanded[i * 2 + 1] = (uint8_t)(byte >> 4);
     }
-
-    carquet_avx512_bitunpack32_8bit(expanded, tmp);
-    memcpy(values, tmp, 8 * sizeof(uint32_t));
+    __m128i bytes = _mm_loadl_epi64((const __m128i*)expanded);
+    __m256i result = _mm256_cvtepu8_epi32(bytes);
+    _mm256_storeu_si256((__m256i*)values, result);
 }
 
 /**
