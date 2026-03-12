@@ -10,7 +10,6 @@
 #include <stddef.h>
 #include <string.h>
 
-extern void carquet_dispatch_match_copy(uint8_t* dst, const uint8_t* src, size_t len, size_t offset);
 extern size_t carquet_dispatch_match_length(const uint8_t* p, const uint8_t* match, const uint8_t* limit);
 
 /* ============================================================================
@@ -25,7 +24,7 @@ extern size_t carquet_dispatch_match_length(const uint8_t* p, const uint8_t* mat
 
 #define SNAPPY_HASH_LOG        14
 #define SNAPPY_HASH_SIZE       (1 << SNAPPY_HASH_LOG)
-#define SNAPPY_MAX_OFFSET      (1 << 15)
+#define SNAPPY_MAX_OFFSET      65535
 #define SNAPPY_BLOCK_SIZE      (1 << 16)
 
 /* Forward declaration */
@@ -69,6 +68,108 @@ static size_t snappy_write_varint(uint8_t* p, uint32_t value) {
  * Snappy Decompression
  * ============================================================================
  */
+
+static inline void snappy_match_copy_fast(uint8_t* dst, size_t len, size_t offset) {
+    const uint8_t* src = dst - offset;
+
+    if (offset == 1) {
+        memset(dst, *src, len);
+        return;
+    }
+
+    if (offset == 2) {
+        uint16_t pattern16;
+        uint32_t pattern32;
+        uint64_t pattern64;
+
+        memcpy(&pattern16, src, sizeof(pattern16));
+        pattern32 = (uint32_t)pattern16 | ((uint32_t)pattern16 << 16);
+        pattern64 = (uint64_t)pattern32 | ((uint64_t)pattern32 << 32);
+
+        while (len >= 8) {
+            memcpy(dst, &pattern64, sizeof(pattern64));
+            dst += 8;
+            len -= 8;
+        }
+        while (len >= 2) {
+            memcpy(dst, &pattern16, sizeof(pattern16));
+            dst += 2;
+            len -= 2;
+        }
+        if (len) {
+            *dst = *(const uint8_t*)&pattern16;
+        }
+        return;
+    }
+
+    if (offset == 4) {
+        uint32_t pattern32;
+        uint64_t pattern64;
+        memcpy(&pattern32, src, 4);
+        pattern64 = (uint64_t)pattern32 | ((uint64_t)pattern32 << 32);
+
+        while (len >= 8) {
+            memcpy(dst, &pattern64, sizeof(pattern64));
+            dst += 8;
+            len -= 8;
+        }
+        while (len > 0) {
+            *dst++ = *src++;
+            len--;
+        }
+        return;
+    }
+
+    if (offset < 8) {
+        /* For offsets 3, 5, 6, 7 the 8-byte tiling trick doesn't work
+         * (8 % offset != 0 means the pattern drifts after each 8-byte copy).
+         * Use byte-by-byte copy from the repeating source. */
+        for (size_t i = 0; i < len; i++) {
+            dst[i] = src[i % offset];
+        }
+        return;
+    }
+
+    if (offset < 16) {
+        while (len >= 8) {
+            uint64_t chunk;
+            memcpy(&chunk, src, sizeof(chunk));
+            memcpy(dst, &chunk, sizeof(chunk));
+            dst += 8;
+            src += 8;
+            len -= 8;
+        }
+        while (len > 0) {
+            *dst++ = *src++;
+            len--;
+        }
+        return;
+    }
+
+    while (len >= 16) {
+        uint64_t lo;
+        uint64_t hi;
+        memcpy(&lo, src, sizeof(lo));
+        memcpy(&hi, src + 8, sizeof(hi));
+        memcpy(dst, &lo, sizeof(lo));
+        memcpy(dst + 8, &hi, sizeof(hi));
+        dst += 16;
+        src += 16;
+        len -= 16;
+    }
+    if (len >= 8) {
+        uint64_t chunk;
+        memcpy(&chunk, src, sizeof(chunk));
+        memcpy(dst, &chunk, sizeof(chunk));
+        dst += 8;
+        src += 8;
+        len -= 8;
+    }
+    while (len > 0) {
+        *dst++ = *src++;
+        len--;
+    }
+}
 
 carquet_status_t carquet_snappy_decompress(
     const uint8_t* src,
@@ -139,8 +240,7 @@ carquet_status_t carquet_snappy_decompress(
                 return CARQUET_ERROR_INVALID_COMPRESSED_DATA;
             }
 
-            const uint8_t* ref = op - offset;
-            carquet_dispatch_match_copy(op, ref, len, offset);
+            snappy_match_copy_fast(op, len, offset);
             op += len;
 
         } else if (type == SNAPPY_COPY_2) {
@@ -159,8 +259,7 @@ carquet_status_t carquet_snappy_decompress(
                 return CARQUET_ERROR_INVALID_COMPRESSED_DATA;
             }
 
-            const uint8_t* ref = op - offset;
-            carquet_dispatch_match_copy(op, ref, len, offset);
+            snappy_match_copy_fast(op, len, offset);
             op += len;
 
         } else { /* SNAPPY_COPY_4 */
@@ -180,8 +279,7 @@ carquet_status_t carquet_snappy_decompress(
                 return CARQUET_ERROR_INVALID_COMPRESSED_DATA;
             }
 
-            const uint8_t* ref = op - offset;
-            carquet_dispatch_match_copy(op, ref, len, offset);
+            snappy_match_copy_fast(op, len, offset);
             op += len;
         }
     }
@@ -207,6 +305,52 @@ static inline uint32_t snappy_read32(const uint8_t* p) {
     uint32_t v;
     memcpy(&v, p, 4);
     return v;
+}
+
+/* Prefetch hint - no-op on compilers without support */
+#if defined(__GNUC__) || defined(__clang__)
+#define SNAPPY_PREFETCH(addr) __builtin_prefetch((addr), 0, 1)
+#elif defined(_MSC_VER)
+#include <xmmintrin.h>
+#define SNAPPY_PREFETCH(addr) _mm_prefetch((const char*)(addr), _MM_HINT_T1)
+#else
+#define SNAPPY_PREFETCH(addr) ((void)0)
+#endif
+
+/* Fast inline match length using 64-bit XOR comparison.
+ * Avoids SIMD dispatch overhead on the hot compression path.
+ * Assumes little-endian byte order (x86/ARM). */
+static inline size_t fast_match_length(const uint8_t* p, const uint8_t* match,
+                                        const uint8_t* limit) {
+    const uint8_t* start = p;
+
+    while (p + 8 <= limit) {
+        uint64_t a, b;
+        memcpy(&a, p, 8);
+        memcpy(&b, match, 8);
+        uint64_t diff = a ^ b;
+        if (diff) {
+#if defined(__GNUC__) || defined(__clang__)
+            return (size_t)(p - start) + ((size_t)__builtin_ctzll(diff) >> 3);
+#elif defined(_MSC_VER) && (defined(_M_X64) || defined(_M_ARM64))
+            unsigned long idx;
+            _BitScanForward64(&idx, diff);
+            return (size_t)(p - start) + (idx >> 3);
+#else
+            for (size_t i = 0; i < 8; i++) {
+                if (p[i] != match[i]) return (size_t)(p - start) + i;
+            }
+#endif
+        }
+        p += 8;
+        match += 8;
+    }
+
+    while (p < limit && *p == *match) {
+        p++;
+        match++;
+    }
+    return (size_t)(p - start);
 }
 
 static uint8_t* snappy_emit_literal(uint8_t* op, const uint8_t* literal, size_t len) {
@@ -266,6 +410,85 @@ static uint8_t* snappy_emit_copy(uint8_t* op, size_t offset, size_t len) {
     return op;
 }
 
+static uint8_t* snappy_compress_block(
+    const uint8_t* src,
+    size_t src_size,
+    uint8_t* op) {
+
+    if (src_size == 0) return op;
+    if (src_size < 15) return snappy_emit_literal(op, src, src_size);
+
+    uint16_t hash_table[SNAPPY_HASH_SIZE];
+    memset(hash_table, 0, sizeof(hash_table));
+
+    const uint8_t* const iend = src + src_size;
+    const uint8_t* const ilimit = iend - 15;
+    const uint8_t* ip = src + 1;
+    const uint8_t* anchor = src;
+    const uint8_t* candidate;
+
+    /* Pre-seed hash table for position 0 */
+    hash_table[snappy_hash(snappy_read32(src))] = 0;
+    uint32_t next_hash = snappy_hash(snappy_read32(ip));
+
+    for (;;) {
+        /* Accelerating skip loop: find next match candidate */
+        size_t skip = 32;
+        const uint8_t* next_ip = ip;
+
+        do {
+            ip = next_ip;
+            uint32_t h = next_hash;
+            size_t step = skip >> 5;
+            skip++;
+            next_ip = ip + step;
+
+            if (next_ip > ilimit) goto emit_remainder;
+
+            next_hash = snappy_hash(snappy_read32(next_ip));
+            SNAPPY_PREFETCH(&hash_table[next_hash]);
+            candidate = src + hash_table[h];
+            hash_table[h] = (uint16_t)(ip - src);
+        } while (snappy_read32(ip) != snappy_read32(candidate) ||
+                 (size_t)(ip - candidate) > SNAPPY_MAX_OFFSET);
+
+        /* Emit pending literal bytes */
+        if (ip > anchor) {
+            op = snappy_emit_literal(op, anchor, (size_t)(ip - anchor));
+        }
+
+        /* Emit match(es), chaining consecutive matches */
+        do {
+            size_t match_len = 4 + fast_match_length(ip + 4, candidate + 4, iend);
+            size_t offset = (size_t)(ip - candidate);
+            ip += match_len;
+            op = snappy_emit_copy(op, offset, match_len);
+            anchor = ip;
+
+            if (ip >= ilimit) goto emit_remainder;
+
+            /* Insert hash entries near match end for future matches */
+            hash_table[snappy_hash(snappy_read32(ip - 2))] = (uint16_t)(ip - 2 - src);
+            hash_table[snappy_hash(snappy_read32(ip - 1))] = (uint16_t)(ip - 1 - src);
+
+            /* Try to chain: check for immediate match at current position */
+            uint32_t h = snappy_hash(snappy_read32(ip));
+            candidate = src + hash_table[h];
+            hash_table[h] = (uint16_t)(ip - src);
+        } while (snappy_read32(ip) == snappy_read32(candidate) &&
+                 (size_t)(ip - candidate) <= SNAPPY_MAX_OFFSET);
+
+        /* Prepare next hash for the skip loop */
+        next_hash = snappy_hash(snappy_read32(++ip));
+    }
+
+emit_remainder:
+    if (anchor < iend) {
+        op = snappy_emit_literal(op, anchor, (size_t)(iend - anchor));
+    }
+    return op;
+}
+
 carquet_status_t carquet_snappy_compress(
     const uint8_t* src,
     size_t src_size,
@@ -297,50 +520,14 @@ carquet_status_t carquet_snappy_compress(
         return CARQUET_ERROR_INVALID_ARGUMENT;
     }
 
-    if (src_size < 15) {
-        /* Just emit a literal */
-        op = snappy_emit_literal(op, src, src_size);
-        *dst_size = (size_t)(op - dst);
-        return CARQUET_OK;
-    }
-
-    uint16_t hash_table[SNAPPY_HASH_SIZE];
-    memset(hash_table, 0, sizeof(hash_table));
-
-    const uint8_t* ip = src;
-    const uint8_t* const iend = src + src_size;
-    const uint8_t* const ilimit = iend - 15;
-    const uint8_t* anchor = src;
-
-    while (ip < ilimit) {
-        uint32_t h = snappy_hash(snappy_read32(ip));
-        const uint8_t* ref = src + hash_table[h];
-        hash_table[h] = (uint16_t)(ip - src);
-
-        if (ip <= ref || ip - ref > SNAPPY_MAX_OFFSET || snappy_read32(ref) != snappy_read32(ip)) {
-            ip++;
-            continue;
+    size_t pos = 0;
+    while (pos < src_size) {
+        size_t block_size = src_size - pos;
+        if (block_size > SNAPPY_BLOCK_SIZE) {
+            block_size = SNAPPY_BLOCK_SIZE;
         }
-
-        /* Emit pending literal */
-        if (ip > anchor) {
-            op = snappy_emit_literal(op, anchor, (size_t)(ip - anchor));
-        }
-
-        const uint8_t* match_start = ip;
-        size_t match_len = 4 + carquet_dispatch_match_length(ip + 4, ref + 4, iend);
-        ip = match_start + match_len;
-        op = snappy_emit_copy(op, (size_t)(match_start - ref), match_len);
-        anchor = ip;
-
-        if (ip < ilimit) {
-            hash_table[snappy_hash(snappy_read32(ip - 1))] = (uint16_t)(ip - 1 - src);
-        }
-    }
-
-    /* Emit final literal */
-    if (anchor < iend) {
-        op = snappy_emit_literal(op, anchor, (size_t)(iend - anchor));
+        op = snappy_compress_block(src + pos, block_size, op);
+        pos += block_size;
     }
 
     *dst_size = (size_t)(op - dst);

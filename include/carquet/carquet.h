@@ -1,7 +1,7 @@
 /**
  * @file carquet.h
  * @brief Carquet - High-Performance Pure C Parquet Library
- * @version 0.2.0
+ * @version 0.3.0
  *
  * @copyright Copyright (c) 2025. All rights reserved.
  * @license MIT License
@@ -193,13 +193,13 @@ extern "C" {
 #define CARQUET_VERSION_MAJOR 0
 
 /** @brief Minor version number */
-#define CARQUET_VERSION_MINOR 2
+#define CARQUET_VERSION_MINOR 3
 
 /** @brief Patch version number */
 #define CARQUET_VERSION_PATCH 0
 
 /** @brief Version string in "MAJOR.MINOR.PATCH" format */
-#define CARQUET_VERSION_STRING "0.2.0"
+#define CARQUET_VERSION_STRING "0.3.0"
 
 /** @brief Numeric version for compile-time comparisons: (MAJOR * 10000 + MINOR * 100 + PATCH) */
 #define CARQUET_VERSION_NUMBER (CARQUET_VERSION_MAJOR * 10000 + CARQUET_VERSION_MINOR * 100 + CARQUET_VERSION_PATCH)
@@ -283,6 +283,23 @@ void carquet_version_components(int* major, int* minor, int* patch);
  */
 CARQUET_API CARQUET_WARN_UNUSED_RESULT
 carquet_status_t carquet_init(void);
+
+/**
+ * @brief Release library-level resources.
+ *
+ * Frees cached compression contexts held by the calling thread and resets
+ * library state.  On POSIX systems with OpenMP, worker-thread contexts are
+ * freed automatically when those threads exit; this function handles the
+ * main thread and the non-OpenMP (global) case.
+ *
+ * Safe to call multiple times.  After cleanup, carquet_init() may be called
+ * again if the library is needed once more.
+ *
+ * @note Call from the main thread before program exit for a clean valgrind
+ *       report.
+ */
+CARQUET_API
+void carquet_cleanup(void);
 
 /**
  * @brief CPU feature information detected at runtime.
@@ -1792,6 +1809,15 @@ typedef struct carquet_writer_options {
      * Default: true
      */
     bool write_statistics;
+
+    /**
+     * @brief Write page CRC32 checksums.
+     *
+     * CRCs improve corruption detection but add write-side overhead.
+     *
+     * Default: true
+     */
+    bool write_crc;
 
     /**
      * @brief Write page index for efficient page skipping.

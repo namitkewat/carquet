@@ -913,6 +913,53 @@ static int test_nullable_mixed(void) {
 
     ASSERT_TRUE(carquet_reader_num_rows(reader) == 10, "nullable_mixed", "row count mismatch");
 
+    carquet_batch_reader_config_t config;
+    carquet_batch_reader_config_init(&config);
+    config.batch_size = 10;
+
+    carquet_batch_reader_t* batch_reader = carquet_batch_reader_create(reader, &config, &err);
+    if (!batch_reader) {
+        carquet_reader_close(reader);
+        carquet_schema_free(schema);
+        remove(test_file);
+        TEST_FAIL("nullable_mixed", "batch reader creation failed");
+    }
+
+    carquet_row_batch_t* batch = NULL;
+    status = carquet_batch_reader_next(batch_reader, &batch);
+    ASSERT_OK(status, "nullable_mixed", "batch read failed");
+    ASSERT_TRUE(batch != NULL, "nullable_mixed", "missing batch");
+
+    const void* data = NULL;
+    const uint8_t* null_bitmap = NULL;
+    int64_t n = 0;
+    status = carquet_row_batch_column(batch, 0, &data, &null_bitmap, &n);
+    ASSERT_OK(status, "nullable_mixed", "column read failed");
+    ASSERT_TRUE(n == 10, "nullable_mixed", "batch row count mismatch");
+    ASSERT_TRUE(null_bitmap != NULL, "nullable_mixed", "missing null bitmap");
+
+    const int32_t* read_values = (const int32_t*)data;
+    const int32_t expected_values[10] = {1, 0, 3, 0, 5, 0, 7, 0, 9, 0};
+    for (int i = 0; i < 10; i++) {
+        int is_null = (null_bitmap[i / 8] >> (i % 8)) & 1;
+        if ((i % 2) == 1) {
+            ASSERT_TRUE(is_null, "nullable_mixed", "expected null bit");
+        } else {
+            ASSERT_TRUE(!is_null, "nullable_mixed", "unexpected null bit");
+        }
+        if (read_values[i] != expected_values[i]) {
+            carquet_row_batch_free(batch);
+            carquet_batch_reader_free(batch_reader);
+            carquet_reader_close(reader);
+            carquet_schema_free(schema);
+            remove(test_file);
+            TEST_FAIL("nullable_mixed", "decoded values not aligned to logical rows");
+        }
+    }
+
+    carquet_row_batch_free(batch);
+    carquet_batch_reader_free(batch_reader);
+
     carquet_reader_close(reader);
     carquet_schema_free(schema);
     remove(test_file);
@@ -1105,6 +1152,166 @@ static int test_compression_roundtrip(carquet_compression_t compression, const c
     return 0;
 }
 
+static int test_float_double_compression_roundtrip(
+    carquet_compression_t compression,
+    const char* name) {
+
+    char test_file[512];
+    make_temp_path(test_file, sizeof(test_file), "test_maturity_float_double");
+    carquet_error_t err = CARQUET_ERROR_INIT;
+    const int count = 2048;
+
+    carquet_schema_t* schema = carquet_schema_create(&err);
+    if (!schema) TEST_FAIL("float_double_compression", "schema creation failed");
+
+    (void)carquet_schema_add_column(schema, "value_f32", CARQUET_PHYSICAL_FLOAT, NULL,
+            CARQUET_REPETITION_REQUIRED, 0, 0);
+    (void)carquet_schema_add_column(schema, "value_f64", CARQUET_PHYSICAL_DOUBLE, NULL,
+            CARQUET_REPETITION_REQUIRED, 0, 0);
+
+    float* f32 = malloc((size_t)count * sizeof(float));
+    double* f64 = malloc((size_t)count * sizeof(double));
+    if (!f32 || !f64) {
+        free(f32);
+        free(f64);
+        carquet_schema_free(schema);
+        TEST_FAIL("float_double_compression", "allocation failed");
+    }
+
+    for (int i = 0; i < count; i++) {
+        f32[i] = (float)((i % 97) * 0.25f + (i / 97) * 0.001f);
+        f64[i] = (double)((i % 131) * 0.125 + (i / 131) * 0.00001);
+    }
+
+    carquet_writer_options_t opts;
+    carquet_writer_options_init(&opts);
+    opts.compression = compression;
+
+    carquet_writer_t* writer = carquet_writer_create(test_file, schema, &opts, &err);
+    if (!writer) {
+        free(f32);
+        free(f64);
+        carquet_schema_free(schema);
+        printf("[FAIL] float_double_compression_%s: writer creation failed - %s\n", name, err.message);
+        g_tests_failed++;
+        return 1;
+    }
+
+    carquet_status_t status = carquet_writer_write_batch(writer, 0, f32, count, NULL, NULL);
+    ASSERT_OK(status, "float_double_compression", "float write failed");
+    status = carquet_writer_write_batch(writer, 1, f64, count, NULL, NULL);
+    ASSERT_OK(status, "float_double_compression", "double write failed");
+    status = carquet_writer_close(writer);
+    ASSERT_OK(status, "float_double_compression", "writer close failed");
+
+    carquet_reader_t* reader = carquet_reader_open(test_file, NULL, &err);
+    if (!reader) {
+        free(f32);
+        free(f64);
+        carquet_schema_free(schema);
+        remove(test_file);
+        printf("[FAIL] float_double_compression_%s: reader open failed - %s\n", name, err.message);
+        g_tests_failed++;
+        return 1;
+    }
+
+    carquet_batch_reader_config_t config;
+    carquet_batch_reader_config_init(&config);
+    config.batch_size = count;
+
+    carquet_batch_reader_t* batch_reader = carquet_batch_reader_create(reader, &config, &err);
+    if (!batch_reader) {
+        carquet_reader_close(reader);
+        free(f32);
+        free(f64);
+        carquet_schema_free(schema);
+        remove(test_file);
+        printf("[FAIL] float_double_compression_%s: batch reader failed - %s\n", name, err.message);
+        g_tests_failed++;
+        return 1;
+    }
+
+    carquet_row_batch_t* batch = NULL;
+    status = carquet_batch_reader_next(batch_reader, &batch);
+    ASSERT_OK(status, "float_double_compression", "batch read failed");
+    if (!batch || carquet_row_batch_num_rows(batch) != count) {
+        carquet_batch_reader_free(batch_reader);
+        carquet_reader_close(reader);
+        free(f32);
+        free(f64);
+        carquet_schema_free(schema);
+        remove(test_file);
+        TEST_FAIL("float_double_compression", "unexpected batch row count");
+    }
+
+    const void* data = NULL;
+    const uint8_t* nulls = NULL;
+    int64_t values_read = 0;
+    status = carquet_row_batch_column(batch, 0, &data, &nulls, &values_read);
+    ASSERT_OK(status, "float_double_compression", "float column read failed");
+    if (values_read != count) {
+        carquet_row_batch_free(batch);
+        carquet_batch_reader_free(batch_reader);
+        carquet_reader_close(reader);
+        free(f32);
+        free(f64);
+        carquet_schema_free(schema);
+        remove(test_file);
+        TEST_FAIL("float_double_compression", "float row count mismatch");
+    }
+    const float* read_f32 = (const float*)data;
+    for (int i = 0; i < count; i++) {
+        if (read_f32[i] != f32[i]) {
+            carquet_row_batch_free(batch);
+            carquet_batch_reader_free(batch_reader);
+            carquet_reader_close(reader);
+            free(f32);
+            free(f64);
+            carquet_schema_free(schema);
+            remove(test_file);
+            TEST_FAIL("float_double_compression", "float roundtrip mismatch");
+        }
+    }
+
+    status = carquet_row_batch_column(batch, 1, &data, &nulls, &values_read);
+    ASSERT_OK(status, "float_double_compression", "double column read failed");
+    if (values_read != count) {
+        carquet_row_batch_free(batch);
+        carquet_batch_reader_free(batch_reader);
+        carquet_reader_close(reader);
+        free(f32);
+        free(f64);
+        carquet_schema_free(schema);
+        remove(test_file);
+        TEST_FAIL("float_double_compression", "double row count mismatch");
+    }
+    const double* read_f64 = (const double*)data;
+    for (int i = 0; i < count; i++) {
+        if (read_f64[i] != f64[i]) {
+            carquet_row_batch_free(batch);
+            carquet_batch_reader_free(batch_reader);
+            carquet_reader_close(reader);
+            free(f32);
+            free(f64);
+            carquet_schema_free(schema);
+            remove(test_file);
+            TEST_FAIL("float_double_compression", "double roundtrip mismatch");
+        }
+    }
+
+    carquet_row_batch_free(batch);
+    carquet_batch_reader_free(batch_reader);
+    carquet_reader_close(reader);
+    free(f32);
+    free(f64);
+    carquet_schema_free(schema);
+    remove(test_file);
+
+    printf("[PASS] float_double_compression_%s\n", name);
+    g_tests_passed++;
+    return 0;
+}
+
 static int test_all_compressions(void) {
     printf("\n--- Compression Roundtrip Tests ---\n");
 
@@ -1113,6 +1320,8 @@ static int test_all_compressions(void) {
     test_compression_roundtrip(CARQUET_COMPRESSION_GZIP, "gzip");
     test_compression_roundtrip(CARQUET_COMPRESSION_LZ4, "lz4");
     test_compression_roundtrip(CARQUET_COMPRESSION_ZSTD, "zstd");
+    test_float_double_compression_roundtrip(CARQUET_COMPRESSION_SNAPPY, "snappy");
+    test_float_double_compression_roundtrip(CARQUET_COMPRESSION_ZSTD, "zstd");
 
     return 0;
 }

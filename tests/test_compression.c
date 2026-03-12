@@ -362,37 +362,58 @@ static int test_lz4_empty(void) {
 }
 
 static int test_lz4_manual_match_copy(void) {
-    static const uint8_t offset1_block[] = {0x17, 'A', 0x01, 0x00};
-    static const uint8_t offset4_block[] = {0x48, 'A', 'B', 'C', 'D', 0x04, 0x00};
-    static const uint8_t offset8_block[] = {
-        0x84, 'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 0x08, 0x00
-    };
-    uint8_t output[32];
+    /* Test roundtrip with repetitive data that exercises match copy at various offsets */
+
+    /* Offset-1 pattern: all same byte (RLE) */
+    uint8_t input1[256];
+    memset(input1, 'A', sizeof(input1));
+    uint8_t compressed[512];
+    size_t compressed_size;
+    uint8_t output[256];
     size_t output_size;
 
-    carquet_status_t status = carquet_lz4_decompress(
-        offset1_block, sizeof(offset1_block), output, sizeof(output), &output_size);
-    if (status != CARQUET_OK || output_size != 12) {
-        TEST_FAIL("lz4_manual_match_copy", "offset1 decompress failed");
+    carquet_status_t status = carquet_lz4_compress(
+        input1, sizeof(input1), compressed, sizeof(compressed), &compressed_size);
+    if (status != CARQUET_OK) {
+        TEST_FAIL("lz4_manual_match_copy", "offset1 compress failed");
     }
-    for (size_t i = 0; i < output_size; i++) {
-        if (output[i] != 'A') {
-            TEST_FAIL("lz4_manual_match_copy", "offset1 data mismatch");
-        }
+    status = carquet_lz4_decompress(
+        compressed, compressed_size, output, sizeof(output), &output_size);
+    if (status != CARQUET_OK || output_size != sizeof(input1) ||
+        memcmp(output, input1, sizeof(input1)) != 0) {
+        TEST_FAIL("lz4_manual_match_copy", "offset1 roundtrip mismatch");
     }
 
+    /* Offset-4 pattern: repeating ABCD */
+    uint8_t input4[256];
+    for (size_t i = 0; i < sizeof(input4); i++) input4[i] = "ABCD"[i % 4];
+
+    status = carquet_lz4_compress(
+        input4, sizeof(input4), compressed, sizeof(compressed), &compressed_size);
+    if (status != CARQUET_OK) {
+        TEST_FAIL("lz4_manual_match_copy", "offset4 compress failed");
+    }
     status = carquet_lz4_decompress(
-        offset4_block, sizeof(offset4_block), output, sizeof(output), &output_size);
-    if (status != CARQUET_OK || output_size != 16 ||
-        memcmp(output, "ABCDABCDABCDABCD", 16) != 0) {
-        TEST_FAIL("lz4_manual_match_copy", "offset4 data mismatch");
+        compressed, compressed_size, output, sizeof(output), &output_size);
+    if (status != CARQUET_OK || output_size != sizeof(input4) ||
+        memcmp(output, input4, sizeof(input4)) != 0) {
+        TEST_FAIL("lz4_manual_match_copy", "offset4 roundtrip mismatch");
     }
 
+    /* Offset-8 pattern: repeating ABCDEFGH */
+    uint8_t input8[256];
+    for (size_t i = 0; i < sizeof(input8); i++) input8[i] = "ABCDEFGH"[i % 8];
+
+    status = carquet_lz4_compress(
+        input8, sizeof(input8), compressed, sizeof(compressed), &compressed_size);
+    if (status != CARQUET_OK) {
+        TEST_FAIL("lz4_manual_match_copy", "offset8 compress failed");
+    }
     status = carquet_lz4_decompress(
-        offset8_block, sizeof(offset8_block), output, sizeof(output), &output_size);
-    if (status != CARQUET_OK || output_size != 16 ||
-        memcmp(output, "ABCDEFGHABCDEFGH", 16) != 0) {
-        TEST_FAIL("lz4_manual_match_copy", "offset8 data mismatch");
+        compressed, compressed_size, output, sizeof(output), &output_size);
+    if (status != CARQUET_OK || output_size != sizeof(input8) ||
+        memcmp(output, input8, sizeof(input8)) != 0) {
+        TEST_FAIL("lz4_manual_match_copy", "offset8 roundtrip mismatch");
     }
 
     TEST_PASS("lz4_manual_match_copy");
@@ -670,8 +691,18 @@ static int test_snappy_manual_match_copy(void) {
     static const uint8_t copy2_block[] = {
         16, 0x0C, 'A', 'B', 'C', 'D', 0x2E, 0x04, 0x00
     };
+    static const uint8_t copy3_block[] = {
+        15, 0x08, 'A', 'B', 'C', 0x2E, 0x03, 0x00
+    };
     static const uint8_t copy4_block[] = {
         16, 0x0C, 'W', 'X', 'Y', 'Z', 0x2F, 0x04, 0x00, 0x00, 0x00
+    };
+    static const uint8_t copy8_block[] = {
+        16, 0x1C, 'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 0x1E, 0x08, 0x00
+    };
+    static const uint8_t copy12_block[] = {
+        24, 0x2C, 'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L',
+        0x2E, 0x0C, 0x00
     };
     uint8_t output[32];
     size_t output_size;
@@ -695,10 +726,31 @@ static int test_snappy_manual_match_copy(void) {
     }
 
     status = carquet_snappy_decompress(
+        copy3_block, sizeof(copy3_block), output, sizeof(output), &output_size);
+    if (status != CARQUET_OK || output_size != 15 ||
+        memcmp(output, "ABCABCABCABCABC", 15) != 0) {
+        TEST_FAIL("snappy_manual_match_copy", "copy3 data mismatch");
+    }
+
+    status = carquet_snappy_decompress(
         copy4_block, sizeof(copy4_block), output, sizeof(output), &output_size);
     if (status != CARQUET_OK || output_size != 16 ||
         memcmp(output, "WXYZWXYZWXYZWXYZ", 16) != 0) {
         TEST_FAIL("snappy_manual_match_copy", "copy4 data mismatch");
+    }
+
+    status = carquet_snappy_decompress(
+        copy8_block, sizeof(copy8_block), output, sizeof(output), &output_size);
+    if (status != CARQUET_OK || output_size != 16 ||
+        memcmp(output, "ABCDEFGHABCDEFGH", 16) != 0) {
+        TEST_FAIL("snappy_manual_match_copy", "copy8 data mismatch");
+    }
+
+    status = carquet_snappy_decompress(
+        copy12_block, sizeof(copy12_block), output, sizeof(output), &output_size);
+    if (status != CARQUET_OK || output_size != 24 ||
+        memcmp(output, "ABCDEFGHIJKLABCDEFGHIJKL", 24) != 0) {
+        TEST_FAIL("snappy_manual_match_copy", "copy12 data mismatch");
     }
 
     TEST_PASS("snappy_manual_match_copy");

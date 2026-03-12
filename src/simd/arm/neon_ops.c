@@ -26,6 +26,16 @@
 
 #include <arm_neon.h>
 
+static inline int64x2_t carquet_neon_min_s64(int64x2_t a, int64x2_t b) {
+    uint64x2_t mask = vcltq_s64(a, b);
+    return vbslq_s64(mask, a, b);
+}
+
+static inline int64x2_t carquet_neon_max_s64(int64x2_t a, int64x2_t b) {
+    uint64x2_t mask = vcgtq_s64(a, b);
+    return vbslq_s64(mask, a, b);
+}
+
 /* ============================================================================
  * Bit Unpacking - NEON Optimized (ALL bit widths)
  * ============================================================================
@@ -1208,13 +1218,24 @@ void carquet_neon_match_copy(uint8_t* dst, const uint8_t* src, size_t len, size_
         }
     } else if (offset == 2) {
         /* Fill with 2-byte pattern */
-        uint8_t v0 = src[0], v1 = src[1];
+        uint16_t pattern16;
+        memcpy(&pattern16, src, sizeof(pattern16));
+        uint16x8_t v = vdupq_n_u16(pattern16);
+
+        while (len >= 16) {
+            vst1q_u16((uint16_t*)dst, v);
+            dst += 16;
+            len -= 16;
+        }
+
         while (len >= 2) {
-            *dst++ = v0;
-            *dst++ = v1;
+            memcpy(dst, &pattern16, sizeof(pattern16));
+            dst += 2;
             len -= 2;
         }
-        if (len) *dst = v0;
+        if (len) {
+            *dst = *(const uint8_t*)&pattern16;
+        }
     } else if (offset == 4) {
         /* Fill with 4-byte pattern */
         uint32_t pattern;
@@ -1236,11 +1257,40 @@ void carquet_neon_match_copy(uint8_t* dst, const uint8_t* src, size_t len, size_
         for (size_t i = 0; i < len; i++) {
             dst[i] = src[i];
         }
-    } else {
-        /* General overlapping case: copy byte by byte */
+    } else if (offset >= 8) {
+        /* Offset 8-15: copy 8 bytes at a time; each chunk is safe to materialize first. */
+        while (len >= 8) {
+            uint64_t v;
+            memcpy(&v, src, sizeof(v));
+            memcpy(dst, &v, sizeof(v));
+            dst += 8;
+            src += 8;
+            len -= 8;
+        }
+
         while (len > 0) {
             *dst++ = *src++;
             len--;
+        }
+    } else {
+        /* Offset 3, 5, 6, 7: tile the seed bytes into a vector and blast full chunks. */
+        uint8_t pattern[16];
+        for (size_t i = 0; i < offset; i++) {
+            pattern[i] = src[i];
+        }
+        for (size_t i = offset; i < sizeof(pattern); i++) {
+            pattern[i] = pattern[i % offset];
+        }
+
+        uint8x16_t v = vld1q_u8(pattern);
+        while (len >= 16) {
+            vst1q_u8(dst, v);
+            dst += 16;
+            len -= 16;
+        }
+
+        for (size_t i = 0; i < len; i++) {
+            dst[i] = pattern[i];
         }
     }
 }
@@ -1404,6 +1454,262 @@ void carquet_neon_fill_def_levels(int16_t* def_levels, int64_t count, int16_t va
     for (; i < count; i++) {
         def_levels[i] = value;
     }
+}
+
+void carquet_neon_minmax_i32(const int32_t* values, int64_t count,
+                              int32_t* min_value, int32_t* max_value) {
+    int32_t min_v = values[0];
+    int32_t max_v = values[0];
+    int32x4_t min_vec = vdupq_n_s32(min_v);
+    int32x4_t max_vec = vdupq_n_s32(max_v);
+    int64_t i = 1;
+
+    for (; i + 4 <= count; i += 4) {
+        int32x4_t v = vld1q_s32(values + i);
+        min_vec = vminq_s32(min_vec, v);
+        max_vec = vmaxq_s32(max_vec, v);
+    }
+
+    int32_t tmp_min[4];
+    int32_t tmp_max[4];
+    vst1q_s32(tmp_min, min_vec);
+    vst1q_s32(tmp_max, max_vec);
+    for (int j = 0; j < 4; j++) {
+        if (tmp_min[j] < min_v) min_v = tmp_min[j];
+        if (tmp_max[j] > max_v) max_v = tmp_max[j];
+    }
+    for (; i < count; i++) {
+        if (values[i] < min_v) min_v = values[i];
+        if (values[i] > max_v) max_v = values[i];
+    }
+
+    *min_value = min_v;
+    *max_value = max_v;
+}
+
+void carquet_neon_minmax_i64(const int64_t* values, int64_t count,
+                              int64_t* min_value, int64_t* max_value) {
+    int64_t min_v = values[0];
+    int64_t max_v = values[0];
+    int64x2_t min_vec = vdupq_n_s64(min_v);
+    int64x2_t max_vec = vdupq_n_s64(max_v);
+    int64_t i = 1;
+
+    for (; i + 2 <= count; i += 2) {
+        int64x2_t v = vld1q_s64(values + i);
+        min_vec = carquet_neon_min_s64(min_vec, v);
+        max_vec = carquet_neon_max_s64(max_vec, v);
+    }
+
+    int64_t tmp_min[2];
+    int64_t tmp_max[2];
+    vst1q_s64(tmp_min, min_vec);
+    vst1q_s64(tmp_max, max_vec);
+    for (int j = 0; j < 2; j++) {
+        if (tmp_min[j] < min_v) min_v = tmp_min[j];
+        if (tmp_max[j] > max_v) max_v = tmp_max[j];
+    }
+    for (; i < count; i++) {
+        if (values[i] < min_v) min_v = values[i];
+        if (values[i] > max_v) max_v = values[i];
+    }
+
+    *min_value = min_v;
+    *max_value = max_v;
+}
+
+void carquet_neon_minmax_float(const float* values, int64_t count,
+                                float* min_value, float* max_value) {
+    float min_v = values[0];
+    float max_v = values[0];
+    float32x4_t min_vec = vdupq_n_f32(min_v);
+    float32x4_t max_vec = vdupq_n_f32(max_v);
+    int64_t i = 1;
+
+    for (; i + 4 <= count; i += 4) {
+        float32x4_t v = vld1q_f32(values + i);
+        min_vec = vminq_f32(min_vec, v);
+        max_vec = vmaxq_f32(max_vec, v);
+    }
+
+    float tmp_min[4];
+    float tmp_max[4];
+    vst1q_f32(tmp_min, min_vec);
+    vst1q_f32(tmp_max, max_vec);
+    for (int j = 0; j < 4; j++) {
+        if (tmp_min[j] < min_v) min_v = tmp_min[j];
+        if (tmp_max[j] > max_v) max_v = tmp_max[j];
+    }
+    for (; i < count; i++) {
+        if (values[i] < min_v) min_v = values[i];
+        if (values[i] > max_v) max_v = values[i];
+    }
+
+    *min_value = min_v;
+    *max_value = max_v;
+}
+
+void carquet_neon_minmax_double(const double* values, int64_t count,
+                                 double* min_value, double* max_value) {
+    double min_v = values[0];
+    double max_v = values[0];
+    float64x2_t min_vec = vdupq_n_f64(min_v);
+    float64x2_t max_vec = vdupq_n_f64(max_v);
+    int64_t i = 1;
+
+    for (; i + 2 <= count; i += 2) {
+        float64x2_t v = vld1q_f64(values + i);
+        min_vec = vminq_f64(min_vec, v);
+        max_vec = vmaxq_f64(max_vec, v);
+    }
+
+    double tmp_min[2];
+    double tmp_max[2];
+    vst1q_f64(tmp_min, min_vec);
+    vst1q_f64(tmp_max, max_vec);
+    for (int j = 0; j < 2; j++) {
+        if (tmp_min[j] < min_v) min_v = tmp_min[j];
+        if (tmp_max[j] > max_v) max_v = tmp_max[j];
+    }
+    for (; i < count; i++) {
+        if (values[i] < min_v) min_v = values[i];
+        if (values[i] > max_v) max_v = values[i];
+    }
+
+    *min_value = min_v;
+    *max_value = max_v;
+}
+
+void carquet_neon_copy_minmax_i32(const int32_t* values, int64_t count, int32_t* output,
+                                   int32_t* min_value, int32_t* max_value) {
+    int32_t min_v = values[0];
+    int32_t max_v = values[0];
+    int32x4_t min_vec = vdupq_n_s32(min_v);
+    int32x4_t max_vec = vdupq_n_s32(max_v);
+    int64_t i = 0;
+
+    for (; i + 4 <= count; i += 4) {
+        int32x4_t v = vld1q_s32(values + i);
+        vst1q_s32(output + i, v);
+        min_vec = vminq_s32(min_vec, v);
+        max_vec = vmaxq_s32(max_vec, v);
+    }
+
+    int32_t tmp_min[4];
+    int32_t tmp_max[4];
+    vst1q_s32(tmp_min, min_vec);
+    vst1q_s32(tmp_max, max_vec);
+    for (int j = 0; j < 4; j++) {
+        if (tmp_min[j] < min_v) min_v = tmp_min[j];
+        if (tmp_max[j] > max_v) max_v = tmp_max[j];
+    }
+    for (; i < count; i++) {
+        int32_t v = values[i];
+        output[i] = v;
+        if (v < min_v) min_v = v;
+        if (v > max_v) max_v = v;
+    }
+    *min_value = min_v;
+    *max_value = max_v;
+}
+
+void carquet_neon_copy_minmax_i64(const int64_t* values, int64_t count, int64_t* output,
+                                   int64_t* min_value, int64_t* max_value) {
+    int64_t min_v = values[0];
+    int64_t max_v = values[0];
+    int64x2_t min_vec = vdupq_n_s64(min_v);
+    int64x2_t max_vec = vdupq_n_s64(max_v);
+    int64_t i = 0;
+
+    for (; i + 2 <= count; i += 2) {
+        int64x2_t v = vld1q_s64(values + i);
+        vst1q_s64(output + i, v);
+        min_vec = carquet_neon_min_s64(min_vec, v);
+        max_vec = carquet_neon_max_s64(max_vec, v);
+    }
+
+    int64_t tmp_min[2];
+    int64_t tmp_max[2];
+    vst1q_s64(tmp_min, min_vec);
+    vst1q_s64(tmp_max, max_vec);
+    for (int j = 0; j < 2; j++) {
+        if (tmp_min[j] < min_v) min_v = tmp_min[j];
+        if (tmp_max[j] > max_v) max_v = tmp_max[j];
+    }
+    for (; i < count; i++) {
+        int64_t v = values[i];
+        output[i] = v;
+        if (v < min_v) min_v = v;
+        if (v > max_v) max_v = v;
+    }
+    *min_value = min_v;
+    *max_value = max_v;
+}
+
+void carquet_neon_copy_minmax_float(const float* values, int64_t count, float* output,
+                                     float* min_value, float* max_value) {
+    float min_v = values[0];
+    float max_v = values[0];
+    float32x4_t min_vec = vdupq_n_f32(min_v);
+    float32x4_t max_vec = vdupq_n_f32(max_v);
+    int64_t i = 0;
+
+    for (; i + 4 <= count; i += 4) {
+        float32x4_t v = vld1q_f32(values + i);
+        vst1q_f32(output + i, v);
+        min_vec = vminq_f32(min_vec, v);
+        max_vec = vmaxq_f32(max_vec, v);
+    }
+
+    float tmp_min[4];
+    float tmp_max[4];
+    vst1q_f32(tmp_min, min_vec);
+    vst1q_f32(tmp_max, max_vec);
+    for (int j = 0; j < 4; j++) {
+        if (tmp_min[j] < min_v) min_v = tmp_min[j];
+        if (tmp_max[j] > max_v) max_v = tmp_max[j];
+    }
+    for (; i < count; i++) {
+        float v = values[i];
+        output[i] = v;
+        if (v < min_v) min_v = v;
+        if (v > max_v) max_v = v;
+    }
+    *min_value = min_v;
+    *max_value = max_v;
+}
+
+void carquet_neon_copy_minmax_double(const double* values, int64_t count, double* output,
+                                      double* min_value, double* max_value) {
+    double min_v = values[0];
+    double max_v = values[0];
+    float64x2_t min_vec = vdupq_n_f64(min_v);
+    float64x2_t max_vec = vdupq_n_f64(max_v);
+    int64_t i = 0;
+
+    for (; i + 2 <= count; i += 2) {
+        float64x2_t v = vld1q_f64(values + i);
+        vst1q_f64(output + i, v);
+        min_vec = vminq_f64(min_vec, v);
+        max_vec = vmaxq_f64(max_vec, v);
+    }
+
+    double tmp_min[2];
+    double tmp_max[2];
+    vst1q_f64(tmp_min, min_vec);
+    vst1q_f64(tmp_max, max_vec);
+    for (int j = 0; j < 2; j++) {
+        if (tmp_min[j] < min_v) min_v = tmp_min[j];
+        if (tmp_max[j] > max_v) max_v = tmp_max[j];
+    }
+    for (; i < count; i++) {
+        double v = values[i];
+        output[i] = v;
+        if (v < min_v) min_v = v;
+        if (v > max_v) max_v = v;
+    }
+    *min_value = min_v;
+    *max_value = max_v;
 }
 
 #endif /* __ARM_NEON */

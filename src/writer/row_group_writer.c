@@ -56,6 +56,12 @@ extern void carquet_column_writer_enable_page_index(
     carquet_column_writer_internal_t* writer);
 extern void carquet_column_writer_set_file_offset(
     carquet_column_writer_internal_t* writer, int64_t offset);
+extern void carquet_column_writer_set_statistics(
+    carquet_column_writer_internal_t* writer, bool enabled);
+extern void carquet_column_writer_set_crc(
+    carquet_column_writer_internal_t* writer, bool enabled);
+extern void carquet_column_writer_reset(
+    carquet_column_writer_internal_t* writer);
 
 /* Bloom filter and page index accessors */
 typedef struct carquet_bloom_filter carquet_bloom_filter_t;
@@ -110,6 +116,8 @@ typedef struct carquet_row_group_writer {
     /* Optional features */
     bool write_bloom_filters;
     bool write_page_index;
+    bool write_statistics;
+    bool write_crc;
     int32_t compression_level;
 } carquet_row_group_writer_t;
 
@@ -121,6 +129,18 @@ typedef struct finalized_column_chunk {
     int64_t uncompressed_size;
     carquet_status_t status;
 } finalized_column_chunk_t;
+
+static carquet_encoding_t choose_column_encoding(
+    carquet_physical_type_t type,
+    carquet_compression_t compression) {
+
+    if (compression != CARQUET_COMPRESSION_UNCOMPRESSED &&
+        (type == CARQUET_PHYSICAL_FLOAT || type == CARQUET_PHYSICAL_DOUBLE)) {
+        return CARQUET_ENCODING_BYTE_STREAM_SPLIT;
+    }
+
+    return CARQUET_ENCODING_PLAIN;
+}
 
 static bool can_parallel_finalize(const carquet_row_group_writer_t* writer) {
 #ifdef _OPENMP
@@ -207,6 +227,23 @@ void carquet_row_group_writer_destroy(carquet_row_group_writer_t* writer) {
     }
 }
 
+void carquet_row_group_writer_reset(carquet_row_group_writer_t* writer, int64_t file_offset) {
+    if (!writer) return;
+
+    writer->num_rows = 0;
+    writer->total_byte_size = 0;
+    writer->file_offset = file_offset;
+    carquet_buffer_clear(&writer->row_group_buffer);
+
+    for (int i = 0; i < writer->num_columns; i++) {
+        carquet_column_writer_reset(writer->column_writers[i]);
+        writer->column_infos[i].file_offset = 0;
+        writer->column_infos[i].total_compressed_size = 0;
+        writer->column_infos[i].total_uncompressed_size = 0;
+        writer->column_infos[i].num_values = 0;
+    }
+}
+
 /* ============================================================================
  * Column Management
  * ============================================================================
@@ -245,9 +282,11 @@ carquet_status_t carquet_row_group_writer_add_column(
     writer->column_infos = new_infos;
 
     /* Create column writer */
+    carquet_encoding_t encoding = choose_column_encoding(type, writer->compression);
+
     carquet_column_writer_internal_t* col_writer = carquet_column_writer_create(
         type,
-        CARQUET_ENCODING_PLAIN,
+        encoding,
         writer->compression,
         max_def_level,
         max_rep_level,
@@ -266,13 +305,15 @@ carquet_status_t carquet_row_group_writer_add_column(
     if (writer->write_page_index) {
         carquet_column_writer_enable_page_index(col_writer);
     }
+    carquet_column_writer_set_statistics(col_writer, writer->write_statistics);
+    carquet_column_writer_set_crc(col_writer, writer->write_crc);
 
     writer->column_writers[writer->num_columns] = col_writer;
 
     /* Initialize column info */
     memset(&writer->column_infos[writer->num_columns], 0, sizeof(column_chunk_info_t));
     writer->column_infos[writer->num_columns].type = type;
-    writer->column_infos[writer->num_columns].encoding = CARQUET_ENCODING_PLAIN;
+    writer->column_infos[writer->num_columns].encoding = encoding;
     writer->column_infos[writer->num_columns].compression = writer->compression;
     writer->column_infos[writer->num_columns].type_length = type_length;
     writer->column_infos[writer->num_columns].path = strdup(name);
@@ -507,10 +548,14 @@ void carquet_row_group_writer_set_options(
     carquet_row_group_writer_t* writer,
     bool write_bloom_filters,
     bool write_page_index,
+    bool write_statistics,
+    bool write_crc,
     int32_t compression_level) {
     if (writer) {
         writer->write_bloom_filters = write_bloom_filters;
         writer->write_page_index = write_page_index;
+        writer->write_statistics = write_statistics;
+        writer->write_crc = write_crc;
         writer->compression_level = compression_level;
     }
 }

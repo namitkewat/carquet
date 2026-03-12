@@ -62,6 +62,16 @@ extern int carquet_gzip_decompress(
 extern int carquet_zstd_decompress(
     const uint8_t* src, size_t src_size,
     uint8_t* dst, size_t dst_capacity, size_t* dst_size);
+extern carquet_status_t carquet_byte_stream_split_decode_float(
+    const uint8_t* data,
+    size_t data_size,
+    float* values,
+    int64_t count);
+extern carquet_status_t carquet_byte_stream_split_decode_double(
+    const uint8_t* data,
+    size_t data_size,
+    double* values,
+    int64_t count);
 
 /* ============================================================================
  * Decompression
@@ -240,7 +250,7 @@ static carquet_status_t ensure_decoded_page_buffers(
         release_decoded_level_buffers(reader);
 
         if (values_buffer_size > 0) {
-            reader->decoded_values = malloc(values_buffer_size);
+            reader->decoded_values = calloc(1, values_buffer_size);
         }
         if (need_def_levels && num_values > 0) {
             reader->decoded_def_levels = malloc(sizeof(int16_t) * (size_t)num_values);
@@ -297,6 +307,10 @@ static carquet_status_t decode_levels_rle(
         data, data_size, bit_width, levels, num_values);
 
     if (decoded < 0) {
+        return CARQUET_ERROR_DECODE;
+    }
+
+    if (decoded != num_values) {
         return CARQUET_ERROR_DECODE;
     }
 
@@ -518,6 +532,22 @@ carquet_status_t carquet_read_data_page_v1(
                 if (bytes < 0) {
                     status = CARQUET_ERROR_DECODE;
                 }
+            }
+            break;
+
+        case CARQUET_ENCODING_BYTE_STREAM_SPLIT:
+            switch (reader->type) {
+                case CARQUET_PHYSICAL_FLOAT:
+                    status = carquet_byte_stream_split_decode_float(
+                        ptr, remaining, (float*)values, non_null_count);
+                    break;
+                case CARQUET_PHYSICAL_DOUBLE:
+                    status = carquet_byte_stream_split_decode_double(
+                        ptr, remaining, (double*)values, non_null_count);
+                    break;
+                default:
+                    status = CARQUET_ERROR_INVALID_ENCODING;
+                    break;
             }
             break;
 

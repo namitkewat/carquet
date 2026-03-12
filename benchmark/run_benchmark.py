@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
 """
-Carquet vs PyArrow benchmark orchestrator.
+Carquet benchmark orchestrator.
 
 Runs each configuration independently with cooldown pauses between them
 to avoid thermal throttling on fanless laptops (e.g. MacBook Air).
 
 Usage:
-    python3 benchmark/run_benchmark.py              # full benchmark
-    python3 benchmark/run_benchmark.py --quick       # large/none only
-    python3 benchmark/run_benchmark.py --cooldown 5  # 5s cooldown between configs
-    python3 benchmark/run_benchmark.py --no-pyarrow  # carquet only
+    python3 benchmark/run_benchmark.py                # full benchmark
+    python3 benchmark/run_benchmark.py --quick         # large/none only
+    python3 benchmark/run_benchmark.py --skip-xlarge   # skip 100M row configs
+    python3 benchmark/run_benchmark.py --skip-small --skip-medium  # large+ only
+    python3 benchmark/run_benchmark.py --cooldown 5    # 5s cooldown between configs
+    python3 benchmark/run_benchmark.py --no-pyarrow    # skip PyArrow
+    python3 benchmark/run_benchmark.py --no-arrow-cpp  # skip Arrow C++
 """
 
 import argparse
@@ -90,8 +93,8 @@ def get_system_info():
     }
 
 
-def get_carquet_version(binary):
-    """Get carquet version from the benchmark binary."""
+def get_benchmark_version(binary):
+    """Get version string from a benchmark binary."""
     try:
         out = subprocess.check_output(
             [binary, "--version"], stderr=subprocess.DEVNULL, text=True
@@ -115,16 +118,25 @@ CONFIGS = [
     ("xlarge", "none",   100_000_000),
     ("xlarge", "snappy", 100_000_000),
     ("xlarge", "zstd",   100_000_000),
+    ("xlarge", "lz4",    100_000_000),
     ("large",  "none",    10_000_000),
     ("large",  "snappy",  10_000_000),
     ("large",  "zstd",    10_000_000),
+    ("large",  "lz4",     10_000_000),
     ("medium", "none",     1_000_000),
     ("medium", "snappy",   1_000_000),
     ("medium", "zstd",     1_000_000),
+    ("medium", "lz4",      1_000_000),
     ("small",  "none",       100_000),
     ("small",  "snappy",     100_000),
     ("small",  "zstd",       100_000),
+    ("small",  "lz4",        100_000),
 ]
+DATASET_ORDER = ["xlarge", "large", "medium", "small"]
+COMPRESSION_ORDER = []
+for _dataset, _compression, _rows in CONFIGS:
+    if _compression not in COMPRESSION_ORDER:
+        COMPRESSION_ORDER.append(_compression)
 
 
 def get_benchmark_zstd_level():
@@ -152,37 +164,69 @@ def parse_csv_line(line):
     }
 
 
-def run_carquet_single(binary, dataset, compression):
-    """Run carquet benchmark for a single config."""
-    proc = subprocess.run(
-        [binary, dataset, compression],
-        capture_output=True, text=True, timeout=300
+def result_is_valid(result):
+    if not result:
+        return False
+    return (
+        result["rows"] > 0 and
+        result["write_ms"] > 0 and
+        result["read_ms"] > 0 and
+        result["file_bytes"] > 0
     )
+
+
+def stderr_tail(stderr):
+    if not stderr:
+        return None
+    lines = [line.strip() for line in stderr.splitlines() if line.strip()]
+    if not lines:
+        return None
+    return lines[-1]
+
+
+def run_benchmark_process(argv, timeout_seconds):
+    env = os.environ.copy()
+    try:
+        proc = subprocess.run(
+            argv,
+            capture_output=True, text=True, timeout=timeout_seconds, env=env
+        )
+    except subprocess.TimeoutExpired:
+        return None, f"timed out after {timeout_seconds}s"
+    parsed = None
     for line in proc.stdout.splitlines():
         r = parse_csv_line(line)
         if r:
-            return r
-    return None
+            parsed = r
+            break
+
+    if proc.returncode != 0:
+        return None, stderr_tail(proc.stderr) or f"exit code {proc.returncode}"
+    if not result_is_valid(parsed):
+        return None, stderr_tail(proc.stderr) or "benchmark returned invalid or zero timings"
+    return parsed, None
 
 
-def run_pyarrow_single(python, script, dataset, compression, rows):
+def run_carquet_single(binary, dataset, compression, timeout_seconds):
+    """Run carquet benchmark for a single config."""
+    return run_benchmark_process([binary, dataset, compression], timeout_seconds)
+
+
+def run_arrow_cpp_single(binary, dataset, compression, timeout_seconds):
+    """Run Arrow C++ benchmark for a single config."""
+    return run_benchmark_process([binary, dataset, compression], timeout_seconds)
+
+
+def run_pyarrow_single(python, script, dataset, compression, rows, timeout_seconds):
     """Run pyarrow benchmark for a single config by invoking a helper snippet."""
     code = f"""
 import sys, os
 sys.path.insert(0, os.path.dirname({script!r}))
 from benchmark_pyarrow import run_benchmark
-comp_map = {{"none": None, "snappy": "snappy", "zstd": "zstd"}}
+comp_map = {{"none": None, "snappy": "snappy", "zstd": "zstd", "lz4": "lz4"}}
 run_benchmark({dataset!r}, {rows}, comp_map[{compression!r}], {compression!r})
 """
-    proc = subprocess.run(
-        [python, "-c", code],
-        capture_output=True, text=True, timeout=300
-    )
-    for line in proc.stdout.splitlines():
-        r = parse_csv_line(line)
-        if r:
-            return r
-    return None
+    return run_benchmark_process([python, "-c", code], timeout_seconds)
 
 
 def cooldown(seconds):
@@ -234,87 +278,154 @@ def fmt_size(b):
     return f"{mb:>6.2f}MB"
 
 
-def print_final_table(results, has_pyarrow):
-    """Print the full comparison table."""
-    print()
-    print(f"  {BOLD}{'':15} {'Write':^24}{'':2}{'Read':^24}{'':2}{'Size':^16}{RST}")
+def have_results(results, library):
+    return any(lib == library for lib, _ in results.keys())
 
-    if has_pyarrow:
-        print(f"  {'':15} {'Carquet':>8} {'PyArrow':>8} {'ratio':>6}"
-              f"  {'Carquet':>8} {'PyArrow':>8} {'ratio':>6}"
-              f"  {'Carquet':>7} {'PyArrow':>7}")
-    else:
-        print(f"  {'':15} {'time':>8} {'M r/s':>8}"
-              f"  {'time':>8} {'M r/s':>8}"
-              f"  {'bytes':>8}")
+
+def print_library_table(results, library, label):
+    """Print a single-library summary table."""
+    print()
+    print(f"  {BOLD}{label}{RST}")
+    print(f"  {BOLD}{'':15} {'Write':^18}{'':2}{'Read':^18}{'':2}{'Size':^10}{RST}")
+    print(f"  {'':15} {'time':>8} {'M r/s':>8}"
+          f"  {'time':>8} {'M r/s':>8}"
+          f"  {'bytes':>8}")
     print(f"  {_bar()}")
 
-    # Group by dataset, print in display order (large → small)
-    for dataset in ["xlarge", "large", "medium", "small"]:
-        for compression in ["none", "snappy", "zstd"]:
+    for dataset_idx, dataset in enumerate(DATASET_ORDER):
+        printed_dataset = False
+        for compression in COMPRESSION_ORDER:
             key = (dataset, compression)
-            c = results.get(("carquet", key))
-            p = results.get(("pyarrow", key))
-            if not c and not p:
+            result = results.get((library, key))
+            if not result:
                 continue
 
+            printed_dataset = True
             label = f"{dataset}/{compression}"
-            rows = c["rows"] if c else p["rows"]
-            c_w = c["write_ms"] if c else None
-            c_r = c["read_ms"] if c else None
-            c_sz = c["file_bytes"] if c else None
-            p_w = p["write_ms"] if p else None
-            p_r = p["read_ms"] if p else None
-            p_sz = p["file_bytes"] if p else None
-
+            rows = result["rows"]
             line = f"  {BOLD}{label:<15}{RST}"
-
-            if has_pyarrow:
-                # Write
-                line += f" {fmt_ms(c_w)} {fmt_ms(p_w)} {fmt_speedup(c_w, p_w)}"
-                # Read
-                line += f"  {fmt_ms(c_r)} {fmt_ms(p_r)} {fmt_speedup(c_r, p_r)}"
-                # Size
-                line += f"  {fmt_size(c_sz) if c_sz else '':>7}"
-                line += f" {fmt_size(p_sz) if p_sz else '':>7}"
-            else:
-                def throughput(r, ms):
-                    if ms and ms > 0:
-                        return f"{(r/ms)*1000/1e6:>7.1f}M"
-                    return "      -"
-                line += f" {fmt_ms(c_w)} {throughput(rows, c_w)}"
-                line += f"  {fmt_ms(c_r)} {throughput(rows, c_r)}"
-                line += f"  {fmt_size(c_sz) if c_sz else '':>8}"
-
+            def throughput(r, ms):
+                if ms and ms > 0:
+                    return f"{(r/ms)*1000/1e6:>7.1f}M"
+                return "      -"
+            line += f" {fmt_ms(result['write_ms'])} {throughput(rows, result['write_ms'])}"
+            line += f"  {fmt_ms(result['read_ms'])} {throughput(rows, result['read_ms'])}"
+            line += f"  {fmt_size(result['file_bytes']):>8}"
             print(line)
-        if dataset != "small":
+        has_later = any(results.get((library, (later, comp)))
+                        for later in DATASET_ORDER[dataset_idx + 1:]
+                        for comp in COMPRESSION_ORDER)
+        if printed_dataset and has_later:
             print()
 
+def print_comparison_table(results, competitor, competitor_label):
+    """Print a Carquet-vs-competitor comparison table."""
+    print()
+    print(f"  {BOLD}Carquet vs {competitor_label}{RST}")
+    print(f"  {BOLD}{'':15} {'Write':^24}{'':2}{'Read':^24}{'':2}{'Size':^16}{RST}")
+    print(f"  {'':15} {'Carquet':>8} {competitor_label:>8} {'ratio':>6}"
+          f"  {'Carquet':>8} {competitor_label:>8} {'ratio':>6}"
+          f"  {'Carquet':>7} {competitor_label:>7}")
+    print(f"  {_bar()}")
+
+    for dataset_idx, dataset in enumerate(DATASET_ORDER):
+        printed_dataset = False
+        for compression in COMPRESSION_ORDER:
+            key = (dataset, compression)
+            carquet = results.get(("carquet", key))
+            other = results.get((competitor, key))
+            if not carquet and not other:
+                continue
+
+            printed_dataset = True
+            label = f"{dataset}/{compression}"
+            c_w = carquet["write_ms"] if carquet else None
+            c_r = carquet["read_ms"] if carquet else None
+            c_sz = carquet["file_bytes"] if carquet else None
+            o_w = other["write_ms"] if other else None
+            o_r = other["read_ms"] if other else None
+            o_sz = other["file_bytes"] if other else None
+
+            line = f"  {BOLD}{label:<15}{RST}"
+            line += f" {fmt_ms(c_w)} {fmt_ms(o_w)} {fmt_speedup(c_w, o_w)}"
+            line += f"  {fmt_ms(c_r)} {fmt_ms(o_r)} {fmt_speedup(c_r, o_r)}"
+            line += f"  {(fmt_size(c_sz) if c_sz else ''):>7}"
+            line += f" {(fmt_size(o_sz) if o_sz else ''):>7}"
+            print(line)
+        has_later = any(results.get(("carquet", (later, comp))) or
+                        results.get((competitor, (later, comp)))
+                        for later in DATASET_ORDER[dataset_idx + 1:]
+                        for comp in COMPRESSION_ORDER)
+        if printed_dataset and has_later:
+            print()
+
+    print()
+    print(f"  {DIM}ratio = {competitor_label} time / Carquet time (higher = Carquet faster){RST}")
+
+
+def print_final_tables(results):
+    """Print final summary tables for the libraries that ran."""
+    has_carquet = have_results(results, "carquet")
+    has_arrow_cpp = have_results(results, "arrow_cpp")
+    has_pyarrow = have_results(results, "pyarrow")
+
+    if has_carquet:
+        if has_arrow_cpp:
+            print_comparison_table(results, "arrow_cpp", "Arrow C++")
+        if has_pyarrow:
+            print_comparison_table(results, "pyarrow", "PyArrow")
+        if not has_arrow_cpp and not has_pyarrow:
+            print_library_table(results, "carquet", "Carquet")
+        return
+
+    if has_arrow_cpp:
+        print_library_table(results, "arrow_cpp", "Arrow C++")
     if has_pyarrow:
-        print()
-        print(f"  {DIM}ratio = PyArrow time / Carquet time (higher = Carquet faster){RST}")
+        print_library_table(results, "pyarrow", "PyArrow")
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Carquet vs PyArrow benchmark with thermal management"
+        description="Carquet benchmark runner with optional Arrow C++ and PyArrow comparisons"
     )
     parser.add_argument("--quick", action="store_true",
                         help="Run only large/none config")
+    parser.add_argument("--skip-xlarge", action="store_true",
+                        help="Skip xlarge (100M rows) configs")
+    parser.add_argument("--skip-large", action="store_true",
+                        help="Skip large (10M rows) configs")
+    parser.add_argument("--skip-medium", action="store_true",
+                        help="Skip medium (1M rows) configs")
+    parser.add_argument("--skip-small", action="store_true",
+                        help="Skip small (100K rows) configs")
     parser.add_argument("--cooldown", type=int, default=3,
                         help="Seconds between configs (default: 3)")
+    parser.add_argument("--timeout", type=int, default=300,
+                        help="Per-library subprocess timeout in seconds (default: 300)")
+    parser.add_argument("--temp-dir",
+                        help="Directory for temporary benchmark parquet files")
+    parser.add_argument("--no-arrow-cpp", action="store_true",
+                        help="Skip Arrow C++ benchmarks")
     parser.add_argument("--no-pyarrow", action="store_true",
                         help="Skip PyArrow benchmarks")
     parser.add_argument("--no-carquet", action="store_true",
                         help="Skip Carquet benchmarks")
     args = parser.parse_args()
 
+    if args.temp_dir:
+        temp_dir = os.path.abspath(args.temp_dir)
+        if not os.path.isdir(temp_dir):
+            print(f"{RED}Error:{RST} temp dir does not exist: {temp_dir}")
+            sys.exit(1)
+        os.environ["CARQUET_BENCH_TMPDIR"] = temp_dir
+
     # Locate binaries
     script_dir = os.path.dirname(os.path.abspath(__file__))
     build_dir = os.path.join(script_dir, "..", "build")
     carquet_bin = os.path.join(build_dir, "benchmark_carquet")
+    arrow_cpp_bin = os.path.join(build_dir, "benchmark_arrow_cpp")
 
     if not args.no_carquet and not os.path.isfile(carquet_bin):
         print(f"{RED}Error:{RST} {carquet_bin} not found. Build first:")
@@ -323,8 +434,15 @@ def main():
 
     # Collect metadata
     sys_info = get_system_info()
-    carquet_version = get_carquet_version(carquet_bin) if not args.no_carquet else "unknown"
+    carquet_version = get_benchmark_version(carquet_bin) if not args.no_carquet else "unknown"
     timestamp = datetime.date.today().isoformat()
+
+    has_arrow_cpp = not args.no_arrow_cpp and os.path.isfile(arrow_cpp_bin)
+    arrow_cpp_version = get_benchmark_version(arrow_cpp_bin) if has_arrow_cpp else None
+    if not args.no_arrow_cpp and not has_arrow_cpp:
+        print(f"{YLW}Warning:{RST} Arrow C++ benchmark not built, skipping")
+        print("         Build with -DCARQUET_BUILD_BENCHMARKS=ON "
+              "-DCARQUET_BUILD_ARROW_CPP_BENCHMARK=ON")
 
     # Find Python with pyarrow
     python = sys.executable
@@ -343,22 +461,66 @@ def main():
             print(f"{YLW}Warning:{RST} PyArrow not available, skipping")
             has_pyarrow = False
 
+    benchmark_runners = []
+    if not args.no_carquet:
+        benchmark_runners.append((
+            "carquet",
+            "Carquet",
+            lambda dataset, compression, rows: run_carquet_single(
+                carquet_bin, dataset, compression, args.timeout)
+        ))
+    if has_arrow_cpp:
+        benchmark_runners.append((
+            "arrow_cpp",
+            "Arrow C++",
+            lambda dataset, compression, rows: run_arrow_cpp_single(
+                arrow_cpp_bin, dataset, compression, args.timeout)
+        ))
+    if has_pyarrow:
+        benchmark_runners.append((
+            "pyarrow",
+            "PyArrow",
+            lambda dataset, compression, rows: run_pyarrow_single(
+                python, pyarrow_script, dataset, compression, rows, args.timeout)
+        ))
+
+    if not benchmark_runners:
+        print(f"{RED}Error:{RST} no benchmarks are available to run")
+        sys.exit(1)
+
     # Select configs
     configs = CONFIGS
     if args.quick:
         configs = [c for c in configs if c[0] == "xlarge" and c[1] == "none"]
+    else:
+        skip = set()
+        if args.skip_xlarge:
+            skip.add("xlarge")
+        if args.skip_large:
+            skip.add("large")
+        if args.skip_medium:
+            skip.add("medium")
+        if args.skip_small:
+            skip.add("small")
+        if skip:
+            configs = [c for c in configs if c[0] not in skip]
 
     # ── Header ──
     print()
     print(f"  {BOLD}Carquet {carquet_version} Benchmark{RST}")
     print(f"  {_bar()}")
     print_system_info(sys_info)
+    if has_arrow_cpp:
+        print(f"  {DIM}vs:{RST}   Arrow C++ {arrow_cpp_version}")
     if has_pyarrow:
         print(f"  {DIM}vs:{RST}   PyArrow {pyarrow_version}")
     zstd_level = get_benchmark_zstd_level()
     print(f"  {DIM}cfg:{RST}  {len(configs)} configs, {args.cooldown}s cooldown, "
           f"trimmed median, cache purged, 11-51 iters by size")
     print(f"  {DIM}zstd:{RST} level {zstd_level}")
+    print(f"  {DIM}timeout:{RST} {args.timeout}s per library/config")
+    if args.temp_dir:
+        print(f"  {DIM}tmp:{RST}  {os.environ['CARQUET_BENCH_TMPDIR']}")
     print(f"  {_bar()}")
     print()
 
@@ -370,6 +532,7 @@ def main():
     # ── Run benchmarks ──
     results = {}
     total = len(configs)
+    inter_library_cooldown = 0 if args.cooldown <= 0 else max(1, args.cooldown // 2)
 
     for i, (dataset, compression, rows) in enumerate(configs):
         key = (dataset, compression)
@@ -377,49 +540,38 @@ def main():
         label = f"{dataset}/{compression}"
         print(f"  {CYN}{tag}{RST} {BOLD}{label}{RST} {DIM}({rows:,} rows){RST}")
 
-        carquet_r = None
-        pyarrow_r = None
-
-        # Carquet
-        if not args.no_carquet:
+        config_results = {}
+        for runner_idx, (lib_key, lib_label, runner) in enumerate(benchmark_runners):
             t0 = time.time()
-            carquet_r = run_carquet_single(carquet_bin, dataset, compression)
+            result, error_detail = runner(dataset, compression, rows)
             elapsed = time.time() - t0
-            if carquet_r:
-                results[("carquet", key)] = carquet_r
-                mr = (rows / carquet_r["read_ms"]) * 1000 / 1e6
-                sz = fmt_size(carquet_r["file_bytes"])
-                print(f"       Carquet  W {fmt_ms(carquet_r['write_ms'])}  "
-                      f"R {fmt_ms(carquet_r['read_ms'])} "
+            if result:
+                results[(lib_key, key)] = result
+                config_results[lib_key] = result
+                mr = (rows / result["read_ms"]) * 1000 / 1e6
+                sz = fmt_size(result["file_bytes"])
+                print(f"       {lib_label:<9} W {fmt_ms(result['write_ms'])}  "
+                      f"R {fmt_ms(result['read_ms'])} "
                       f"{DIM}({mr:.0f}M r/s, {sz}, {elapsed:.0f}s){RST}")
             else:
-                print(f"       Carquet  {RED}failed{RST}")
+                print(f"       {lib_label:<9} {RED}failed{RST}")
+                if error_detail:
+                    print(f"       {DIM}{error_detail}{RST}")
 
-        # Cooldown between libraries
-        if not args.no_carquet and has_pyarrow:
-            cooldown(max(1, args.cooldown // 2))
+            if runner_idx < len(benchmark_runners) - 1:
+                cooldown(inter_library_cooldown)
 
-        # PyArrow
-        if has_pyarrow:
-            t0 = time.time()
-            pyarrow_r = run_pyarrow_single(python, pyarrow_script,
-                                           dataset, compression, rows)
-            elapsed = time.time() - t0
-            if pyarrow_r:
-                results[("pyarrow", key)] = pyarrow_r
-                mr = (rows / pyarrow_r["read_ms"]) * 1000 / 1e6
-                sz = fmt_size(pyarrow_r["file_bytes"])
-                print(f"       PyArrow  W {fmt_ms(pyarrow_r['write_ms'])}  "
-                      f"R {fmt_ms(pyarrow_r['read_ms'])} "
-                      f"{DIM}({mr:.0f}M r/s, {sz}, {elapsed:.0f}s){RST}")
-            else:
-                print(f"       PyArrow  {RED}failed{RST}")
-
-        # Speedup summary for this config
+        carquet_r = config_results.get("carquet")
+        arrow_cpp_r = config_results.get("arrow_cpp")
+        pyarrow_r = config_results.get("pyarrow")
+        if carquet_r and arrow_cpp_r:
+            ws = fmt_speedup(carquet_r["write_ms"], arrow_cpp_r["write_ms"])
+            rs = fmt_speedup(carquet_r["read_ms"], arrow_cpp_r["read_ms"])
+            print(f"       {DIM}vs Arrow C++  W {ws}  R {rs}{RST}")
         if carquet_r and pyarrow_r:
             ws = fmt_speedup(carquet_r["write_ms"], pyarrow_r["write_ms"])
             rs = fmt_speedup(carquet_r["read_ms"], pyarrow_r["read_ms"])
-            print(f"       {DIM}speedup  W {ws}  R {rs}{RST}")
+            print(f"       {DIM}vs PyArrow    W {ws}  R {rs}{RST}")
 
         # Cooldown between configs
         if i < total - 1:
@@ -430,7 +582,7 @@ def main():
     print(f"  {_bar('═')}")
     print(f"  {BOLD}Results{RST}")
     print(f"  {_bar('═')}")
-    print_final_table(results, has_pyarrow)
+    print_final_tables(results)
     print()
 
     # ── Save JSON report ──
@@ -444,9 +596,14 @@ def main():
             "statistic": "trimmed_median",
             "cache_purge": True,
             "cooldown_seconds": args.cooldown,
+            "subprocess_timeout_seconds": args.timeout,
         },
         "results": [],
     }
+    if args.temp_dir:
+        report["config"]["temp_dir"] = os.environ["CARQUET_BENCH_TMPDIR"]
+    if arrow_cpp_version:
+        report["arrow_cpp_version"] = arrow_cpp_version
     if pyarrow_version:
         report["pyarrow_version"] = pyarrow_version
 

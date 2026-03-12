@@ -104,6 +104,10 @@ static long get_file_size(const char* filename) {
 }
 
 static const char* get_temp_dir(void) {
+    const char* override = getenv("CARQUET_BENCH_TMPDIR");
+    if (override && override[0] != '\0') {
+        return override;
+    }
 #ifdef _WIN32
     static char temp_dir[512] = {0};
     if (temp_dir[0] == 0) {
@@ -228,19 +232,53 @@ static double benchmark_write(const char* filename, const test_data_t* td,
     carquet_writer_options_t opts;
     carquet_writer_options_init(&opts);
     opts.compression = codec;
+    int64_t rg_rows = td->num_rows > 1000000 ? td->num_rows / 10 : 100000;
     if (codec == CARQUET_COMPRESSION_ZSTD) {
         opts.compression_level = get_benchmark_zstd_level();
     }
-    /* Scale row group size: ~10 row groups per file for balanced metadata/data ratio */
-    opts.row_group_size = td->num_rows > 1000000 ? td->num_rows / 10 : 100000;
+    opts.row_group_size = rg_rows * (int64_t)(sizeof(int64_t) + sizeof(double) + sizeof(int32_t));
 
     double start = get_time_ms();
 
     carquet_writer_t* writer = carquet_writer_create(filename, schema, &opts, &err);
-    (void)carquet_writer_write_batch(writer, 0, td->ids, td->num_rows, NULL, NULL);
-    (void)carquet_writer_write_batch(writer, 1, td->values, td->num_rows, NULL, NULL);
-    (void)carquet_writer_write_batch(writer, 2, td->categories, td->num_rows, NULL, NULL);
-    (void)carquet_writer_close(writer);
+    if (!writer) {
+        fprintf(stderr, "carquet_writer_create failed for %s: %s\n",
+                filename, err.message[0] ? err.message : "unknown error");
+        carquet_schema_free(schema);
+        return 0.0;
+    }
+    for (int64_t offset = 0; offset < td->num_rows; offset += rg_rows) {
+        int64_t chunk = td->num_rows - offset;
+        if (chunk > rg_rows) {
+            chunk = rg_rows;
+        }
+
+        if (carquet_writer_write_batch(writer, 0, td->ids + offset, chunk, NULL, NULL) != CARQUET_OK ||
+            carquet_writer_write_batch(writer, 1, td->values + offset, chunk, NULL, NULL) != CARQUET_OK ||
+            carquet_writer_write_batch(writer, 2, td->categories + offset, chunk, NULL, NULL) != CARQUET_OK) {
+            fprintf(stderr, "carquet_writer_write_batch failed for %s: %s\n",
+                    filename, err.message[0] ? err.message : "unknown error");
+            (void)carquet_writer_close(writer);
+            carquet_schema_free(schema);
+            return 0.0;
+        }
+
+        if (offset + chunk < td->num_rows) {
+            if (carquet_writer_new_row_group(writer) != CARQUET_OK) {
+                fprintf(stderr, "carquet_writer_new_row_group failed for %s: %s\n",
+                        filename, err.message[0] ? err.message : "unknown error");
+                (void)carquet_writer_close(writer);
+                carquet_schema_free(schema);
+                return 0.0;
+            }
+        }
+    }
+    if (carquet_writer_close(writer) != CARQUET_OK) {
+        fprintf(stderr, "carquet_writer_close failed for %s: %s\n",
+                filename, err.message[0] ? err.message : "unknown error");
+        carquet_schema_free(schema);
+        return 0.0;
+    }
 
     double elapsed = get_time_ms() - start;
     carquet_schema_free(schema);
@@ -258,7 +296,11 @@ static double benchmark_read(const char* filename, int expected_rows) {
     opts.verify_checksums = false;
 
     carquet_reader_t* reader = carquet_reader_open(filename, &opts, &err);
-    if (!reader) return 0;
+    if (!reader) {
+        fprintf(stderr, "carquet_reader_open failed for %s: %s\n",
+                filename, err.message[0] ? err.message : "unknown error");
+        return 0.0;
+    }
 
     carquet_batch_reader_config_t config;
     carquet_batch_reader_config_init(&config);
@@ -398,7 +440,8 @@ int main(int argc, char* argv[]) {
     compression_config_t compressions[] = {
         {CARQUET_COMPRESSION_UNCOMPRESSED, "none"},
         {CARQUET_COMPRESSION_SNAPPY, "snappy"},
-        {CARQUET_COMPRESSION_ZSTD, "zstd"}
+        {CARQUET_COMPRESSION_ZSTD, "zstd"},
+        {CARQUET_COMPRESSION_LZ4_RAW, "lz4"}
     };
     int num_compressions = sizeof(compressions) / sizeof(compressions[0]);
 

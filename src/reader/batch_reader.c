@@ -290,6 +290,32 @@ static void read_projected_column(
 
     col_data->num_values = values_read;
 
+    /* The column reader returns dense non-null values (Parquet convention).
+     * The batch reader's contract is row-aligned: value[i] corresponds to
+     * logical row i, with null slots zeroed.  Expand in-place (back-to-front)
+     * so the data and null bitmap are consistent. */
+    if (def_levels && max_def > 0 && values_read > 0) {
+        int64_t non_null = 0;
+        for (int64_t k = 0; k < values_read; k++) {
+            if (def_levels[k] == max_def) non_null++;
+        }
+
+        if (non_null < values_read) {
+            uint8_t* data = (uint8_t*)col_data->data;
+            int64_t src = non_null - 1;
+            for (int64_t dst = values_read - 1; dst >= 0; dst--) {
+                uint8_t* dp = data + (size_t)dst * value_size;
+                if (def_levels[dst] == max_def) {
+                    uint8_t* sp = data + (size_t)src * value_size;
+                    if (sp != dp) memmove(dp, sp, value_size);
+                    src--;
+                } else {
+                    memset(dp, 0, value_size);
+                }
+            }
+        }
+    }
+
     /* Build null bitmap from definition levels (uses SIMD when available) */
     if (def_levels && col_data->null_bitmap) {
         carquet_dispatch_build_null_bitmap(def_levels, values_read,
@@ -641,7 +667,7 @@ carquet_status_t carquet_batch_reader_next(
      * are uncompressed, avoiding ~10-50us of barrier overhead per batch.
      */
     int32_t omp_i;  /* Declared outside for MSVC OpenMP compatibility */
-    #pragma omp parallel for num_threads(num_threads) schedule(static) if(needs_decompression && num_threads > 1)
+    #pragma omp parallel for num_threads(num_threads) schedule(dynamic, 1) if(needs_decompression && num_threads > 1)
     for (omp_i = 0; omp_i < batch_reader->num_projected; omp_i++) {
         carquet_column_reader_t* col_reader = batch_reader->col_readers[omp_i];
         if (col_reader && !col_reader->page_loaded && col_reader->values_remaining > 0) {
@@ -675,7 +701,7 @@ carquet_status_t carquet_batch_reader_next(
 #ifdef _OPENMP
     bool can_parallelize_columns = (num_threads > 1) && (batch_reader->num_projected > 1);
     if (can_parallelize_columns && !all_zero_copy_ready) {
-        #pragma omp parallel for num_threads(num_threads) schedule(static)
+        #pragma omp parallel for num_threads(num_threads) schedule(dynamic, 1)
         for (col_i = 0; col_i < batch_reader->num_projected; col_i++) {
             read_projected_column(batch_reader, new_batch, col_i, rows_to_read, &read_error);
         }

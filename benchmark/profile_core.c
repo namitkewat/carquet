@@ -78,7 +78,8 @@ static int benchmark_read_file(const char* filepath, int iterations) {
                 const void* data;
                 const uint8_t* null_bitmap;
                 int64_t num_values;
-                (void)carquet_row_batch_column(batch, col, &data, &null_bitmap, &num_values);
+                if (carquet_row_batch_column(batch, col, &data, &null_bitmap, &num_values) != CARQUET_OK)
+                    continue;
 
                 /* Touch data to prevent optimization */
                 if (data && num_values > 0) {
@@ -261,18 +262,21 @@ static carquet_schema_t* create_schema(void) {
     carquet_schema_t* schema = carquet_schema_create(&err);
     if (!schema) return NULL;
 
-    (void)carquet_schema_add_column(schema, "id", CARQUET_PHYSICAL_INT64,
-                                    NULL, CARQUET_REPETITION_REQUIRED, 0, 0);
-    (void)carquet_schema_add_column(schema, "value_i32", CARQUET_PHYSICAL_INT32,
-                                    NULL, CARQUET_REPETITION_REQUIRED, 0, 0);
-    (void)carquet_schema_add_column(schema, "value_f64", CARQUET_PHYSICAL_DOUBLE,
-                                    NULL, CARQUET_REPETITION_REQUIRED, 0, 0);
-    (void)carquet_schema_add_column(schema, "value_f32", CARQUET_PHYSICAL_FLOAT,
-                                    NULL, CARQUET_REPETITION_REQUIRED, 0, 0);
-    (void)carquet_schema_add_column(schema, "category", CARQUET_PHYSICAL_INT32,
-                                    NULL, CARQUET_REPETITION_REQUIRED, 0, 0);
-    (void)carquet_schema_add_column(schema, "nullable_val", CARQUET_PHYSICAL_DOUBLE,
-                                    NULL, CARQUET_REPETITION_OPTIONAL, 0, 0);
+    if (carquet_schema_add_column(schema, "id", CARQUET_PHYSICAL_INT64,
+                                  NULL, CARQUET_REPETITION_REQUIRED, 0, 0) != CARQUET_OK ||
+        carquet_schema_add_column(schema, "value_i32", CARQUET_PHYSICAL_INT32,
+                                  NULL, CARQUET_REPETITION_REQUIRED, 0, 0) != CARQUET_OK ||
+        carquet_schema_add_column(schema, "value_f64", CARQUET_PHYSICAL_DOUBLE,
+                                  NULL, CARQUET_REPETITION_REQUIRED, 0, 0) != CARQUET_OK ||
+        carquet_schema_add_column(schema, "value_f32", CARQUET_PHYSICAL_FLOAT,
+                                  NULL, CARQUET_REPETITION_REQUIRED, 0, 0) != CARQUET_OK ||
+        carquet_schema_add_column(schema, "category", CARQUET_PHYSICAL_INT32,
+                                  NULL, CARQUET_REPETITION_REQUIRED, 0, 0) != CARQUET_OK ||
+        carquet_schema_add_column(schema, "nullable_val", CARQUET_PHYSICAL_DOUBLE,
+                                  NULL, CARQUET_REPETITION_OPTIONAL, 0, 0) != CARQUET_OK) {
+        carquet_schema_free(schema);
+        return NULL;
+    }
 
     return schema;
 }
@@ -296,12 +300,16 @@ static int benchmark_write(carquet_compression_t compression) {
         return -1;
     }
 
-    (void)carquet_writer_write_batch(writer, 0, g_int64_data, g_num_rows, NULL, NULL);
-    (void)carquet_writer_write_batch(writer, 1, g_int32_data, g_num_rows, NULL, NULL);
-    (void)carquet_writer_write_batch(writer, 2, g_double_data, g_num_rows, NULL, NULL);
-    (void)carquet_writer_write_batch(writer, 3, g_float_data, g_num_rows, NULL, NULL);
-    (void)carquet_writer_write_batch(writer, 4, g_low_cardinality, g_num_rows, NULL, NULL);
-    (void)carquet_writer_write_batch(writer, 5, g_double_data, g_num_rows, g_def_levels, NULL);
+    if (carquet_writer_write_batch(writer, 0, g_int64_data, g_num_rows, NULL, NULL) != CARQUET_OK ||
+        carquet_writer_write_batch(writer, 1, g_int32_data, g_num_rows, NULL, NULL) != CARQUET_OK ||
+        carquet_writer_write_batch(writer, 2, g_double_data, g_num_rows, NULL, NULL) != CARQUET_OK ||
+        carquet_writer_write_batch(writer, 3, g_float_data, g_num_rows, NULL, NULL) != CARQUET_OK ||
+        carquet_writer_write_batch(writer, 4, g_low_cardinality, g_num_rows, NULL, NULL) != CARQUET_OK ||
+        carquet_writer_write_batch(writer, 5, g_double_data, g_num_rows, g_def_levels, NULL) != CARQUET_OK) {
+        if (carquet_writer_close(writer) != CARQUET_OK) { /* best-effort cleanup */ }
+        carquet_schema_free(schema);
+        return -1;
+    }
 
     carquet_status_t status = carquet_writer_close(writer);
     carquet_schema_free(schema);
@@ -335,7 +343,8 @@ static int benchmark_read(void) {
             const void* data;
             const uint8_t* null_bitmap;
             int64_t num_values;
-            (void)carquet_row_batch_column(batch, col, &data, &null_bitmap, &num_values);
+            if (carquet_row_batch_column(batch, col, &data, &null_bitmap, &num_values) != CARQUET_OK)
+                continue;
             if (data && num_values > 0) {
                 volatile uint8_t x = ((const uint8_t*)data)[0];
                 (void)x;
@@ -416,7 +425,10 @@ int main(int argc, char* argv[]) {
     printf("=== Carquet Core Profiling Benchmark ===\n");
 
     /* Initialize library */
-    (void)carquet_init();
+    if (carquet_init() != CARQUET_OK) {
+        fprintf(stderr, "Failed to initialize carquet\n");
+        return 1;
+    }
 
     /* Print CPU info */
     const carquet_cpu_info_t* cpu = carquet_get_cpu_info();
@@ -453,14 +465,18 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    int rc;
     if (read_only) {
         if (!data_dir) {
             fprintf(stderr, "Error: --read-only requires a data directory\n");
             print_usage(argv[0]);
             return 1;
         }
-        return run_read_only_benchmark(data_dir, iterations);
+        rc = run_read_only_benchmark(data_dir, iterations);
     } else {
-        return run_full_benchmark(iterations, num_rows);
+        rc = run_full_benchmark(iterations, num_rows);
     }
+
+    carquet_cleanup();
+    return rc;
 }

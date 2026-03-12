@@ -13,6 +13,8 @@
 #include "bitpack.h"
 #include <string.h>
 
+extern carquet_bitunpack8_fn carquet_dispatch_get_bitunpack8_fn(int bit_width);
+
 /* Read bytes as little-endian integers for bit unpacking */
 static inline uint16_t read_le16(const uint8_t* p) {
     return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
@@ -155,6 +157,12 @@ void carquet_bitunpack8_8bit(const uint8_t* input, uint32_t* values) {
 void carquet_bitunpack8_32(const uint8_t* input, int bit_width, uint32_t* values) {
     if (bit_width == 0) {
         memset(values, 0, 8 * sizeof(uint32_t));
+        return;
+    }
+
+    carquet_bitunpack8_fn simd_fn = carquet_dispatch_get_bitunpack8_fn(bit_width);
+    if (simd_fn != NULL) {
+        simd_fn(input, values);
         return;
     }
 
@@ -335,7 +343,8 @@ carquet_bitunpack8_fn carquet_get_bitunpack8_fn(int bit_width) {
     if (bit_width < 1 || bit_width > 8) {
         return NULL;
     }
-    return unpack_functions[bit_width];
+    carquet_bitunpack8_fn simd_fn = carquet_dispatch_get_bitunpack8_fn(bit_width);
+    return simd_fn != NULL ? simd_fn : unpack_functions[bit_width];
 }
 
 carquet_bitpack8_fn carquet_get_bitpack8_fn(int bit_width) {

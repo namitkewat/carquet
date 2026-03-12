@@ -13,6 +13,23 @@
 #include "core/endian.h"
 #include "core/bitpack.h"
 
+extern int64_t carquet_dispatch_find_run_length_i32(const int32_t* values, int64_t count);
+extern void carquet_dispatch_minmax_i32(const int32_t* values, int64_t count,
+                                         int32_t* min_value, int32_t* max_value);
+extern void carquet_dispatch_minmax_i64(const int64_t* values, int64_t count,
+                                         int64_t* min_value, int64_t* max_value);
+extern void carquet_dispatch_minmax_float(const float* values, int64_t count,
+                                           float* min_value, float* max_value);
+extern void carquet_dispatch_minmax_double(const double* values, int64_t count,
+                                            double* min_value, double* max_value);
+extern void carquet_dispatch_copy_minmax_i32(const int32_t* values, int64_t count, int32_t* output,
+                                             int32_t* min_value, int32_t* max_value);
+extern int64_t carquet_dispatch_count_non_nulls(const int16_t* def_levels, int64_t count,
+                                                int16_t max_def_level);
+extern void carquet_dispatch_build_null_bitmap(const int16_t* def_levels, int64_t count,
+                                               int16_t max_def_level, uint8_t* null_bitmap);
+extern void carquet_dispatch_fill_def_levels(int16_t* def_levels, int64_t count, int16_t value);
+
 #define TEST_PASS(name) printf("[PASS] %s\n", name)
 #define TEST_FAIL(name, msg) do { printf("[FAIL] %s: %s\n", name, msg); return 1; } while(0)
 
@@ -344,6 +361,115 @@ static int test_bitpack_roundtrip(void) {
     return 0;
 }
 
+static int test_bitpack_16bit(void) {
+    uint32_t original[8] = {
+        0x0001, 0x0102, 0x1234, 0x4567,
+        0x89AB, 0xBEEF, 0xCAFE, 0xFFFF
+    };
+    uint8_t packed[16];
+    uint32_t unpacked[8];
+
+    memset(packed, 0, sizeof(packed));
+    memset(unpacked, 0, sizeof(unpacked));
+
+    carquet_bitpack8_32(original, 16, packed);
+    carquet_bitunpack8_32(packed, 16, unpacked);
+
+    for (int i = 0; i < 8; i++) {
+        assert(unpacked[i] == (original[i] & 0xFFFFu));
+    }
+
+    TEST_PASS("bitpack_16bit");
+    return 0;
+}
+
+static int test_run_detection(void) {
+    int32_t all_same[32];
+    int32_t mismatch_early[16];
+    int32_t mismatch_late[33];
+
+    for (int i = 0; i < 32; i++) {
+        all_same[i] = 7;
+    }
+    for (int i = 0; i < 16; i++) {
+        mismatch_early[i] = 11;
+    }
+    for (int i = 0; i < 33; i++) {
+        mismatch_late[i] = -3;
+    }
+
+    mismatch_early[5] = 12;
+    mismatch_late[31] = 99;
+
+    assert(carquet_dispatch_find_run_length_i32(NULL, 0) == 0);
+    assert(carquet_dispatch_find_run_length_i32(all_same, 32) == 32);
+    assert(carquet_dispatch_find_run_length_i32(mismatch_early, 16) == 5);
+    assert(carquet_dispatch_find_run_length_i32(mismatch_late, 33) == 31);
+
+    TEST_PASS("run_detection");
+    return 0;
+}
+
+static int test_dispatch_minmax(void) {
+    int32_t i32v[] = {7, -2, 9, 4, -5, 6, 0, 3, 12};
+    int64_t i64v[] = {42, -100, 999, 8, -7, 77, 3};
+    float fv[] = {3.5f, -1.0f, 9.25f, 4.0f, -7.5f, 6.25f, 0.0f};
+    double dv[] = {8.0, -3.0, 15.5, 1.0, -9.0, 2.5, 14.0};
+    int32_t i32min, i32max;
+    int64_t i64min, i64max;
+    float fmin, fmax;
+    double dmin, dmax;
+
+    carquet_dispatch_minmax_i32(i32v, 9, &i32min, &i32max);
+    carquet_dispatch_minmax_i64(i64v, 7, &i64min, &i64max);
+    carquet_dispatch_minmax_float(fv, 7, &fmin, &fmax);
+    carquet_dispatch_minmax_double(dv, 7, &dmin, &dmax);
+
+    assert(i32min == -5 && i32max == 12);
+    assert(i64min == -100 && i64max == 999);
+    assert(fmin == -7.5f && fmax == 9.25f);
+    assert(dmin == -9.0 && dmax == 15.5);
+
+    TEST_PASS("dispatch_minmax");
+    return 0;
+}
+
+static int test_dispatch_copy_minmax(void) {
+    int32_t src[] = {4, -2, 9, 1, -7, 3, 11, 0};
+    int32_t dst[8] = {0};
+    int32_t min_v = 0;
+    int32_t max_v = 0;
+
+    carquet_dispatch_copy_minmax_i32(src, 8, dst, &min_v, &max_v);
+
+    assert(memcmp(src, dst, sizeof(src)) == 0);
+    assert(min_v == -7);
+    assert(max_v == 11);
+
+    TEST_PASS("dispatch_copy_minmax");
+    return 0;
+}
+
+static int test_dispatch_null_helpers(void) {
+    int16_t levels[] = {1, 0, 1, 1, 0, 0, 1, 0, 1, 1};
+    int16_t filled[10];
+    uint8_t bitmap[2] = {0, 0};
+
+    assert(carquet_dispatch_count_non_nulls(levels, 10, 1) == 6);
+
+    carquet_dispatch_build_null_bitmap(levels, 10, 1, bitmap);
+    assert(bitmap[0] == 0xB2);
+    assert(bitmap[1] == 0x00);
+
+    carquet_dispatch_fill_def_levels(filled, 10, 3);
+    for (int i = 0; i < 10; i++) {
+        assert(filled[i] == 3);
+    }
+
+    TEST_PASS("dispatch_null_helpers");
+    return 0;
+}
+
 static int test_bit_reader(void) {
     uint8_t data[] = {0xD2, 0xB4};  /* 0b11010010, 0b10110100, LSB first */
     carquet_bit_reader_t reader;
@@ -393,6 +519,11 @@ int main(void) {
     failures += test_bitpack_1bit();
     failures += test_bitpack_4bit();
     failures += test_bitpack_roundtrip();
+    failures += test_bitpack_16bit();
+    failures += test_run_detection();
+    failures += test_dispatch_minmax();
+    failures += test_dispatch_copy_minmax();
+    failures += test_dispatch_null_helpers();
     failures += test_bit_reader();
 
     printf("\n");

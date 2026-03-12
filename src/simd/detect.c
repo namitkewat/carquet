@@ -31,9 +31,20 @@
 static carquet_cpu_info_t g_cpu_info = {0};
 static int g_initialized = 0;
 
-/* External initialization functions for compression tables */
+/* External initialization/cleanup functions for compression */
 extern void carquet_gzip_init_tables(void);
 extern void carquet_zstd_init_tables(void);
+extern void carquet_zstd_cleanup(void);
+
+static void carquet_clear_initialized(void) {
+#if defined(__GNUC__) || defined(__clang__)
+    __atomic_store_n(&g_initialized, 0, __ATOMIC_RELEASE);
+#elif defined(_MSC_VER)
+    _InterlockedExchange((volatile long*)&g_initialized, 0);
+#else
+    g_initialized = 0;
+#endif
+}
 
 static int carquet_is_initialized(void) {
 #if defined(__GNUC__) || defined(__clang__)
@@ -180,6 +191,11 @@ carquet_status_t carquet_init(void) {
     carquet_set_initialized();
 
     return CARQUET_OK;
+}
+
+void carquet_cleanup(void) {
+    carquet_zstd_cleanup();
+    carquet_clear_initialized();
 }
 
 const carquet_cpu_info_t* carquet_get_cpu_info(void) {

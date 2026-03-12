@@ -15,12 +15,12 @@ static int test_version(void) {
     const char* ver = carquet_version();
     (void)ver;
     assert(ver != NULL);
-    assert(strcmp(ver, "0.2.0") == 0);
+    assert(strcmp(ver, "0.3.0") == 0);
 
     int major, minor, patch;
     carquet_version_components(&major, &minor, &patch);
     assert(major == 0);
-    assert(minor == 2);
+    assert(minor == 3);
     assert(patch == 0);
 
     TEST_PASS("version");
@@ -78,6 +78,7 @@ static int test_writer_options(void) {
     assert(opts.row_group_size == 128 * 1024 * 1024);
     assert(opts.page_size == 1024 * 1024);
     assert(opts.write_statistics == true);
+    assert(opts.write_crc == true);
     assert(opts.created_by != NULL);
 
     TEST_PASS("writer_options");

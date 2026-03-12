@@ -45,6 +45,9 @@ extern carquet_row_group_writer_t* carquet_row_group_writer_create(
     int64_t file_offset);
 
 extern void carquet_row_group_writer_destroy(carquet_row_group_writer_t* writer);
+extern void carquet_row_group_writer_reset(
+    carquet_row_group_writer_t* writer,
+    int64_t file_offset);
 
 extern carquet_status_t carquet_row_group_writer_add_column(
     carquet_row_group_writer_t* writer,
@@ -83,6 +86,8 @@ extern const column_chunk_info_t* carquet_row_group_writer_get_column_info(
 extern void carquet_row_group_writer_set_options(
     carquet_row_group_writer_t* writer,
     bool write_bloom_filters, bool write_page_index,
+    bool write_statistics,
+    bool write_crc,
     int32_t compression_level);
 
 /* Bloom filter and page index accessors */
@@ -124,9 +129,36 @@ typedef struct writer_column_def {
  * ============================================================================
  */
 
-typedef struct row_group_info {
-    parquet_row_group_t metadata;
+typedef struct row_group_column_info {
     int64_t file_offset;
+    int64_t total_compressed_size;
+    int64_t total_uncompressed_size;
+    int64_t num_values;
+    carquet_physical_type_t type;
+    carquet_compression_t codec;
+    int64_t data_page_offset;
+    bool has_bloom_filter_offset;
+    int64_t bloom_filter_offset;
+    bool has_bloom_filter_length;
+    int32_t bloom_filter_length;
+    bool has_column_index_offset;
+    int64_t column_index_offset;
+    bool has_column_index_length;
+    int32_t column_index_length;
+    bool has_offset_index_offset;
+    int64_t offset_index_offset;
+    bool has_offset_index_length;
+    int32_t offset_index_length;
+} row_group_column_info_t;
+
+typedef struct row_group_info {
+    int64_t file_offset;
+    int64_t num_rows;
+    int64_t total_byte_size;
+    int64_t total_compressed_size;
+    int16_t ordinal;
+    row_group_column_info_t* columns;
+    int32_t num_columns;
 } row_group_info_t;
 
 /* ============================================================================
@@ -147,6 +179,9 @@ struct carquet_writer {
     /* Full schema elements (including groups) for metadata serialization */
     parquet_schema_element_t* schema_elements;
     int32_t num_schema_elements;
+    char*** column_paths;
+    int32_t* column_path_lens;
+    carquet_encoding_t (*column_encodings)[2];
 
     /* Options */
     carquet_writer_options_t options;
@@ -183,6 +218,7 @@ void carquet_writer_options_init(carquet_writer_options_t* options) {
     options->row_group_size = 128 * 1024 * 1024;  /* 128 MB */
     options->page_size = 1024 * 1024;              /* 1 MB */
     options->write_statistics = true;
+    options->write_crc = true;
     options->write_page_index = false;
     options->write_bloom_filters = false;
     options->dictionary_encoding = CARQUET_ENCODING_PLAIN_DICTIONARY;
@@ -296,6 +332,59 @@ static carquet_status_t store_schema_elements(
     return CARQUET_OK;
 }
 
+static carquet_status_t build_column_metadata_cache(
+    carquet_writer_t* writer,
+    const carquet_schema_t* schema) {
+
+    writer->column_paths = calloc((size_t)schema->num_leaves, sizeof(char**));
+    writer->column_path_lens = calloc((size_t)schema->num_leaves, sizeof(int32_t));
+    writer->column_encodings = calloc((size_t)schema->num_leaves,
+        sizeof(*writer->column_encodings));
+
+    if (!writer->column_paths || !writer->column_path_lens || !writer->column_encodings) {
+        return CARQUET_ERROR_OUT_OF_MEMORY;
+    }
+
+    for (int32_t i = 0; i < schema->num_leaves; i++) {
+        int32_t elem_idx = schema->leaf_indices[i];
+        int32_t depth = 0;
+
+        for (int32_t cur = elem_idx; cur > 0; cur = schema->parent_indices[cur]) {
+            depth++;
+        }
+
+        if (depth <= 0) {
+            depth = 1;
+        }
+
+        writer->column_paths[i] = calloc((size_t)depth, sizeof(char*));
+        if (!writer->column_paths[i]) {
+            return CARQUET_ERROR_OUT_OF_MEMORY;
+        }
+
+        writer->column_path_lens[i] = depth;
+        if (depth == 1) {
+            writer->column_paths[i][0] = writer->schema_elements[elem_idx].name;
+        } else {
+            int32_t cur = elem_idx;
+            for (int32_t pi = depth - 1; pi >= 0; pi--) {
+                writer->column_paths[i][pi] = writer->schema_elements[cur].name;
+                cur = schema->parent_indices[cur];
+            }
+        }
+
+        writer->column_encodings[i][0] =
+            (writer->options.compression != CARQUET_COMPRESSION_UNCOMPRESSED &&
+             (schema->elements[elem_idx].type == CARQUET_PHYSICAL_FLOAT ||
+              schema->elements[elem_idx].type == CARQUET_PHYSICAL_DOUBLE))
+                ? CARQUET_ENCODING_BYTE_STREAM_SPLIT
+                : CARQUET_ENCODING_PLAIN;
+        writer->column_encodings[i][1] = CARQUET_ENCODING_RLE;
+    }
+
+    return CARQUET_OK;
+}
+
 static carquet_status_t ensure_row_group(carquet_writer_t* writer) {
     if (writer->current_row_group) {
         return CARQUET_OK;
@@ -322,6 +411,8 @@ static carquet_status_t ensure_row_group(carquet_writer_t* writer) {
         writer->current_row_group,
         writer->options.write_bloom_filters,
         writer->options.write_page_index,
+        writer->options.write_statistics,
+        writer->options.write_crc,
         writer->options.compression_level);
 
     /* Add all columns to the row group writer */
@@ -351,7 +442,7 @@ static carquet_status_t ensure_row_group(carquet_writer_t* writer) {
 }
 
 static carquet_status_t flush_row_group(carquet_writer_t* writer) {
-    if (!writer->current_row_group) {
+    if (!writer->current_row_group || writer->current_row_group_rows == 0) {
         return CARQUET_OK;
     }
 
@@ -382,61 +473,17 @@ static carquet_status_t flush_row_group(carquet_writer_t* writer) {
     memset(rg_info, 0, sizeof(*rg_info));
 
     rg_info->file_offset = writer->file_offset;
-    rg_info->metadata.num_rows = writer->current_row_group_rows;
-    rg_info->metadata.total_byte_size = carquet_row_group_writer_total_byte_size(writer->current_row_group);
-    rg_info->metadata.has_file_offset = true;
-    rg_info->metadata.file_offset = writer->file_offset;
-    rg_info->metadata.has_total_compressed_size = true;
-    rg_info->metadata.total_compressed_size = (int64_t)size;
-    rg_info->metadata.has_ordinal = true;
-    rg_info->metadata.ordinal = (int16_t)writer->num_row_groups;
+    rg_info->num_rows = writer->current_row_group_rows;
+    rg_info->total_byte_size = carquet_row_group_writer_total_byte_size(writer->current_row_group);
+    rg_info->total_compressed_size = (int64_t)size;
+    rg_info->ordinal = (int16_t)writer->num_row_groups;
 
     /* Build column chunks metadata */
     int num_cols = carquet_row_group_writer_num_columns(writer->current_row_group);
-    rg_info->metadata.num_columns = num_cols;
-    rg_info->metadata.columns = carquet_arena_calloc(&writer->arena, num_cols,
-        sizeof(parquet_column_chunk_t));
-
-    if (!rg_info->metadata.columns) {
+    rg_info->num_columns = num_cols;
+    rg_info->columns = calloc((size_t)num_cols, sizeof(*rg_info->columns));
+    if (!rg_info->columns) {
         return CARQUET_ERROR_OUT_OF_MEMORY;
-    }
-
-    /* Build parent map once for all columns (heap-allocated for large schemas) */
-    int32_t* parent_map = malloc(writer->num_schema_elements * sizeof(int32_t));
-    if (!parent_map) {
-        return CARQUET_ERROR_OUT_OF_MEMORY;
-    }
-    memset(parent_map, -1, writer->num_schema_elements * sizeof(int32_t));
-    {
-        /* DFS traversal using a stack of (element_idx, remaining_children) */
-        int32_t* stack_idx = malloc(writer->num_schema_elements * sizeof(int32_t));
-        int32_t* stack_rem = malloc(writer->num_schema_elements * sizeof(int32_t));
-        if (!stack_idx || !stack_rem) {
-            free(parent_map);
-            free(stack_idx);
-            free(stack_rem);
-            return CARQUET_ERROR_OUT_OF_MEMORY;
-        }
-        int32_t sp = 0;
-        stack_idx[0] = 0;
-        stack_rem[0] = writer->schema_elements[0].num_children;
-
-        for (int32_t idx = 1; idx < writer->num_schema_elements; idx++) {
-            parent_map[idx] = stack_idx[sp];
-            stack_rem[sp]--;
-
-            while (sp >= 0 && stack_rem[sp] == 0) {
-                sp--;
-            }
-
-            if (writer->schema_elements[idx].num_children > 0) {
-                sp++;
-                stack_idx[sp] = idx;
-                stack_rem[sp] = writer->schema_elements[idx].num_children;
-            }
-        }
-        free(stack_idx);
-        free(stack_rem);
     }
 
     for (int i = 0; i < num_cols; i++) {
@@ -445,75 +492,15 @@ static carquet_status_t flush_row_group(carquet_writer_t* writer) {
 
         if (!col_info) continue;
 
-        parquet_column_chunk_t* chunk = &rg_info->metadata.columns[i];
+        row_group_column_info_t* chunk = &rg_info->columns[i];
         chunk->file_offset = col_info->file_offset;
-        chunk->has_metadata = true;
-
-        parquet_column_metadata_t* meta = &chunk->metadata;
-        meta->type = col_info->type;
-        meta->codec = col_info->compression;
-        meta->num_values = col_info->num_values;
-        meta->total_compressed_size = col_info->total_compressed_size;
-        meta->total_uncompressed_size = col_info->total_uncompressed_size;
-        meta->data_page_offset = col_info->file_offset;
-
-        /* Encodings used */
-        meta->num_encodings = 2;  /* PLAIN + RLE for levels */
-        meta->encodings = carquet_arena_calloc(&writer->arena, 2, sizeof(carquet_encoding_t));
-        if (meta->encodings) {
-            meta->encodings[0] = CARQUET_ENCODING_PLAIN;
-            meta->encodings[1] = CARQUET_ENCODING_RLE;
-        }
-
-        /* Path in schema - build full hierarchical path for nested columns */
-        {
-            const char* path_components[64];
-            int32_t path_depth = 0;
-
-            /* Find the leaf element index in the stored schema */
-            int32_t leaf_elem_idx = -1;
-            int32_t leaf_count = 0;
-            for (int32_t si = 0; si < writer->num_schema_elements; si++) {
-                if (writer->schema_elements[si].num_children == 0) {
-                    if (leaf_count == i) {
-                        leaf_elem_idx = si;
-                        break;
-                    }
-                    leaf_count++;
-                }
-            }
-
-            if (leaf_elem_idx >= 0) {
-                /* Walk up from leaf to root */
-                int32_t cur = leaf_elem_idx;
-                while (cur > 0 && path_depth < 64) {
-                    path_components[path_depth++] = writer->schema_elements[cur].name;
-                    cur = parent_map[cur];
-                }
-            }
-
-            if (path_depth > 0) {
-                meta->path_len = path_depth;
-                meta->path_in_schema = carquet_arena_calloc(&writer->arena, path_depth, sizeof(char*));
-                if (meta->path_in_schema) {
-                    /* Reverse to root-first order */
-                    for (int32_t pi = 0; pi < path_depth; pi++) {
-                        meta->path_in_schema[pi] = carquet_arena_strdup(
-                            &writer->arena, path_components[path_depth - 1 - pi]);
-                    }
-                }
-            } else {
-                /* Fallback: just use column name */
-                meta->path_len = 1;
-                meta->path_in_schema = carquet_arena_calloc(&writer->arena, 1, sizeof(char*));
-                if (meta->path_in_schema && col_info->path) {
-                    meta->path_in_schema[0] = carquet_arena_strdup(&writer->arena, col_info->path);
-                }
-            }
-        }
+        chunk->type = col_info->type;
+        chunk->codec = col_info->compression;
+        chunk->num_values = col_info->num_values;
+        chunk->total_compressed_size = col_info->total_compressed_size;
+        chunk->total_uncompressed_size = col_info->total_uncompressed_size;
+        chunk->data_page_offset = col_info->file_offset;
     }
-
-    free(parent_map);
 
     writer->num_row_groups++;
     writer->file_offset += (int64_t)size;
@@ -569,11 +556,11 @@ static carquet_status_t flush_row_group(carquet_writer_t* writer) {
             }
 
             /* Record offset in column metadata */
-            parquet_column_chunk_t* chunk = &rg_info->metadata.columns[i];
-            chunk->metadata.has_bloom_filter_offset = true;
-            chunk->metadata.bloom_filter_offset = writer->file_offset;
-            chunk->metadata.has_bloom_filter_length = true;
-            chunk->metadata.bloom_filter_length = (int32_t)(bf_header.size + bf_size);
+            row_group_column_info_t* chunk = &rg_info->columns[i];
+            chunk->has_bloom_filter_offset = true;
+            chunk->bloom_filter_offset = writer->file_offset;
+            chunk->has_bloom_filter_length = true;
+            chunk->bloom_filter_length = (int32_t)(bf_header.size + bf_size);
 
             /* Write header + data */
             if (fwrite(bf_header.data, 1, bf_header.size, writer->file) != bf_header.size) {
@@ -593,7 +580,7 @@ static carquet_status_t flush_row_group(carquet_writer_t* writer) {
     /* Write column indexes and offset indexes (after bloom filters) */
     if (writer->options.write_page_index) {
         for (int i = 0; i < num_cols; i++) {
-            parquet_column_chunk_t* chunk = &rg_info->metadata.columns[i];
+            row_group_column_info_t* chunk = &rg_info->columns[i];
 
             /* Column index */
             carquet_column_index_builder_t* ci = carquet_row_group_writer_get_column_index(
@@ -639,9 +626,8 @@ static carquet_status_t flush_row_group(carquet_writer_t* writer) {
         }
     }
 
-    /* Cleanup current row group */
-    carquet_row_group_writer_destroy(writer->current_row_group);
-    writer->current_row_group = NULL;
+    /* Reuse the current row group writer for the next group. */
+    carquet_row_group_writer_reset(writer->current_row_group, writer->file_offset);
     writer->current_row_group_rows = 0;
 
     return CARQUET_OK;
@@ -686,7 +672,57 @@ static carquet_status_t build_file_metadata(
     }
 
     for (int32_t i = 0; i < writer->num_row_groups; i++) {
-        metadata->row_groups[i] = writer->row_groups[i].metadata;
+        const row_group_info_t* src_rg = &writer->row_groups[i];
+        parquet_row_group_t* dst_rg = &metadata->row_groups[i];
+
+        dst_rg->num_rows = src_rg->num_rows;
+        dst_rg->total_byte_size = src_rg->total_byte_size;
+        dst_rg->has_file_offset = true;
+        dst_rg->file_offset = src_rg->file_offset;
+        dst_rg->has_total_compressed_size = true;
+        dst_rg->total_compressed_size = src_rg->total_compressed_size;
+        dst_rg->has_ordinal = true;
+        dst_rg->ordinal = src_rg->ordinal;
+        dst_rg->num_columns = src_rg->num_columns;
+        dst_rg->columns = carquet_arena_calloc(&writer->arena, src_rg->num_columns,
+            sizeof(parquet_column_chunk_t));
+        if (!dst_rg->columns && src_rg->num_columns > 0) {
+            return CARQUET_ERROR_OUT_OF_MEMORY;
+        }
+
+        for (int32_t j = 0; j < src_rg->num_columns; j++) {
+            const row_group_column_info_t* src_col = &src_rg->columns[j];
+            parquet_column_chunk_t* dst_chunk = &dst_rg->columns[j];
+            parquet_column_metadata_t* meta = &dst_chunk->metadata;
+
+            dst_chunk->file_offset = src_col->file_offset;
+            dst_chunk->has_metadata = true;
+
+            meta->type = src_col->type;
+            meta->codec = src_col->codec;
+            meta->num_values = src_col->num_values;
+            meta->total_compressed_size = src_col->total_compressed_size;
+            meta->total_uncompressed_size = src_col->total_uncompressed_size;
+            meta->data_page_offset = src_col->data_page_offset;
+            meta->num_encodings = 2;
+            meta->encodings = writer->column_encodings[j];
+            meta->path_len = writer->column_path_lens[j];
+            meta->path_in_schema = writer->column_paths[j];
+
+            meta->has_bloom_filter_offset = src_col->has_bloom_filter_offset;
+            meta->bloom_filter_offset = src_col->bloom_filter_offset;
+            meta->has_bloom_filter_length = src_col->has_bloom_filter_length;
+            meta->bloom_filter_length = src_col->bloom_filter_length;
+
+            dst_chunk->has_column_index_offset = src_col->has_column_index_offset;
+            dst_chunk->column_index_offset = src_col->column_index_offset;
+            dst_chunk->has_column_index_length = src_col->has_column_index_length;
+            dst_chunk->column_index_length = src_col->column_index_length;
+            dst_chunk->has_offset_index_offset = src_col->has_offset_index_offset;
+            dst_chunk->offset_index_offset = src_col->offset_index_offset;
+            dst_chunk->has_offset_index_length = src_col->has_offset_index_length;
+            dst_chunk->offset_index_length = src_col->offset_index_length;
+        }
     }
 
     return CARQUET_OK;
@@ -748,6 +784,13 @@ carquet_writer_t* carquet_writer_create(
         if (status != CARQUET_OK) {
             carquet_writer_abort(writer);
             CARQUET_SET_ERROR(error, status, "Failed to store schema elements");
+            return NULL;
+        }
+
+        status = build_column_metadata_cache(writer, schema);
+        if (status != CARQUET_OK) {
+            carquet_writer_abort(writer);
+            CARQUET_SET_ERROR(error, status, "Failed to build writer metadata cache");
             return NULL;
         }
     }
@@ -815,6 +858,13 @@ carquet_writer_t* carquet_writer_create_file(
         if (status != CARQUET_OK) {
             carquet_writer_abort(writer);
             CARQUET_SET_ERROR(error, status, "Failed to store schema elements");
+            return NULL;
+        }
+
+        status = build_column_metadata_cache(writer, schema);
+        if (status != CARQUET_OK) {
+            carquet_writer_abort(writer);
+            CARQUET_SET_ERROR(error, status, "Failed to build writer metadata cache");
             return NULL;
         }
     }
@@ -979,9 +1029,6 @@ carquet_status_t carquet_writer_close(carquet_writer_t* writer) {
         goto cleanup;
     }
 
-    /* Flush and close */
-    fflush(writer->file);
-
 cleanup:
     /* Free resources */
     if (writer->current_row_group) {
@@ -1009,8 +1056,21 @@ cleanup:
         }
         free(writer->schema_elements);
     }
+    if (writer->column_paths) {
+        for (int32_t i = 0; i < writer->num_columns; i++) {
+            free(writer->column_paths[i]);
+        }
+        free(writer->column_paths);
+    }
+    free(writer->column_path_lens);
+    free(writer->column_encodings);
 
     free(writer->column_values_written);
+    if (writer->row_groups) {
+        for (int32_t i = 0; i < writer->num_row_groups; i++) {
+            free(writer->row_groups[i].columns);
+        }
+    }
     free(writer->row_groups);
     free(writer->path);
     carquet_arena_destroy(&writer->arena);
@@ -1053,8 +1113,21 @@ void carquet_writer_abort(carquet_writer_t* writer) {
         }
         free(writer->schema_elements);
     }
+    if (writer->column_paths) {
+        for (int32_t i = 0; i < writer->num_columns; i++) {
+            free(writer->column_paths[i]);
+        }
+        free(writer->column_paths);
+    }
+    free(writer->column_path_lens);
+    free(writer->column_encodings);
 
     free(writer->column_values_written);
+    if (writer->row_groups) {
+        for (int32_t i = 0; i < writer->num_row_groups; i++) {
+            free(writer->row_groups[i].columns);
+        }
+    }
     free(writer->row_groups);
     free(writer->path);
     carquet_arena_destroy(&writer->arena);

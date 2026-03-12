@@ -369,6 +369,44 @@ void carquet_sve_gather_double(const double* dict, const uint32_t* indices,
     }
 }
 
+bool carquet_sve_checked_gather_i32(const int32_t* dict, int32_t dict_count,
+                                     const uint32_t* indices, int64_t count,
+                                     int32_t* output) {
+    for (int64_t i = 0; i < count; i++) {
+        if (indices[i] >= (uint32_t)dict_count) {
+            return false;
+        }
+    }
+    carquet_sve_gather_i32(dict, indices, count, output);
+    return true;
+}
+
+bool carquet_sve_checked_gather_i64(const int64_t* dict, int32_t dict_count,
+                                     const uint32_t* indices, int64_t count,
+                                     int64_t* output) {
+    for (int64_t i = 0; i < count; i++) {
+        if (indices[i] >= (uint32_t)dict_count) {
+            return false;
+        }
+    }
+    carquet_sve_gather_i64(dict, indices, count, output);
+    return true;
+}
+
+bool carquet_sve_checked_gather_float(const float* dict, int32_t dict_count,
+                                       const uint32_t* indices, int64_t count,
+                                       float* output) {
+    return carquet_sve_checked_gather_i32(
+        (const int32_t*)dict, dict_count, indices, count, (int32_t*)output);
+}
+
+bool carquet_sve_checked_gather_double(const double* dict, int32_t dict_count,
+                                        const uint32_t* indices, int64_t count,
+                                        double* output) {
+    return carquet_sve_checked_gather_i64(
+        (const int64_t*)dict, dict_count, indices, count, (int64_t*)output);
+}
+
 /* ============================================================================
  * Memcpy/Memset - SVE Optimized
  * ============================================================================
@@ -453,6 +491,228 @@ void carquet_sve_pack_bools(const uint8_t* input, uint8_t* output, int64_t count
         output[i / 8] = byte;
         i += 8;
     }
+}
+
+int64_t carquet_sve_count_non_nulls(const int16_t* def_levels, int64_t count, int16_t max_def_level) {
+    int64_t non_null_count = 0;
+    int64_t i = 0;
+
+    while (i < count) {
+        svbool_t pg = svwhilelt_b16(i, count);
+        svint16_t levels = svld1_s16(pg, def_levels + i);
+        svbool_t matches = svcmpeq_n_s16(pg, levels, max_def_level);
+        non_null_count += (int64_t)svcntp_b16(pg, matches);
+        i += svcnth();
+    }
+
+    return non_null_count;
+}
+
+void carquet_sve_build_null_bitmap(const int16_t* def_levels, int64_t count,
+                                    int16_t max_def_level, uint8_t* null_bitmap) {
+    int64_t i = 0;
+    int64_t byte_index = 0;
+
+    while (i < count) {
+        uint8_t bits = 0;
+        for (int j = 0; j < 8 && i < count; j++, i++) {
+            if (def_levels[i] < max_def_level) {
+                bits |= (uint8_t)(1u << j);
+            }
+        }
+        null_bitmap[byte_index++] = bits;
+    }
+}
+
+void carquet_sve_fill_def_levels(int16_t* def_levels, int64_t count, int16_t value) {
+    int64_t i = 0;
+    svint16_t val = svdup_n_s16(value);
+
+    while (i < count) {
+        svbool_t pg = svwhilelt_b16(i, count);
+        svst1_s16(pg, def_levels + i, val);
+        i += svcnth();
+    }
+}
+
+void carquet_sve_minmax_i32(const int32_t* values, int64_t count,
+                             int32_t* min_value, int32_t* max_value) {
+    int32_t min_v = values[0];
+    int32_t max_v = values[0];
+    int64_t i = 1;
+
+    while (i < count) {
+        svbool_t pg = svwhilelt_b32(i, count);
+        svint32_t v = svld1_s32(pg, values + i);
+        int32_t chunk_min = svminv_s32(pg, v);
+        int32_t chunk_max = svmaxv_s32(pg, v);
+        if (chunk_min < min_v) min_v = chunk_min;
+        if (chunk_max > max_v) max_v = chunk_max;
+        i += svcntw();
+    }
+
+    *min_value = min_v;
+    *max_value = max_v;
+}
+
+void carquet_sve_minmax_i64(const int64_t* values, int64_t count,
+                             int64_t* min_value, int64_t* max_value) {
+    int64_t min_v = values[0];
+    int64_t max_v = values[0];
+    int64_t i = 1;
+
+    while (i < count) {
+        svbool_t pg = svwhilelt_b64(i, count);
+        svint64_t v = svld1_s64(pg, values + i);
+        int64_t chunk_min = svminv_s64(pg, v);
+        int64_t chunk_max = svmaxv_s64(pg, v);
+        if (chunk_min < min_v) min_v = chunk_min;
+        if (chunk_max > max_v) max_v = chunk_max;
+        i += svcntd();
+    }
+
+    *min_value = min_v;
+    *max_value = max_v;
+}
+
+void carquet_sve_minmax_float(const float* values, int64_t count,
+                               float* min_value, float* max_value) {
+    float min_v = values[0];
+    float max_v = values[0];
+    int64_t i = 1;
+
+    while (i < count) {
+        svbool_t pg = svwhilelt_b32(i, count);
+        svfloat32_t v = svld1_f32(pg, values + i);
+        float chunk_min = svminv_f32(pg, v);
+        float chunk_max = svmaxv_f32(pg, v);
+        if (chunk_min < min_v) min_v = chunk_min;
+        if (chunk_max > max_v) max_v = chunk_max;
+        i += svcntw();
+    }
+
+    *min_value = min_v;
+    *max_value = max_v;
+}
+
+void carquet_sve_minmax_double(const double* values, int64_t count,
+                                double* min_value, double* max_value) {
+    double min_v = values[0];
+    double max_v = values[0];
+    int64_t i = 1;
+
+    while (i < count) {
+        svbool_t pg = svwhilelt_b64(i, count);
+        svfloat64_t v = svld1_f64(pg, values + i);
+        double chunk_min = svminv_f64(pg, v);
+        double chunk_max = svmaxv_f64(pg, v);
+        if (chunk_min < min_v) min_v = chunk_min;
+        if (chunk_max > max_v) max_v = chunk_max;
+        i += svcntd();
+    }
+
+    *min_value = min_v;
+    *max_value = max_v;
+}
+
+void carquet_sve_copy_minmax_i32(const int32_t* values, int64_t count, int32_t* output,
+                                  int32_t* min_value, int32_t* max_value) {
+    int32_t min_v = values[0];
+    int32_t max_v = values[0];
+    int64_t i = 0;
+
+    while (i < count) {
+        svbool_t pg = svwhilelt_b32(i, count);
+        svint32_t v = svld1_s32(pg, values + i);
+        svst1_s32(pg, output + i, v);
+        int32_t chunk_min = svminv_s32(pg, v);
+        int32_t chunk_max = svmaxv_s32(pg, v);
+        if (chunk_min < min_v) min_v = chunk_min;
+        if (chunk_max > max_v) max_v = chunk_max;
+        i += svcntw();
+    }
+
+    *min_value = min_v;
+    *max_value = max_v;
+}
+
+void carquet_sve_copy_minmax_i64(const int64_t* values, int64_t count, int64_t* output,
+                                  int64_t* min_value, int64_t* max_value) {
+    int64_t min_v = values[0];
+    int64_t max_v = values[0];
+    int64_t i = 0;
+
+    while (i < count) {
+        svbool_t pg = svwhilelt_b64(i, count);
+        svint64_t v = svld1_s64(pg, values + i);
+        svst1_s64(pg, output + i, v);
+        int64_t chunk_min = svminv_s64(pg, v);
+        int64_t chunk_max = svmaxv_s64(pg, v);
+        if (chunk_min < min_v) min_v = chunk_min;
+        if (chunk_max > max_v) max_v = chunk_max;
+        i += svcntd();
+    }
+
+    *min_value = min_v;
+    *max_value = max_v;
+}
+
+void carquet_sve_copy_minmax_float(const float* values, int64_t count, float* output,
+                                    float* min_value, float* max_value) {
+    float min_v = values[0];
+    float max_v = values[0];
+    int64_t i = 0;
+
+    while (i < count) {
+        svbool_t pg = svwhilelt_b32(i, count);
+        svfloat32_t v = svld1_f32(pg, values + i);
+        svst1_f32(pg, output + i, v);
+        float chunk_min = svminv_f32(pg, v);
+        float chunk_max = svmaxv_f32(pg, v);
+        if (chunk_min < min_v) min_v = chunk_min;
+        if (chunk_max > max_v) max_v = chunk_max;
+        i += svcntw();
+    }
+
+    *min_value = min_v;
+    *max_value = max_v;
+}
+
+void carquet_sve_copy_minmax_double(const double* values, int64_t count, double* output,
+                                     double* min_value, double* max_value) {
+    double min_v = values[0];
+    double max_v = values[0];
+    int64_t i = 0;
+
+    while (i < count) {
+        svbool_t pg = svwhilelt_b64(i, count);
+        svfloat64_t v = svld1_f64(pg, values + i);
+        svst1_f64(pg, output + i, v);
+        double chunk_min = svminv_f64(pg, v);
+        double chunk_max = svmaxv_f64(pg, v);
+        if (chunk_min < min_v) min_v = chunk_min;
+        if (chunk_max > max_v) max_v = chunk_max;
+        i += svcntd();
+    }
+
+    *min_value = min_v;
+    *max_value = max_v;
+}
+
+void carquet_sve_bitunpack8_4bit(const uint8_t* input, uint32_t* values) {
+    uint32_t v = (uint32_t)input[0] | ((uint32_t)input[1] << 8) |
+                 ((uint32_t)input[2] << 16) | ((uint32_t)input[3] << 24);
+    for (int i = 0; i < 8; i++) {
+        values[i] = (v >> (i * 4)) & 0xF;
+    }
+}
+
+void carquet_sve_bitunpack8_8bit(const uint8_t* input, uint32_t* values) {
+    carquet_sve_bitunpack_8to32(input, values, 8);
+}
+
+void carquet_sve_bitunpack8_16bit(const uint8_t* input, uint32_t* values) {
+    carquet_sve_bitunpack_16to32((const uint16_t*)input, values, 8);
 }
 
 /* ============================================================================

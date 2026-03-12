@@ -8,6 +8,7 @@
  */
 
 #include <carquet/carquet.h>
+#include "core/bitpack.h"
 #include <stdbool.h>
 #include <stdint.h>
 #include <stddef.h>
@@ -56,6 +57,7 @@ typedef void (*memcpy_fn)(void* dest, const void* src, size_t n);
 
 typedef void (*unpack_bools_fn)(const uint8_t* input, uint8_t* output, int64_t count);
 typedef void (*pack_bools_fn)(const uint8_t* input, uint8_t* output, int64_t count);
+typedef void (*bitunpack8_u32_fn)(const uint8_t* input, uint32_t* values);
 
 typedef int64_t (*find_run_length_i32_fn)(const int32_t* values, int64_t count);
 
@@ -68,6 +70,18 @@ typedef int64_t (*count_non_nulls_fn)(const int16_t* def_levels, int64_t count, 
 typedef void (*build_null_bitmap_fn)(const int16_t* def_levels, int64_t count,
                                       int16_t max_def_level, uint8_t* null_bitmap);
 typedef void (*fill_def_levels_fn)(int16_t* def_levels, int64_t count, int16_t value);
+typedef void (*minmax_i32_fn)(const int32_t* values, int64_t count, int32_t* min_value, int32_t* max_value);
+typedef void (*minmax_i64_fn)(const int64_t* values, int64_t count, int64_t* min_value, int64_t* max_value);
+typedef void (*minmax_float_fn)(const float* values, int64_t count, float* min_value, float* max_value);
+typedef void (*minmax_double_fn)(const double* values, int64_t count, double* min_value, double* max_value);
+typedef void (*copy_minmax_i32_fn)(const int32_t* values, int64_t count, int32_t* output,
+                                    int32_t* min_value, int32_t* max_value);
+typedef void (*copy_minmax_i64_fn)(const int64_t* values, int64_t count, int64_t* output,
+                                    int64_t* min_value, int64_t* max_value);
+typedef void (*copy_minmax_float_fn)(const float* values, int64_t count, float* output,
+                                      float* min_value, float* max_value);
+typedef void (*copy_minmax_double_fn)(const double* values, int64_t count, double* output,
+                                       double* min_value, double* max_value);
 
 /* ============================================================================
  * Scalar Fallback Implementations
@@ -377,6 +391,78 @@ static void scalar_fill_def_levels(int16_t* def_levels, int64_t count, int16_t v
     }
 }
 
+static void scalar_minmax_i32(const int32_t* values, int64_t count,
+                               int32_t* min_value, int32_t* max_value) {
+    int32_t min_v = values[0];
+    int32_t max_v = values[0];
+    for (int64_t i = 1; i < count; i++) {
+        if (values[i] < min_v) min_v = values[i];
+        if (values[i] > max_v) max_v = values[i];
+    }
+    *min_value = min_v;
+    *max_value = max_v;
+}
+
+static void scalar_minmax_i64(const int64_t* values, int64_t count,
+                               int64_t* min_value, int64_t* max_value) {
+    int64_t min_v = values[0];
+    int64_t max_v = values[0];
+    for (int64_t i = 1; i < count; i++) {
+        if (values[i] < min_v) min_v = values[i];
+        if (values[i] > max_v) max_v = values[i];
+    }
+    *min_value = min_v;
+    *max_value = max_v;
+}
+
+static void scalar_minmax_float(const float* values, int64_t count,
+                                 float* min_value, float* max_value) {
+    float min_v = values[0];
+    float max_v = values[0];
+    for (int64_t i = 1; i < count; i++) {
+        if (values[i] < min_v) min_v = values[i];
+        if (values[i] > max_v) max_v = values[i];
+    }
+    *min_value = min_v;
+    *max_value = max_v;
+}
+
+static void scalar_minmax_double(const double* values, int64_t count,
+                                  double* min_value, double* max_value) {
+    double min_v = values[0];
+    double max_v = values[0];
+    for (int64_t i = 1; i < count; i++) {
+        if (values[i] < min_v) min_v = values[i];
+        if (values[i] > max_v) max_v = values[i];
+    }
+    *min_value = min_v;
+    *max_value = max_v;
+}
+
+static void scalar_copy_minmax_i32(const int32_t* values, int64_t count, int32_t* output,
+                                    int32_t* min_value, int32_t* max_value) {
+    memcpy(output, values, (size_t)count * sizeof(int32_t));
+    scalar_minmax_i32(values, count, min_value, max_value);
+}
+
+static void scalar_copy_minmax_i64(const int64_t* values, int64_t count, int64_t* output,
+                                    int64_t* min_value, int64_t* max_value) {
+    memcpy(output, values, (size_t)count * sizeof(int64_t));
+    scalar_minmax_i64(values, count, min_value, max_value);
+}
+
+static void scalar_copy_minmax_float(const float* values, int64_t count, float* output,
+                                      float* min_value, float* max_value) {
+    memcpy(output, values, (size_t)count * sizeof(float));
+    scalar_minmax_float(values, count, min_value, max_value);
+}
+
+static void scalar_copy_minmax_double(const double* values, int64_t count, double* output,
+                                       double* min_value, double* max_value) {
+    memcpy(output, values, (size_t)count * sizeof(double));
+    scalar_minmax_double(values, count, min_value, max_value);
+}
+
 /* ============================================================================
  * External SIMD Function Declarations
  * ============================================================================
@@ -397,6 +483,18 @@ extern void carquet_sse_gather_float(const float* dict, const uint32_t* indices,
                                       int64_t count, float* output);
 extern void carquet_sse_gather_double(const double* dict, const uint32_t* indices,
                                        int64_t count, double* output);
+extern bool carquet_sse_checked_gather_i32(const int32_t* dict, int32_t dict_count,
+                                            const uint32_t* indices, int64_t count,
+                                            int32_t* output);
+extern bool carquet_sse_checked_gather_i64(const int64_t* dict, int32_t dict_count,
+                                            const uint32_t* indices, int64_t count,
+                                            int64_t* output);
+extern bool carquet_sse_checked_gather_float(const float* dict, int32_t dict_count,
+                                              const uint32_t* indices, int64_t count,
+                                              float* output);
+extern bool carquet_sse_checked_gather_double(const double* dict, int32_t dict_count,
+                                               const uint32_t* indices, int64_t count,
+                                               double* output);
 extern void carquet_sse_byte_stream_split_encode_float(const float* values, int64_t count,
                                                         uint8_t* output);
 extern void carquet_sse_byte_stream_split_decode_float(const uint8_t* data, int64_t count,
@@ -405,6 +503,15 @@ extern void carquet_sse_byte_stream_split_encode_double(const double* values, in
                                                          uint8_t* output);
 extern void carquet_sse_byte_stream_split_decode_double(const uint8_t* data, int64_t count,
                                                          double* values);
+extern void carquet_sse_bitunpack8_1bit(const uint8_t* input, uint32_t* values);
+extern void carquet_sse_bitunpack8_2bit(const uint8_t* input, uint32_t* values);
+extern void carquet_sse_bitunpack8_3bit(const uint8_t* input, uint32_t* values);
+extern void carquet_sse_bitunpack8_4bit(const uint8_t* input, uint32_t* values);
+extern void carquet_sse_bitunpack8_5bit(const uint8_t* input, uint32_t* values);
+extern void carquet_sse_bitunpack8_6bit(const uint8_t* input, uint32_t* values);
+extern void carquet_sse_bitunpack8_7bit(const uint8_t* input, uint32_t* values);
+extern void carquet_sse_bitunpack8_8bit(const uint8_t* input, uint32_t* values);
+extern void carquet_sse_bitunpack8_16bit(const uint8_t* input, uint32_t* values);
 extern void carquet_sse_unpack_bools(const uint8_t* input, uint8_t* output, int64_t count);
 extern void carquet_sse_pack_bools(const uint8_t* input, uint8_t* output, int64_t count);
 extern uint32_t carquet_sse_crc32c(uint32_t crc, const uint8_t* data, size_t len);
@@ -414,7 +521,36 @@ extern int64_t carquet_sse_count_non_nulls(const int16_t* def_levels, int64_t co
 extern void carquet_sse_build_null_bitmap(const int16_t* def_levels, int64_t count,
                                            int16_t max_def_level, uint8_t* null_bitmap);
 extern void carquet_sse_fill_def_levels(int16_t* def_levels, int64_t count, int16_t value);
+extern void carquet_sse_minmax_i32(const int32_t* values, int64_t count, int32_t* min_value, int32_t* max_value);
+extern void carquet_sse_minmax_i64(const int64_t* values, int64_t count, int64_t* min_value, int64_t* max_value);
+extern void carquet_sse_minmax_float(const float* values, int64_t count, float* min_value, float* max_value);
+extern void carquet_sse_minmax_double(const double* values, int64_t count, double* min_value, double* max_value);
+extern void carquet_sse_copy_minmax_i32(const int32_t* values, int64_t count, int32_t* output,
+                                         int32_t* min_value, int32_t* max_value);
+extern void carquet_sse_copy_minmax_i64(const int64_t* values, int64_t count, int64_t* output,
+                                         int64_t* min_value, int64_t* max_value);
+extern void carquet_sse_copy_minmax_float(const float* values, int64_t count, float* output,
+                                           float* min_value, float* max_value);
+extern void carquet_sse_copy_minmax_double(const double* values, int64_t count, double* output,
+                                            double* min_value, double* max_value);
 extern int64_t carquet_sse_find_run_length_i32(const int32_t* values, int64_t count);
+#endif
+
+#ifdef CARQUET_ENABLE_AVX
+extern void carquet_avx_byte_stream_split_encode_float(const float* values, int64_t count,
+                                                        uint8_t* output);
+extern void carquet_avx_byte_stream_split_decode_float(const uint8_t* data, int64_t count,
+                                                        float* values);
+extern void carquet_avx_byte_stream_split_encode_double(const double* values, int64_t count,
+                                                         uint8_t* output);
+extern void carquet_avx_byte_stream_split_decode_double(const uint8_t* data, int64_t count,
+                                                         double* values);
+extern void carquet_avx_minmax_float(const float* values, int64_t count, float* min_value, float* max_value);
+extern void carquet_avx_minmax_double(const double* values, int64_t count, double* min_value, double* max_value);
+extern void carquet_avx_copy_minmax_float(const float* values, int64_t count, float* output,
+                                           float* min_value, float* max_value);
+extern void carquet_avx_copy_minmax_double(const double* values, int64_t count, double* output,
+                                            double* min_value, double* max_value);
 #endif
 
 #ifdef CARQUET_ENABLE_AVX2
@@ -428,12 +564,56 @@ extern void carquet_avx2_gather_float(const float* dict, const uint32_t* indices
                                        int64_t count, float* output);
 extern void carquet_avx2_gather_double(const double* dict, const uint32_t* indices,
                                         int64_t count, double* output);
+extern bool carquet_avx2_checked_gather_i32(const int32_t* dict, int32_t dict_count,
+                                             const uint32_t* indices, int64_t count,
+                                             int32_t* output);
+extern bool carquet_avx2_checked_gather_i64(const int64_t* dict, int32_t dict_count,
+                                             const uint32_t* indices, int64_t count,
+                                             int64_t* output);
+extern bool carquet_avx2_checked_gather_float(const float* dict, int32_t dict_count,
+                                               const uint32_t* indices, int64_t count,
+                                               float* output);
+extern bool carquet_avx2_checked_gather_double(const double* dict, int32_t dict_count,
+                                                const uint32_t* indices, int64_t count,
+                                                double* output);
 extern void carquet_avx2_byte_stream_split_encode_float(const float* values, int64_t count,
                                                          uint8_t* output);
 extern void carquet_avx2_byte_stream_split_decode_float(const uint8_t* data, int64_t count,
                                                          float* values);
+extern void carquet_avx2_byte_stream_split_encode_double(const double* values, int64_t count,
+                                                          uint8_t* output);
+extern void carquet_avx2_byte_stream_split_decode_double(const uint8_t* data, int64_t count,
+                                                          double* values);
+extern void carquet_avx2_bitunpack8_1bit(const uint8_t* input, uint32_t* values);
+extern void carquet_avx2_bitunpack8_2bit(const uint8_t* input, uint32_t* values);
+extern void carquet_avx2_bitunpack8_3bit(const uint8_t* input, uint32_t* values);
+extern void carquet_avx2_bitunpack8_4bit(const uint8_t* input, uint32_t* values);
+extern void carquet_avx2_bitunpack8_5bit(const uint8_t* input, uint32_t* values);
+extern void carquet_avx2_bitunpack8_6bit(const uint8_t* input, uint32_t* values);
+extern void carquet_avx2_bitunpack8_7bit(const uint8_t* input, uint32_t* values);
+extern void carquet_avx2_bitunpack8_8bit(const uint8_t* input, uint32_t* values);
+extern void carquet_avx2_bitunpack8_16bit(const uint8_t* input, uint32_t* values);
 extern void carquet_avx2_unpack_bools(const uint8_t* input, uint8_t* output, int64_t count);
 extern void carquet_avx2_pack_bools(const uint8_t* input, uint8_t* output, int64_t count);
+extern uint32_t carquet_avx2_crc32c(uint32_t crc, const uint8_t* data, size_t len);
+extern void carquet_avx2_match_copy(uint8_t* dst, const uint8_t* src, size_t len, size_t offset);
+extern size_t carquet_avx2_match_length(const uint8_t* p, const uint8_t* match, const uint8_t* limit);
+extern int64_t carquet_avx2_count_non_nulls(const int16_t* def_levels, int64_t count, int16_t max_def_level);
+extern void carquet_avx2_build_null_bitmap(const int16_t* def_levels, int64_t count,
+                                            int16_t max_def_level, uint8_t* null_bitmap);
+extern void carquet_avx2_fill_def_levels(int16_t* def_levels, int64_t count, int16_t value);
+extern void carquet_avx2_minmax_i32(const int32_t* values, int64_t count, int32_t* min_value, int32_t* max_value);
+extern void carquet_avx2_minmax_i64(const int64_t* values, int64_t count, int64_t* min_value, int64_t* max_value);
+extern void carquet_avx2_minmax_float(const float* values, int64_t count, float* min_value, float* max_value);
+extern void carquet_avx2_minmax_double(const double* values, int64_t count, double* min_value, double* max_value);
+extern void carquet_avx2_copy_minmax_i32(const int32_t* values, int64_t count, int32_t* output,
+                                          int32_t* min_value, int32_t* max_value);
+extern void carquet_avx2_copy_minmax_i64(const int64_t* values, int64_t count, int64_t* output,
+                                          int64_t* min_value, int64_t* max_value);
+extern void carquet_avx2_copy_minmax_float(const float* values, int64_t count, float* output,
+                                            float* min_value, float* max_value);
+extern void carquet_avx2_copy_minmax_double(const double* values, int64_t count, double* output,
+                                             double* min_value, double* max_value);
 extern int64_t carquet_avx2_find_run_length_i32(const int32_t* values, int64_t count);
 #endif
 
@@ -448,12 +628,42 @@ extern void carquet_avx512_gather_float(const float* dict, const uint32_t* indic
                                          int64_t count, float* output);
 extern void carquet_avx512_gather_double(const double* dict, const uint32_t* indices,
                                           int64_t count, double* output);
+extern bool carquet_avx512_checked_gather_i32(const int32_t* dict, int32_t dict_count,
+                                               const uint32_t* indices, int64_t count,
+                                               int32_t* output);
+extern bool carquet_avx512_checked_gather_i64(const int64_t* dict, int32_t dict_count,
+                                               const uint32_t* indices, int64_t count,
+                                               int64_t* output);
+extern bool carquet_avx512_checked_gather_float(const float* dict, int32_t dict_count,
+                                                 const uint32_t* indices, int64_t count,
+                                                 float* output);
+extern bool carquet_avx512_checked_gather_double(const double* dict, int32_t dict_count,
+                                                  const uint32_t* indices, int64_t count,
+                                                  double* output);
 extern void carquet_avx512_byte_stream_split_encode_float(const float* values, int64_t count,
                                                            uint8_t* output);
 extern void carquet_avx512_byte_stream_split_decode_float(const uint8_t* data, int64_t count,
                                                            float* values);
+extern void carquet_avx512_byte_stream_split_encode_double(const double* values, int64_t count,
+                                                            uint8_t* output);
+extern void carquet_avx512_byte_stream_split_decode_double(const uint8_t* data, int64_t count,
+                                                            double* values);
+extern void carquet_avx512_bitunpack8_4bit(const uint8_t* input, uint32_t* values);
+extern void carquet_avx512_bitunpack8_8bit(const uint8_t* input, uint32_t* values);
+extern void carquet_avx512_bitunpack8_16bit(const uint8_t* input, uint32_t* values);
 extern void carquet_avx512_unpack_bools(const uint8_t* input, uint8_t* output, int64_t count);
 extern void carquet_avx512_pack_bools(const uint8_t* input, uint8_t* output, int64_t count);
+extern uint32_t carquet_avx512_crc32c(uint32_t crc, const uint8_t* data, size_t len);
+extern void carquet_avx512_match_copy(uint8_t* dst, const uint8_t* src, size_t len, size_t offset);
+extern size_t carquet_avx512_match_length(const uint8_t* p, const uint8_t* match, const uint8_t* limit);
+extern int64_t carquet_avx512_count_non_nulls(const int16_t* def_levels, int64_t count, int16_t max_def_level);
+extern void carquet_avx512_build_null_bitmap(const int16_t* def_levels, int64_t count,
+                                              int16_t max_def_level, uint8_t* null_bitmap);
+extern void carquet_avx512_fill_def_levels(int16_t* def_levels, int64_t count, int16_t value);
+extern void carquet_avx512_minmax_i32(const int32_t* values, int64_t count, int32_t* min_value, int32_t* max_value);
+extern void carquet_avx512_minmax_i64(const int64_t* values, int64_t count, int64_t* min_value, int64_t* max_value);
+extern void carquet_avx512_minmax_float(const float* values, int64_t count, float* min_value, float* max_value);
+extern void carquet_avx512_minmax_double(const double* values, int64_t count, double* min_value, double* max_value);
 extern int64_t carquet_avx512_find_run_length_i32(const int32_t* values, int64_t count);
 #endif
 
@@ -503,6 +713,18 @@ extern int64_t carquet_neon_count_non_nulls(const int16_t* def_levels, int64_t c
 extern void carquet_neon_build_null_bitmap(const int16_t* def_levels, int64_t count,
                                             int16_t max_def_level, uint8_t* null_bitmap);
 extern void carquet_neon_fill_def_levels(int16_t* def_levels, int64_t count, int16_t value);
+extern void carquet_neon_minmax_i32(const int32_t* values, int64_t count, int32_t* min_value, int32_t* max_value);
+extern void carquet_neon_minmax_i64(const int64_t* values, int64_t count, int64_t* min_value, int64_t* max_value);
+extern void carquet_neon_minmax_float(const float* values, int64_t count, float* min_value, float* max_value);
+extern void carquet_neon_minmax_double(const double* values, int64_t count, double* min_value, double* max_value);
+extern void carquet_neon_copy_minmax_i32(const int32_t* values, int64_t count, int32_t* output,
+                                          int32_t* min_value, int32_t* max_value);
+extern void carquet_neon_copy_minmax_i64(const int64_t* values, int64_t count, int64_t* output,
+                                          int64_t* min_value, int64_t* max_value);
+extern void carquet_neon_copy_minmax_float(const float* values, int64_t count, float* output,
+                                            float* min_value, float* max_value);
+extern void carquet_neon_copy_minmax_double(const double* values, int64_t count, double* output,
+                                             double* min_value, double* max_value);
 #endif
 
 #ifdef __ARM_FEATURE_SVE
@@ -516,6 +738,48 @@ extern void carquet_sve_gather_float(const float* dict, const uint32_t* indices,
                                       int64_t count, float* output);
 extern void carquet_sve_gather_double(const double* dict, const uint32_t* indices,
                                        int64_t count, double* output);
+extern bool carquet_sve_checked_gather_i32(const int32_t* dict, int32_t dict_count,
+                                            const uint32_t* indices, int64_t count,
+                                            int32_t* output);
+extern bool carquet_sve_checked_gather_i64(const int64_t* dict, int32_t dict_count,
+                                            const uint32_t* indices, int64_t count,
+                                            int64_t* output);
+extern bool carquet_sve_checked_gather_float(const float* dict, int32_t dict_count,
+                                              const uint32_t* indices, int64_t count,
+                                              float* output);
+extern bool carquet_sve_checked_gather_double(const double* dict, int32_t dict_count,
+                                               const uint32_t* indices, int64_t count,
+                                               double* output);
+extern void carquet_sve_byte_stream_split_encode_float(const float* values, int64_t count,
+                                                        uint8_t* output);
+extern void carquet_sve_byte_stream_split_decode_float(const uint8_t* data, int64_t count,
+                                                        float* values);
+extern void carquet_sve_byte_stream_split_encode_double(const double* values, int64_t count,
+                                                         uint8_t* output);
+extern void carquet_sve_byte_stream_split_decode_double(const uint8_t* data, int64_t count,
+                                                         double* values);
+extern void carquet_sve_bitunpack8_4bit(const uint8_t* input, uint32_t* values);
+extern void carquet_sve_bitunpack8_8bit(const uint8_t* input, uint32_t* values);
+extern void carquet_sve_bitunpack8_16bit(const uint8_t* input, uint32_t* values);
+extern void carquet_sve_unpack_bools(const uint8_t* input, uint8_t* output, int64_t count);
+extern void carquet_sve_pack_bools(const uint8_t* input, uint8_t* output, int64_t count);
+extern int64_t carquet_sve_find_run_length_i32(const int32_t* values, int64_t count);
+extern int64_t carquet_sve_count_non_nulls(const int16_t* def_levels, int64_t count, int16_t max_def_level);
+extern void carquet_sve_build_null_bitmap(const int16_t* def_levels, int64_t count,
+                                           int16_t max_def_level, uint8_t* null_bitmap);
+extern void carquet_sve_fill_def_levels(int16_t* def_levels, int64_t count, int16_t value);
+extern void carquet_sve_minmax_i32(const int32_t* values, int64_t count, int32_t* min_value, int32_t* max_value);
+extern void carquet_sve_minmax_i64(const int64_t* values, int64_t count, int64_t* min_value, int64_t* max_value);
+extern void carquet_sve_minmax_float(const float* values, int64_t count, float* min_value, float* max_value);
+extern void carquet_sve_minmax_double(const double* values, int64_t count, double* min_value, double* max_value);
+extern void carquet_sve_copy_minmax_i32(const int32_t* values, int64_t count, int32_t* output,
+                                         int32_t* min_value, int32_t* max_value);
+extern void carquet_sve_copy_minmax_i64(const int64_t* values, int64_t count, int64_t* output,
+                                         int64_t* min_value, int64_t* max_value);
+extern void carquet_sve_copy_minmax_float(const float* values, int64_t count, float* output,
+                                           float* min_value, float* max_value);
+extern void carquet_sve_copy_minmax_double(const double* values, int64_t count, double* output,
+                                            double* min_value, double* max_value);
 #endif
 
 #endif /* AArch64 */
@@ -542,6 +806,7 @@ typedef struct {
     byte_split_decode_double_fn byte_split_decode_double;
     unpack_bools_fn unpack_bools;
     pack_bools_fn pack_bools;
+    bitunpack8_u32_fn bitunpack8_u32[33];
     find_run_length_i32_fn find_run_length_i32;
     crc32c_fn crc32c;
     match_copy_fn match_copy;
@@ -549,6 +814,14 @@ typedef struct {
     count_non_nulls_fn count_non_nulls;
     build_null_bitmap_fn build_null_bitmap;
     fill_def_levels_fn fill_def_levels;
+    minmax_i32_fn minmax_i32;
+    minmax_i64_fn minmax_i64;
+    minmax_float_fn minmax_float;
+    minmax_double_fn minmax_double;
+    copy_minmax_i32_fn copy_minmax_i32;
+    copy_minmax_i64_fn copy_minmax_i64;
+    copy_minmax_float_fn copy_minmax_float;
+    copy_minmax_double_fn copy_minmax_double;
 } carquet_simd_dispatch_t;
 
 static carquet_simd_dispatch_t g_dispatch = {0};
@@ -591,6 +864,14 @@ void carquet_simd_dispatch_init(void) {
     g_dispatch.count_non_nulls = scalar_count_non_nulls;
     g_dispatch.build_null_bitmap = scalar_build_null_bitmap;
     g_dispatch.fill_def_levels = scalar_fill_def_levels;
+    g_dispatch.minmax_i32 = scalar_minmax_i32;
+    g_dispatch.minmax_i64 = scalar_minmax_i64;
+    g_dispatch.minmax_float = scalar_minmax_float;
+    g_dispatch.minmax_double = scalar_minmax_double;
+    g_dispatch.copy_minmax_i32 = scalar_copy_minmax_i32;
+    g_dispatch.copy_minmax_i64 = scalar_copy_minmax_i64;
+    g_dispatch.copy_minmax_float = scalar_copy_minmax_float;
+    g_dispatch.copy_minmax_double = scalar_copy_minmax_double;
 
 #if defined(CARQUET_ARCH_X86)
 
@@ -602,19 +883,53 @@ void carquet_simd_dispatch_init(void) {
         g_dispatch.gather_i64 = carquet_sse_gather_i64;
         g_dispatch.gather_float = carquet_sse_gather_float;
         g_dispatch.gather_double = carquet_sse_gather_double;
+        g_dispatch.checked_gather_i32 = carquet_sse_checked_gather_i32;
+        g_dispatch.checked_gather_i64 = carquet_sse_checked_gather_i64;
+        g_dispatch.checked_gather_float = carquet_sse_checked_gather_float;
+        g_dispatch.checked_gather_double = carquet_sse_checked_gather_double;
         g_dispatch.byte_split_encode_float = carquet_sse_byte_stream_split_encode_float;
         g_dispatch.byte_split_decode_float = carquet_sse_byte_stream_split_decode_float;
         g_dispatch.byte_split_encode_double = carquet_sse_byte_stream_split_encode_double;
         g_dispatch.byte_split_decode_double = carquet_sse_byte_stream_split_decode_double;
         g_dispatch.unpack_bools = carquet_sse_unpack_bools;
         g_dispatch.pack_bools = carquet_sse_pack_bools;
+        g_dispatch.bitunpack8_u32[1] = carquet_sse_bitunpack8_1bit;
+        g_dispatch.bitunpack8_u32[2] = carquet_sse_bitunpack8_2bit;
+        g_dispatch.bitunpack8_u32[3] = carquet_sse_bitunpack8_3bit;
+        g_dispatch.bitunpack8_u32[4] = carquet_sse_bitunpack8_4bit;
+        g_dispatch.bitunpack8_u32[5] = carquet_sse_bitunpack8_5bit;
+        g_dispatch.bitunpack8_u32[6] = carquet_sse_bitunpack8_6bit;
+        g_dispatch.bitunpack8_u32[7] = carquet_sse_bitunpack8_7bit;
+        g_dispatch.bitunpack8_u32[8] = carquet_sse_bitunpack8_8bit;
+        g_dispatch.bitunpack8_u32[16] = carquet_sse_bitunpack8_16bit;
         g_dispatch.crc32c = carquet_sse_crc32c;
         g_dispatch.match_copy = carquet_sse_match_copy;
         g_dispatch.match_length = carquet_sse_match_length;
         g_dispatch.count_non_nulls = carquet_sse_count_non_nulls;
         g_dispatch.build_null_bitmap = carquet_sse_build_null_bitmap;
         g_dispatch.fill_def_levels = carquet_sse_fill_def_levels;
+        g_dispatch.minmax_i32 = carquet_sse_minmax_i32;
+        g_dispatch.minmax_i64 = carquet_sse_minmax_i64;
+        g_dispatch.minmax_float = carquet_sse_minmax_float;
+        g_dispatch.minmax_double = carquet_sse_minmax_double;
+        g_dispatch.copy_minmax_i32 = carquet_sse_copy_minmax_i32;
+        g_dispatch.copy_minmax_i64 = carquet_sse_copy_minmax_i64;
+        g_dispatch.copy_minmax_float = carquet_sse_copy_minmax_float;
+        g_dispatch.copy_minmax_double = carquet_sse_copy_minmax_double;
         g_dispatch.find_run_length_i32 = carquet_sse_find_run_length_i32;
+    }
+#endif
+
+#ifdef CARQUET_ENABLE_AVX
+    if (cpu->has_avx) {
+        g_dispatch.byte_split_encode_float = carquet_avx_byte_stream_split_encode_float;
+        g_dispatch.byte_split_decode_float = carquet_avx_byte_stream_split_decode_float;
+        g_dispatch.byte_split_encode_double = carquet_avx_byte_stream_split_encode_double;
+        g_dispatch.byte_split_decode_double = carquet_avx_byte_stream_split_decode_double;
+        g_dispatch.minmax_float = carquet_avx_minmax_float;
+        g_dispatch.minmax_double = carquet_avx_minmax_double;
+        g_dispatch.copy_minmax_float = carquet_avx_copy_minmax_float;
+        g_dispatch.copy_minmax_double = carquet_avx_copy_minmax_double;
     }
 #endif
 
@@ -626,10 +941,39 @@ void carquet_simd_dispatch_init(void) {
         g_dispatch.gather_i64 = carquet_avx2_gather_i64;
         g_dispatch.gather_float = carquet_avx2_gather_float;
         g_dispatch.gather_double = carquet_avx2_gather_double;
+        g_dispatch.checked_gather_i32 = carquet_avx2_checked_gather_i32;
+        g_dispatch.checked_gather_i64 = carquet_avx2_checked_gather_i64;
+        g_dispatch.checked_gather_float = carquet_avx2_checked_gather_float;
+        g_dispatch.checked_gather_double = carquet_avx2_checked_gather_double;
         g_dispatch.byte_split_encode_float = carquet_avx2_byte_stream_split_encode_float;
         g_dispatch.byte_split_decode_float = carquet_avx2_byte_stream_split_decode_float;
+        g_dispatch.byte_split_encode_double = carquet_avx2_byte_stream_split_encode_double;
+        g_dispatch.byte_split_decode_double = carquet_avx2_byte_stream_split_decode_double;
         g_dispatch.unpack_bools = carquet_avx2_unpack_bools;
         g_dispatch.pack_bools = carquet_avx2_pack_bools;
+        g_dispatch.crc32c = carquet_avx2_crc32c;
+        g_dispatch.match_copy = carquet_avx2_match_copy;
+        g_dispatch.match_length = carquet_avx2_match_length;
+        g_dispatch.count_non_nulls = carquet_avx2_count_non_nulls;
+        g_dispatch.build_null_bitmap = carquet_avx2_build_null_bitmap;
+        g_dispatch.fill_def_levels = carquet_avx2_fill_def_levels;
+        g_dispatch.minmax_i32 = carquet_avx2_minmax_i32;
+        g_dispatch.minmax_i64 = carquet_avx2_minmax_i64;
+        g_dispatch.minmax_float = carquet_avx2_minmax_float;
+        g_dispatch.minmax_double = carquet_avx2_minmax_double;
+        g_dispatch.copy_minmax_i32 = carquet_avx2_copy_minmax_i32;
+        g_dispatch.copy_minmax_i64 = carquet_avx2_copy_minmax_i64;
+        g_dispatch.copy_minmax_float = carquet_avx2_copy_minmax_float;
+        g_dispatch.copy_minmax_double = carquet_avx2_copy_minmax_double;
+        g_dispatch.bitunpack8_u32[1] = carquet_avx2_bitunpack8_1bit;
+        g_dispatch.bitunpack8_u32[2] = carquet_avx2_bitunpack8_2bit;
+        g_dispatch.bitunpack8_u32[3] = carquet_avx2_bitunpack8_3bit;
+        g_dispatch.bitunpack8_u32[4] = carquet_avx2_bitunpack8_4bit;
+        g_dispatch.bitunpack8_u32[5] = carquet_avx2_bitunpack8_5bit;
+        g_dispatch.bitunpack8_u32[6] = carquet_avx2_bitunpack8_6bit;
+        g_dispatch.bitunpack8_u32[7] = carquet_avx2_bitunpack8_7bit;
+        g_dispatch.bitunpack8_u32[8] = carquet_avx2_bitunpack8_8bit;
+        g_dispatch.bitunpack8_u32[16] = carquet_avx2_bitunpack8_16bit;
         g_dispatch.find_run_length_i32 = carquet_avx2_find_run_length_i32;
     }
 #endif
@@ -642,10 +986,29 @@ void carquet_simd_dispatch_init(void) {
         g_dispatch.gather_i64 = carquet_avx512_gather_i64;
         g_dispatch.gather_float = carquet_avx512_gather_float;
         g_dispatch.gather_double = carquet_avx512_gather_double;
+        g_dispatch.checked_gather_i32 = carquet_avx512_checked_gather_i32;
+        g_dispatch.checked_gather_i64 = carquet_avx512_checked_gather_i64;
+        g_dispatch.checked_gather_float = carquet_avx512_checked_gather_float;
+        g_dispatch.checked_gather_double = carquet_avx512_checked_gather_double;
         g_dispatch.byte_split_encode_float = carquet_avx512_byte_stream_split_encode_float;
         g_dispatch.byte_split_decode_float = carquet_avx512_byte_stream_split_decode_float;
+        g_dispatch.byte_split_encode_double = carquet_avx512_byte_stream_split_encode_double;
+        g_dispatch.byte_split_decode_double = carquet_avx512_byte_stream_split_decode_double;
+        g_dispatch.bitunpack8_u32[4] = carquet_avx512_bitunpack8_4bit;
+        g_dispatch.bitunpack8_u32[8] = carquet_avx512_bitunpack8_8bit;
+        g_dispatch.bitunpack8_u32[16] = carquet_avx512_bitunpack8_16bit;
         g_dispatch.unpack_bools = carquet_avx512_unpack_bools;
         g_dispatch.pack_bools = carquet_avx512_pack_bools;
+        g_dispatch.crc32c = carquet_avx512_crc32c;
+        g_dispatch.match_copy = carquet_avx512_match_copy;
+        g_dispatch.match_length = carquet_avx512_match_length;
+        g_dispatch.count_non_nulls = carquet_avx512_count_non_nulls;
+        g_dispatch.build_null_bitmap = carquet_avx512_build_null_bitmap;
+        g_dispatch.fill_def_levels = carquet_avx512_fill_def_levels;
+        g_dispatch.minmax_i32 = carquet_avx512_minmax_i32;
+        g_dispatch.minmax_i64 = carquet_avx512_minmax_i64;
+        g_dispatch.minmax_float = carquet_avx512_minmax_float;
+        g_dispatch.minmax_double = carquet_avx512_minmax_double;
         g_dispatch.find_run_length_i32 = carquet_avx512_find_run_length_i32;
     }
 #endif
@@ -680,6 +1043,14 @@ void carquet_simd_dispatch_init(void) {
     g_dispatch.count_non_nulls = carquet_neon_count_non_nulls;
     g_dispatch.build_null_bitmap = carquet_neon_build_null_bitmap;
     g_dispatch.fill_def_levels = carquet_neon_fill_def_levels;
+    g_dispatch.minmax_i32 = carquet_neon_minmax_i32;
+    g_dispatch.minmax_i64 = carquet_neon_minmax_i64;
+    g_dispatch.minmax_float = carquet_neon_minmax_float;
+    g_dispatch.minmax_double = carquet_neon_minmax_double;
+    g_dispatch.copy_minmax_i32 = carquet_neon_copy_minmax_i32;
+    g_dispatch.copy_minmax_i64 = carquet_neon_copy_minmax_i64;
+    g_dispatch.copy_minmax_float = carquet_neon_copy_minmax_float;
+    g_dispatch.copy_minmax_double = carquet_neon_copy_minmax_double;
     }
 #endif
 
@@ -692,6 +1063,31 @@ void carquet_simd_dispatch_init(void) {
         g_dispatch.gather_i64 = carquet_sve_gather_i64;
         g_dispatch.gather_float = carquet_sve_gather_float;
         g_dispatch.gather_double = carquet_sve_gather_double;
+        g_dispatch.checked_gather_i32 = carquet_sve_checked_gather_i32;
+        g_dispatch.checked_gather_i64 = carquet_sve_checked_gather_i64;
+        g_dispatch.checked_gather_float = carquet_sve_checked_gather_float;
+        g_dispatch.checked_gather_double = carquet_sve_checked_gather_double;
+        g_dispatch.byte_split_encode_float = carquet_sve_byte_stream_split_encode_float;
+        g_dispatch.byte_split_decode_float = carquet_sve_byte_stream_split_decode_float;
+        g_dispatch.byte_split_encode_double = carquet_sve_byte_stream_split_encode_double;
+        g_dispatch.byte_split_decode_double = carquet_sve_byte_stream_split_decode_double;
+        g_dispatch.bitunpack8_u32[4] = carquet_sve_bitunpack8_4bit;
+        g_dispatch.bitunpack8_u32[8] = carquet_sve_bitunpack8_8bit;
+        g_dispatch.bitunpack8_u32[16] = carquet_sve_bitunpack8_16bit;
+        g_dispatch.unpack_bools = carquet_sve_unpack_bools;
+        g_dispatch.pack_bools = carquet_sve_pack_bools;
+        g_dispatch.find_run_length_i32 = carquet_sve_find_run_length_i32;
+        g_dispatch.count_non_nulls = carquet_sve_count_non_nulls;
+        g_dispatch.build_null_bitmap = carquet_sve_build_null_bitmap;
+        g_dispatch.fill_def_levels = carquet_sve_fill_def_levels;
+        g_dispatch.minmax_i32 = carquet_sve_minmax_i32;
+        g_dispatch.minmax_i64 = carquet_sve_minmax_i64;
+        g_dispatch.minmax_float = carquet_sve_minmax_float;
+        g_dispatch.minmax_double = carquet_sve_minmax_double;
+        g_dispatch.copy_minmax_i32 = carquet_sve_copy_minmax_i32;
+        g_dispatch.copy_minmax_i64 = carquet_sve_copy_minmax_i64;
+        g_dispatch.copy_minmax_float = carquet_sve_copy_minmax_float;
+        g_dispatch.copy_minmax_double = carquet_sve_copy_minmax_double;
     }
 #endif
 
@@ -846,6 +1242,14 @@ int64_t carquet_dispatch_find_run_length_i32(const int32_t* values, int64_t coun
     return g_dispatch.find_run_length_i32(values, count);
 }
 
+carquet_bitunpack8_fn carquet_dispatch_get_bitunpack8_fn(int bit_width) {
+    if (!g_dispatch_initialized) carquet_simd_dispatch_init();
+    if (bit_width < 0 || bit_width > 32) {
+        return NULL;
+    }
+    return g_dispatch.bitunpack8_u32[bit_width];
+}
+
 uint32_t carquet_dispatch_crc32c(uint32_t crc, const uint8_t* data, size_t len) {
     if (!g_dispatch_initialized) carquet_simd_dispatch_init();
     return g_dispatch.crc32c(crc, data, len);
@@ -875,4 +1279,52 @@ void carquet_dispatch_build_null_bitmap(const int16_t* def_levels, int64_t count
 void carquet_dispatch_fill_def_levels(int16_t* def_levels, int64_t count, int16_t value) {
     if (!g_dispatch_initialized) carquet_simd_dispatch_init();
     g_dispatch.fill_def_levels(def_levels, count, value);
+}
+
+void carquet_dispatch_minmax_i32(const int32_t* values, int64_t count,
+                                  int32_t* min_value, int32_t* max_value) {
+    if (!g_dispatch_initialized) carquet_simd_dispatch_init();
+    g_dispatch.minmax_i32(values, count, min_value, max_value);
+}
+
+void carquet_dispatch_minmax_i64(const int64_t* values, int64_t count,
+                                  int64_t* min_value, int64_t* max_value) {
+    if (!g_dispatch_initialized) carquet_simd_dispatch_init();
+    g_dispatch.minmax_i64(values, count, min_value, max_value);
+}
+
+void carquet_dispatch_minmax_float(const float* values, int64_t count,
+                                    float* min_value, float* max_value) {
+    if (!g_dispatch_initialized) carquet_simd_dispatch_init();
+    g_dispatch.minmax_float(values, count, min_value, max_value);
+}
+
+void carquet_dispatch_minmax_double(const double* values, int64_t count,
+                                     double* min_value, double* max_value) {
+    if (!g_dispatch_initialized) carquet_simd_dispatch_init();
+    g_dispatch.minmax_double(values, count, min_value, max_value);
+}
+
+void carquet_dispatch_copy_minmax_i32(const int32_t* values, int64_t count, int32_t* output,
+                                       int32_t* min_value, int32_t* max_value) {
+    if (!g_dispatch_initialized) carquet_simd_dispatch_init();
+    g_dispatch.copy_minmax_i32(values, count, output, min_value, max_value);
+}
+
+void carquet_dispatch_copy_minmax_i64(const int64_t* values, int64_t count, int64_t* output,
+                                       int64_t* min_value, int64_t* max_value) {
+    if (!g_dispatch_initialized) carquet_simd_dispatch_init();
+    g_dispatch.copy_minmax_i64(values, count, output, min_value, max_value);
+}
+
+void carquet_dispatch_copy_minmax_float(const float* values, int64_t count, float* output,
+                                         float* min_value, float* max_value) {
+    if (!g_dispatch_initialized) carquet_simd_dispatch_init();
+    g_dispatch.copy_minmax_float(values, count, output, min_value, max_value);
+}
+
+void carquet_dispatch_copy_minmax_double(const double* values, int64_t count, double* output,
+                                          double* min_value, double* max_value) {
+    if (!g_dispatch_initialized) carquet_simd_dispatch_init();
+    g_dispatch.copy_minmax_double(values, count, output, min_value, max_value);
 }

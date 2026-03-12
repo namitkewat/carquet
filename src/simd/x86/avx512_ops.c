@@ -49,6 +49,44 @@ static inline int portable_ctz(unsigned int v) {
  * ============================================================================
  */
 
+void carquet_avx512_bitunpack32_8bit(const uint8_t* input, uint32_t* values);
+
+/**
+ * Unpack 8 8-bit values to 32-bit using AVX-512.
+ */
+void carquet_avx512_bitunpack8_8bit(const uint8_t* input, uint32_t* values) {
+    __m128i bytes = _mm_loadl_epi64((const __m128i*)input);
+    __m512i expanded = _mm512_cvtepu8_epi32(bytes);
+    __m256i result = _mm512_castsi512_si256(expanded);
+    _mm256_storeu_si256((__m256i*)values, result);
+}
+
+/**
+ * Unpack 8 16-bit values to 32-bit using AVX-512.
+ */
+void carquet_avx512_bitunpack8_16bit(const uint8_t* input, uint32_t* values) {
+    __m128i words = _mm_loadu_si128((const __m128i*)input);
+    __m256i result = _mm256_cvtepu16_epi32(words);
+    _mm256_storeu_si256((__m256i*)values, result);
+}
+
+/**
+ * Unpack 8 4-bit values to 32-bit using AVX-512.
+ */
+void carquet_avx512_bitunpack8_4bit(const uint8_t* input, uint32_t* values) {
+    uint8_t expanded[16];
+    uint32_t tmp[16];
+
+    for (int i = 0; i < 4; i++) {
+        uint8_t byte = input[i];
+        expanded[i * 2] = (uint8_t)(byte & 0x0F);
+        expanded[i * 2 + 1] = (uint8_t)(byte >> 4);
+    }
+
+    carquet_avx512_bitunpack32_8bit(expanded, tmp);
+    memcpy(values, tmp, 8 * sizeof(uint32_t));
+}
+
 /**
  * Unpack 32 8-bit values to 32-bit using AVX-512.
  */
@@ -224,6 +262,189 @@ void carquet_avx512_byte_stream_split_decode_float(
     }
 }
 
+/**
+ * Encode doubles using byte stream split with AVX-512.
+ * Processes 8 doubles (64 bytes) at a time using two 256-bit halves.
+ */
+void carquet_avx512_byte_stream_split_encode_double(
+    const double* values,
+    int64_t count,
+    uint8_t* output) {
+
+    const uint8_t* src = (const uint8_t*)values;
+    int64_t i = 0;
+    const __m256i s0 = _mm256_setr_epi8(
+        0, 8, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+        0, 8, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1);
+    const __m256i s1 = _mm256_setr_epi8(
+        1, 9, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+        1, 9, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1);
+    const __m256i s2 = _mm256_setr_epi8(
+        2, 10, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+        2, 10, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1);
+    const __m256i s3 = _mm256_setr_epi8(
+        3, 11, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+        3, 11, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1);
+    const __m256i s4 = _mm256_setr_epi8(
+        4, 12, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+        4, 12, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1);
+    const __m256i s5 = _mm256_setr_epi8(
+        5, 13, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+        5, 13, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1);
+    const __m256i s6 = _mm256_setr_epi8(
+        6, 14, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+        6, 14, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1);
+    const __m256i s7 = _mm256_setr_epi8(
+        7, 15, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+        7, 15, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1);
+
+    for (; i + 8 <= count; i += 8) {
+        __m256i lo = _mm256_loadu_si256((const __m256i*)(src + i * 8));
+        __m256i hi = _mm256_loadu_si256((const __m256i*)(src + i * 8 + 32));
+
+        __m256i out0_lo = _mm256_shuffle_epi8(lo, s0);
+        __m256i out1_lo = _mm256_shuffle_epi8(lo, s1);
+        __m256i out2_lo = _mm256_shuffle_epi8(lo, s2);
+        __m256i out3_lo = _mm256_shuffle_epi8(lo, s3);
+        __m256i out4_lo = _mm256_shuffle_epi8(lo, s4);
+        __m256i out5_lo = _mm256_shuffle_epi8(lo, s5);
+        __m256i out6_lo = _mm256_shuffle_epi8(lo, s6);
+        __m256i out7_lo = _mm256_shuffle_epi8(lo, s7);
+        __m256i out0_hi = _mm256_shuffle_epi8(hi, s0);
+        __m256i out1_hi = _mm256_shuffle_epi8(hi, s1);
+        __m256i out2_hi = _mm256_shuffle_epi8(hi, s2);
+        __m256i out3_hi = _mm256_shuffle_epi8(hi, s3);
+        __m256i out4_hi = _mm256_shuffle_epi8(hi, s4);
+        __m256i out5_hi = _mm256_shuffle_epi8(hi, s5);
+        __m256i out6_hi = _mm256_shuffle_epi8(hi, s6);
+        __m256i out7_hi = _mm256_shuffle_epi8(hi, s7);
+
+        uint64_t t0 = (uint64_t)(uint16_t)_mm_extract_epi16(_mm256_castsi256_si128(out0_lo), 0) |
+                      ((uint64_t)(uint16_t)_mm_extract_epi16(_mm256_extracti128_si256(out0_lo, 1), 0) << 16) |
+                      ((uint64_t)(uint16_t)_mm_extract_epi16(_mm256_castsi256_si128(out0_hi), 0) << 32) |
+                      ((uint64_t)(uint16_t)_mm_extract_epi16(_mm256_extracti128_si256(out0_hi, 1), 0) << 48);
+        uint64_t t1 = (uint64_t)(uint16_t)_mm_extract_epi16(_mm256_castsi256_si128(out1_lo), 0) |
+                      ((uint64_t)(uint16_t)_mm_extract_epi16(_mm256_extracti128_si256(out1_lo, 1), 0) << 16) |
+                      ((uint64_t)(uint16_t)_mm_extract_epi16(_mm256_castsi256_si128(out1_hi), 0) << 32) |
+                      ((uint64_t)(uint16_t)_mm_extract_epi16(_mm256_extracti128_si256(out1_hi, 1), 0) << 48);
+        uint64_t t2 = (uint64_t)(uint16_t)_mm_extract_epi16(_mm256_castsi256_si128(out2_lo), 0) |
+                      ((uint64_t)(uint16_t)_mm_extract_epi16(_mm256_extracti128_si256(out2_lo, 1), 0) << 16) |
+                      ((uint64_t)(uint16_t)_mm_extract_epi16(_mm256_castsi256_si128(out2_hi), 0) << 32) |
+                      ((uint64_t)(uint16_t)_mm_extract_epi16(_mm256_extracti128_si256(out2_hi, 1), 0) << 48);
+        uint64_t t3 = (uint64_t)(uint16_t)_mm_extract_epi16(_mm256_castsi256_si128(out3_lo), 0) |
+                      ((uint64_t)(uint16_t)_mm_extract_epi16(_mm256_extracti128_si256(out3_lo, 1), 0) << 16) |
+                      ((uint64_t)(uint16_t)_mm_extract_epi16(_mm256_castsi256_si128(out3_hi), 0) << 32) |
+                      ((uint64_t)(uint16_t)_mm_extract_epi16(_mm256_extracti128_si256(out3_hi, 1), 0) << 48);
+        uint64_t t4 = (uint64_t)(uint16_t)_mm_extract_epi16(_mm256_castsi256_si128(out4_lo), 0) |
+                      ((uint64_t)(uint16_t)_mm_extract_epi16(_mm256_extracti128_si256(out4_lo, 1), 0) << 16) |
+                      ((uint64_t)(uint16_t)_mm_extract_epi16(_mm256_castsi256_si128(out4_hi), 0) << 32) |
+                      ((uint64_t)(uint16_t)_mm_extract_epi16(_mm256_extracti128_si256(out4_hi, 1), 0) << 48);
+        uint64_t t5 = (uint64_t)(uint16_t)_mm_extract_epi16(_mm256_castsi256_si128(out5_lo), 0) |
+                      ((uint64_t)(uint16_t)_mm_extract_epi16(_mm256_extracti128_si256(out5_lo, 1), 0) << 16) |
+                      ((uint64_t)(uint16_t)_mm_extract_epi16(_mm256_castsi256_si128(out5_hi), 0) << 32) |
+                      ((uint64_t)(uint16_t)_mm_extract_epi16(_mm256_extracti128_si256(out5_hi, 1), 0) << 48);
+        uint64_t t6 = (uint64_t)(uint16_t)_mm_extract_epi16(_mm256_castsi256_si128(out6_lo), 0) |
+                      ((uint64_t)(uint16_t)_mm_extract_epi16(_mm256_extracti128_si256(out6_lo, 1), 0) << 16) |
+                      ((uint64_t)(uint16_t)_mm_extract_epi16(_mm256_castsi256_si128(out6_hi), 0) << 32) |
+                      ((uint64_t)(uint16_t)_mm_extract_epi16(_mm256_extracti128_si256(out6_hi, 1), 0) << 48);
+        uint64_t t7 = (uint64_t)(uint16_t)_mm_extract_epi16(_mm256_castsi256_si128(out7_lo), 0) |
+                      ((uint64_t)(uint16_t)_mm_extract_epi16(_mm256_extracti128_si256(out7_lo, 1), 0) << 16) |
+                      ((uint64_t)(uint16_t)_mm_extract_epi16(_mm256_castsi256_si128(out7_hi), 0) << 32) |
+                      ((uint64_t)(uint16_t)_mm_extract_epi16(_mm256_extracti128_si256(out7_hi, 1), 0) << 48);
+
+        memcpy(output + 0 * count + i, &t0, sizeof(t0));
+        memcpy(output + 1 * count + i, &t1, sizeof(t1));
+        memcpy(output + 2 * count + i, &t2, sizeof(t2));
+        memcpy(output + 3 * count + i, &t3, sizeof(t3));
+        memcpy(output + 4 * count + i, &t4, sizeof(t4));
+        memcpy(output + 5 * count + i, &t5, sizeof(t5));
+        memcpy(output + 6 * count + i, &t6, sizeof(t6));
+        memcpy(output + 7 * count + i, &t7, sizeof(t7));
+    }
+
+    for (; i < count; i++) {
+        for (int b = 0; b < 8; b++) {
+            output[b * count + i] = src[i * 8 + b];
+        }
+    }
+}
+
+/**
+ * Decode byte stream split doubles using AVX-512.
+ * Processes 8 doubles (64 bytes) at a time via 128-bit interleave stages.
+ */
+void carquet_avx512_byte_stream_split_decode_double(
+    const uint8_t* data,
+    int64_t count,
+    double* values) {
+
+    uint8_t* dst = (uint8_t*)values;
+    int64_t i = 0;
+
+    for (; i + 8 <= count; i += 8) {
+        uint64_t b0, b1, b2, b3, b4, b5, b6, b7;
+        memcpy(&b0, data + 0 * count + i, sizeof(b0));
+        memcpy(&b1, data + 1 * count + i, sizeof(b1));
+        memcpy(&b2, data + 2 * count + i, sizeof(b2));
+        memcpy(&b3, data + 3 * count + i, sizeof(b3));
+        memcpy(&b4, data + 4 * count + i, sizeof(b4));
+        memcpy(&b5, data + 5 * count + i, sizeof(b5));
+        memcpy(&b6, data + 6 * count + i, sizeof(b6));
+        memcpy(&b7, data + 7 * count + i, sizeof(b7));
+
+        __m128i s0 = _mm_cvtsi64_si128((long long)b0);
+        __m128i s1 = _mm_cvtsi64_si128((long long)b1);
+        __m128i s2 = _mm_cvtsi64_si128((long long)b2);
+        __m128i s3 = _mm_cvtsi64_si128((long long)b3);
+        __m128i s4 = _mm_cvtsi64_si128((long long)b4);
+        __m128i s5 = _mm_cvtsi64_si128((long long)b5);
+        __m128i s6 = _mm_cvtsi64_si128((long long)b6);
+        __m128i s7 = _mm_cvtsi64_si128((long long)b7);
+
+        __m128i u01_lo = _mm_unpacklo_epi8(s0, s1);
+        __m128i u01_hi = _mm_unpackhi_epi8(s0, s1);
+        __m128i u23_lo = _mm_unpacklo_epi8(s2, s3);
+        __m128i u23_hi = _mm_unpackhi_epi8(s2, s3);
+        __m128i u45_lo = _mm_unpacklo_epi8(s4, s5);
+        __m128i u45_hi = _mm_unpackhi_epi8(s4, s5);
+        __m128i u67_lo = _mm_unpacklo_epi8(s6, s7);
+        __m128i u67_hi = _mm_unpackhi_epi8(s6, s7);
+
+        __m128i r0 = _mm_unpacklo_epi16(u01_lo, u23_lo);
+        __m128i r1 = _mm_unpackhi_epi16(u01_lo, u23_lo);
+        __m128i r2 = _mm_unpacklo_epi16(u01_hi, u23_hi);
+        __m128i r3 = _mm_unpackhi_epi16(u01_hi, u23_hi);
+        __m128i r4 = _mm_unpacklo_epi16(u45_lo, u67_lo);
+        __m128i r5 = _mm_unpackhi_epi16(u45_lo, u67_lo);
+        __m128i r6 = _mm_unpacklo_epi16(u45_hi, u67_hi);
+        __m128i r7 = _mm_unpackhi_epi16(u45_hi, u67_hi);
+
+        __m128i d0 = _mm_unpacklo_epi32(r0, r4);
+        __m128i d1 = _mm_unpackhi_epi32(r0, r4);
+        __m128i d2 = _mm_unpacklo_epi32(r1, r5);
+        __m128i d3 = _mm_unpackhi_epi32(r1, r5);
+        __m128i d4 = _mm_unpacklo_epi32(r2, r6);
+        __m128i d5 = _mm_unpackhi_epi32(r2, r6);
+        __m128i d6 = _mm_unpacklo_epi32(r3, r7);
+        __m128i d7 = _mm_unpackhi_epi32(r3, r7);
+
+        _mm_storeu_si128((__m128i*)(dst + i * 8 +  0), d0);
+        _mm_storeu_si128((__m128i*)(dst + i * 8 + 16), d1);
+        _mm_storeu_si128((__m128i*)(dst + i * 8 + 32), d2);
+        _mm_storeu_si128((__m128i*)(dst + i * 8 + 48), d3);
+        _mm_storeu_si128((__m128i*)(dst + i * 8 + 64), d4);
+        _mm_storeu_si128((__m128i*)(dst + i * 8 + 80), d5);
+        _mm_storeu_si128((__m128i*)(dst + i * 8 + 96), d6);
+        _mm_storeu_si128((__m128i*)(dst + i * 8 + 112), d7);
+    }
+
+    for (; i < count; i++) {
+        for (int b = 0; b < 8; b++) {
+            dst[i * 8 + b] = data[b * count + i];
+        }
+    }
+}
+
 /* ============================================================================
  * Delta Decoding - AVX-512 Optimized (Prefix Sum)
  * ============================================================================
@@ -382,6 +603,74 @@ void carquet_avx512_gather_double(const double* dict, const uint32_t* indices,
     carquet_avx512_gather_i64((const int64_t*)dict, indices, count, (int64_t*)output);
 }
 
+bool carquet_avx512_checked_gather_i32(const int32_t* dict, int32_t dict_count,
+                                        const uint32_t* indices, int64_t count,
+                                        int32_t* output) {
+    int64_t i = 0;
+    __m512i limit = _mm512_set1_epi32(dict_count);
+
+    for (; i + 16 <= count; i += 16) {
+        __m512i idx = _mm512_loadu_si512((const void*)(indices + i));
+        __mmask16 valid = _mm512_cmp_epu32_mask(idx, limit, _MM_CMPINT_LT);
+        if (valid != 0xFFFFu) {
+            return false;
+        }
+        __m512i result = _mm512_i32gather_epi32(idx, dict, 4);
+        _mm512_storeu_si512((void*)(output + i), result);
+    }
+
+    for (; i < count; i++) {
+        uint32_t idx = indices[i];
+        if (idx >= (uint32_t)dict_count) {
+            return false;
+        }
+        output[i] = dict[idx];
+    }
+
+    return true;
+}
+
+bool carquet_avx512_checked_gather_i64(const int64_t* dict, int32_t dict_count,
+                                        const uint32_t* indices, int64_t count,
+                                        int64_t* output) {
+    int64_t i = 0;
+    __m256i limit = _mm256_set1_epi32(dict_count);
+
+    for (; i + 8 <= count; i += 8) {
+        __m256i idx = _mm256_loadu_si256((const __m256i*)(indices + i));
+        __mmask8 valid = _mm256_cmp_epu32_mask(idx, limit, _MM_CMPINT_LT);
+        if (valid != 0xFFu) {
+            return false;
+        }
+        __m512i result = _mm512_i32gather_epi64(idx, dict, 8);
+        _mm512_storeu_si512((void*)(output + i), result);
+    }
+
+    for (; i < count; i++) {
+        uint32_t idx = indices[i];
+        if (idx >= (uint32_t)dict_count) {
+            return false;
+        }
+        output[i] = dict[idx];
+    }
+
+    return true;
+}
+
+bool carquet_avx512_checked_gather_float(const float* dict, int32_t dict_count,
+                                          const uint32_t* indices, int64_t count,
+                                          float* output) {
+    return carquet_avx512_checked_gather_i32(
+        (const int32_t*)dict, dict_count, indices, count, (int32_t*)output);
+}
+
+bool carquet_avx512_checked_gather_double(const double* dict, int32_t dict_count,
+                                           const uint32_t* indices, int64_t count,
+                                           double* output) {
+    return carquet_avx512_checked_gather_i64(
+        (const int64_t*)dict, dict_count, indices, count, (int64_t*)output);
+}
+
 /* ============================================================================
  * Memcpy/Memset - AVX-512 Optimized
  * ============================================================================
@@ -476,6 +765,100 @@ void carquet_avx512_memcpy(void* dest, const void* src, size_t n) {
         *d++ = *s++;
         n--;
     }
+}
+
+uint32_t carquet_avx512_crc32c(uint32_t crc, const uint8_t* data, size_t len) {
+    size_t i = 0;
+
+#ifdef __x86_64__
+    for (; i + 8 <= len; i += 8) {
+        uint64_t val;
+        memcpy(&val, data + i, 8);
+        crc = (uint32_t)_mm_crc32_u64(crc, val);
+    }
+#endif
+
+    for (; i + 4 <= len; i += 4) {
+        uint32_t val;
+        memcpy(&val, data + i, 4);
+        crc = _mm_crc32_u32(crc, val);
+    }
+
+    if (i + 2 <= len) {
+        uint16_t val;
+        memcpy(&val, data + i, 2);
+        crc = _mm_crc32_u16(crc, val);
+        i += 2;
+    }
+
+    if (i < len) {
+        crc = _mm_crc32_u8(crc, data[i]);
+    }
+
+    return crc;
+}
+
+void carquet_avx512_match_copy(uint8_t* dst, const uint8_t* src, size_t len, size_t offset) {
+    if (offset >= 64) {
+        while (len >= 64) {
+            _mm512_storeu_si512((void*)dst, _mm512_loadu_si512((const void*)src));
+            dst += 64;
+            src += 64;
+            len -= 64;
+        }
+    } else if (offset == 1) {
+        __m512i v = _mm512_set1_epi8((char)*src);
+        while (len >= 64) {
+            _mm512_storeu_si512((void*)dst, v);
+            dst += 64;
+            len -= 64;
+        }
+    } else if (offset == 4) {
+        uint32_t pattern;
+        memcpy(&pattern, src, sizeof(pattern));
+        __m512i v = _mm512_set1_epi32((int32_t)pattern);
+        while (len >= 64) {
+            _mm512_storeu_si512((void*)dst, v);
+            dst += 64;
+            len -= 64;
+        }
+    } else if (offset == 8) {
+        uint64_t pattern;
+        memcpy(&pattern, src, sizeof(pattern));
+        __m512i v = _mm512_set1_epi64((long long)pattern);
+        while (len >= 64) {
+            _mm512_storeu_si512((void*)dst, v);
+            dst += 64;
+            len -= 64;
+        }
+    }
+
+    while (len > 0) {
+        *dst++ = *src++;
+        len--;
+    }
+}
+
+size_t carquet_avx512_match_length(const uint8_t* p, const uint8_t* match, const uint8_t* limit) {
+    const uint8_t* start = p;
+
+    while (p + 64 <= limit) {
+        __m512i a = _mm512_loadu_si512((const void*)p);
+        __m512i b = _mm512_loadu_si512((const void*)match);
+        __mmask64 mask = _mm512_cmpeq_epi8_mask(a, b);
+        if (mask != ~0ULL) {
+            return (size_t)(p - start) + (size_t)portable_ctz((unsigned int)(~mask));
+        }
+        p += 64;
+        match += 64;
+    }
+
+    while (p < limit && *p == *match) {
+        p++;
+        match++;
+    }
+
+    return (size_t)(p - start);
 }
 
 /* ============================================================================
@@ -581,6 +964,188 @@ int64_t carquet_avx512_find_run_length_i32(const int32_t* values, int64_t count)
     }
 
     return count;
+}
+
+int64_t carquet_avx512_count_non_nulls(const int16_t* def_levels, int64_t count, int16_t max_def_level) {
+    int64_t non_null_count = 0;
+    int64_t i = 0;
+    __m512i max_vec = _mm512_set1_epi16(max_def_level);
+
+    for (; i + 32 <= count; i += 32) {
+        __m512i levels = _mm512_loadu_si512((const void*)(def_levels + i));
+        __mmask32 mask = _mm512_cmpeq_epi16_mask(levels, max_vec);
+        non_null_count += _mm_popcnt_u32((unsigned int)mask);
+    }
+
+    for (; i < count; i++) {
+        if (def_levels[i] == max_def_level) {
+            non_null_count++;
+        }
+    }
+
+    return non_null_count;
+}
+
+void carquet_avx512_build_null_bitmap(const int16_t* def_levels, int64_t count,
+                                       int16_t max_def_level, uint8_t* null_bitmap) {
+    int64_t i = 0;
+    int64_t byte_index = 0;
+    __m512i max_vec = _mm512_set1_epi16(max_def_level);
+
+    for (; i + 32 <= count; i += 32, byte_index += 4) {
+        __m512i levels = _mm512_loadu_si512((const void*)(def_levels + i));
+        __mmask32 mask = _mm512_cmp_epi16_mask(levels, max_vec, _MM_CMPINT_LT);
+        uint32_t bits = (uint32_t)mask;
+        memcpy(null_bitmap + byte_index, &bits, sizeof(bits));
+    }
+
+    for (; i < count; byte_index++) {
+        uint8_t bits = 0;
+        for (int j = 0; j < 8 && i < count; j++, i++) {
+            if (def_levels[i] < max_def_level) {
+                bits |= (uint8_t)(1u << j);
+            }
+        }
+        null_bitmap[byte_index] = bits;
+    }
+}
+
+void carquet_avx512_fill_def_levels(int16_t* def_levels, int64_t count, int16_t value) {
+    int64_t i = 0;
+    __m512i val_vec = _mm512_set1_epi16(value);
+
+    for (; i + 32 <= count; i += 32) {
+        _mm512_storeu_si512((void*)(def_levels + i), val_vec);
+    }
+    for (; i < count; i++) {
+        def_levels[i] = value;
+    }
+}
+
+void carquet_avx512_minmax_i32(const int32_t* values, int64_t count,
+                                int32_t* min_value, int32_t* max_value) {
+    int32_t min_v = values[0];
+    int32_t max_v = values[0];
+    __m512i min_vec = _mm512_set1_epi32(min_v);
+    __m512i max_vec = _mm512_set1_epi32(max_v);
+    int64_t i = 1;
+
+    for (; i + 16 <= count; i += 16) {
+        __m512i v = _mm512_loadu_si512((const void*)(values + i));
+        min_vec = _mm512_min_epi32(min_vec, v);
+        max_vec = _mm512_max_epi32(max_vec, v);
+    }
+
+    int32_t tmp_min[16];
+    int32_t tmp_max[16];
+    _mm512_storeu_si512((void*)tmp_min, min_vec);
+    _mm512_storeu_si512((void*)tmp_max, max_vec);
+    for (int j = 0; j < 16; j++) {
+        if (tmp_min[j] < min_v) min_v = tmp_min[j];
+        if (tmp_max[j] > max_v) max_v = tmp_max[j];
+    }
+    for (; i < count; i++) {
+        if (values[i] < min_v) min_v = values[i];
+        if (values[i] > max_v) max_v = values[i];
+    }
+    *min_value = min_v;
+    *max_value = max_v;
+}
+
+void carquet_avx512_minmax_i64(const int64_t* values, int64_t count,
+                                int64_t* min_value, int64_t* max_value) {
+    int64_t min_v = values[0];
+    int64_t max_v = values[0];
+    __m512i min_vec = _mm512_set1_epi64(min_v);
+    __m512i max_vec = _mm512_set1_epi64(max_v);
+    int64_t i = 1;
+
+    for (; i + 8 <= count; i += 8) {
+        __m512i v = _mm512_loadu_si512((const void*)(values + i));
+        __mmask8 lt = _mm512_cmpgt_epi64_mask(min_vec, v);
+        __mmask8 gt = _mm512_cmpgt_epi64_mask(v, max_vec);
+        min_vec = _mm512_mask_mov_epi64(min_vec, lt, v);
+        max_vec = _mm512_mask_mov_epi64(max_vec, gt, v);
+    }
+
+    int64_t tmp_min[8];
+    int64_t tmp_max[8];
+    _mm512_storeu_si512((void*)tmp_min, min_vec);
+    _mm512_storeu_si512((void*)tmp_max, max_vec);
+    for (int j = 0; j < 8; j++) {
+        if (tmp_min[j] < min_v) min_v = tmp_min[j];
+        if (tmp_max[j] > max_v) max_v = tmp_max[j];
+    }
+    for (; i < count; i++) {
+        if (values[i] < min_v) min_v = values[i];
+        if (values[i] > max_v) max_v = values[i];
+    }
+    *min_value = min_v;
+    *max_value = max_v;
+}
+
+void carquet_avx512_minmax_float(const float* values, int64_t count,
+                                  float* min_value, float* max_value) {
+    float min_v = values[0];
+    float max_v = values[0];
+    __m512 min_vec = _mm512_set1_ps(min_v);
+    __m512 max_vec = _mm512_set1_ps(max_v);
+    int64_t i = 1;
+
+    for (; i + 16 <= count; i += 16) {
+        __m512 v = _mm512_loadu_ps(values + i);
+        __mmask16 lt = _mm512_cmplt_ps_mask(v, min_vec);
+        __mmask16 gt = _mm512_cmp_ps_mask(v, max_vec, _CMP_GT_OQ);
+        min_vec = _mm512_mask_mov_ps(min_vec, lt, v);
+        max_vec = _mm512_mask_mov_ps(max_vec, gt, v);
+    }
+
+    float tmp_min[16];
+    float tmp_max[16];
+    _mm512_storeu_ps(tmp_min, min_vec);
+    _mm512_storeu_ps(tmp_max, max_vec);
+    for (int j = 0; j < 16; j++) {
+        if (tmp_min[j] < min_v) min_v = tmp_min[j];
+        if (tmp_max[j] > max_v) max_v = tmp_max[j];
+    }
+    for (; i < count; i++) {
+        if (values[i] < min_v) min_v = values[i];
+        if (values[i] > max_v) max_v = values[i];
+    }
+    *min_value = min_v;
+    *max_value = max_v;
+}
+
+void carquet_avx512_minmax_double(const double* values, int64_t count,
+                                   double* min_value, double* max_value) {
+    double min_v = values[0];
+    double max_v = values[0];
+    __m512d min_vec = _mm512_set1_pd(min_v);
+    __m512d max_vec = _mm512_set1_pd(max_v);
+    int64_t i = 1;
+
+    for (; i + 8 <= count; i += 8) {
+        __m512d v = _mm512_loadu_pd(values + i);
+        __mmask8 lt = _mm512_cmplt_pd_mask(v, min_vec);
+        __mmask8 gt = _mm512_cmp_pd_mask(v, max_vec, _CMP_GT_OQ);
+        min_vec = _mm512_mask_mov_pd(min_vec, lt, v);
+        max_vec = _mm512_mask_mov_pd(max_vec, gt, v);
+    }
+
+    double tmp_min[8];
+    double tmp_max[8];
+    _mm512_storeu_pd(tmp_min, min_vec);
+    _mm512_storeu_pd(tmp_max, max_vec);
+    for (int j = 0; j < 8; j++) {
+        if (tmp_min[j] < min_v) min_v = tmp_min[j];
+        if (tmp_max[j] > max_v) max_v = tmp_max[j];
+    }
+    for (; i < count; i++) {
+        if (values[i] < min_v) min_v = values[i];
+        if (values[i] > max_v) max_v = values[i];
+    }
+    *min_value = min_v;
+    *max_value = max_v;
 }
 
 /* ============================================================================

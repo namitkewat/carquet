@@ -44,17 +44,21 @@ extern void carquet_dispatch_build_null_bitmap(const int16_t* def_levels, int64_
                                                 int16_t max_def, uint8_t* bitmap);
 
 /* LZ4 internal functions */
-extern int carquet_lz4_compress(const uint8_t* src, size_t src_len,
-                                 uint8_t* dst, size_t dst_capacity);
-extern int carquet_lz4_decompress(const uint8_t* src, size_t src_len,
-                                   uint8_t* dst, size_t dst_capacity);
+extern carquet_status_t carquet_lz4_compress(const uint8_t* src, size_t src_len,
+                                              uint8_t* dst, size_t dst_capacity,
+                                              size_t* dst_size);
+extern carquet_status_t carquet_lz4_decompress(const uint8_t* src, size_t src_len,
+                                                uint8_t* dst, size_t dst_capacity,
+                                                size_t* dst_size);
 
 /* Snappy internal functions */
-extern size_t carquet_snappy_max_compressed_length(size_t source_length);
-extern int carquet_snappy_compress(const uint8_t* input, size_t input_length,
-                                    uint8_t* output, size_t* output_length);
-extern int carquet_snappy_decompress(const uint8_t* input, size_t input_length,
-                                      uint8_t* output, size_t* output_length);
+extern size_t carquet_snappy_compress_bound(size_t source_length);
+extern carquet_status_t carquet_snappy_compress(const uint8_t* input, size_t input_length,
+                                                 uint8_t* output, size_t output_capacity,
+                                                 size_t* output_length);
+extern carquet_status_t carquet_snappy_decompress(const uint8_t* input, size_t input_length,
+                                                    uint8_t* output, size_t output_capacity,
+                                                    size_t* output_length);
 
 /* ============================================================================
  * Timing
@@ -442,8 +446,9 @@ NOINLINE static void bench_lz4_compress(const uint8_t* input, size_t input_size,
 
     BENCH_START();
     for (int64_t iter = 0; iter < iterations; iter++) {
-        int compressed = carquet_lz4_compress(input, input_size, output, output_size);
-        g_sink = compressed;
+        size_t compressed_size = 0;
+        carquet_lz4_compress(input, input_size, output, output_size, &compressed_size);
+        g_sink = (int64_t)compressed_size;
     }
     double elapsed = BENCH_END();
 
@@ -459,8 +464,9 @@ NOINLINE static void bench_lz4_decompress(const uint8_t* compressed, size_t comp
 
     BENCH_START();
     for (int64_t iter = 0; iter < iterations; iter++) {
-        int decompressed = carquet_lz4_decompress(compressed, comp_size, output, output_size);
-        g_sink = decompressed;
+        size_t decompressed_size = 0;
+        carquet_lz4_decompress(compressed, comp_size, output, output_size, &decompressed_size);
+        g_sink = (int64_t)decompressed_size;
     }
     double elapsed = BENCH_END();
 
@@ -476,9 +482,9 @@ NOINLINE static void bench_snappy_compress(const uint8_t* input, size_t input_si
 
     BENCH_START();
     for (int64_t iter = 0; iter < iterations; iter++) {
-        size_t out_len = output_size;
-        int ret = carquet_snappy_compress(input, input_size, output, &out_len);
-        g_sink = ret;
+        size_t out_len = 0;
+        carquet_snappy_compress(input, input_size, output, output_size, &out_len);
+        g_sink = (int64_t)out_len;
     }
     double elapsed = BENCH_END();
 
@@ -504,16 +510,17 @@ static void run_compression_benchmarks(size_t size, int64_t iterations) {
     uint8_t* decompressed = malloc(size);
 
     /* LZ4 */
-    int comp_size = carquet_lz4_compress(input, size, compressed, max_compressed);
-    printf("LZ4 ratio: %.2fx\n", (double)size / comp_size);
+    size_t comp_size = 0;
+    carquet_lz4_compress(input, size, compressed, max_compressed, &comp_size);
+    printf("LZ4 ratio: %.2fx\n", (double)size / (double)comp_size);
     bench_lz4_compress(input, size, compressed, max_compressed, iterations);
     bench_lz4_decompress(compressed, comp_size, decompressed, size, iterations);
 
     printf("\n");
 
     /* Snappy */
-    size_t snappy_size = max_compressed;
-    carquet_snappy_compress(input, size, compressed, &snappy_size);
+    size_t snappy_size = 0;
+    carquet_snappy_compress(input, size, compressed, max_compressed, &snappy_size);
     printf("Snappy ratio: %.2fx\n", (double)size / snappy_size);
     bench_snappy_compress(input, size, compressed, max_compressed, iterations);
 

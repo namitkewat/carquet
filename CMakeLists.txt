@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(carquet VERSION 0.2.0 LANGUAGES C)
+project(carquet VERSION 0.3.0 LANGUAGES C)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -31,13 +31,21 @@ if(APPLE)
 endif()
 
 # Build options
-option(CARQUET_BUILD_TESTS "Build tests" ON)
+option(CARQUET_BUILD_DEV "Build all development targets (tests, examples, benchmarks)" OFF)
+option(CARQUET_BUILD_TESTS "Build tests" ${CARQUET_BUILD_DEV})
+option(CARQUET_BUILD_EXAMPLES "Build example programs" ${CARQUET_BUILD_DEV})
+option(CARQUET_BUILD_BENCHMARKS "Build benchmark and profiling programs" ${CARQUET_BUILD_DEV})
+option(CARQUET_BUILD_ARROW_CPP_BENCHMARK "Build the optional Arrow C++ comparison benchmark" OFF)
+option(CARQUET_BUILD_INTEROP "Build interoperability test programs" ${CARQUET_BUILD_DEV})
 option(CARQUET_BUILD_SHARED "Build shared library" OFF)
 option(CARQUET_ENABLE_SSE "Enable SSE optimizations" ON)
+option(CARQUET_ENABLE_AVX "Enable AVX optimizations" ON)
 option(CARQUET_ENABLE_AVX2 "Enable AVX2 optimizations" ON)
 option(CARQUET_ENABLE_AVX512 "Enable AVX-512 optimizations" ON)
 option(CARQUET_ENABLE_NEON "Enable NEON optimizations" ON)
 option(CARQUET_ENABLE_SVE "Enable SVE optimizations" OFF)
+set(CARQUET_ARROW_CPP_ROOT "" CACHE PATH
+    "Optional Arrow/Parquet install prefix used only for benchmark_arrow_cpp")
 
 # External compression libraries
 include(FetchContent)
@@ -47,8 +55,11 @@ include(FetchContent)
 find_package(zstd CONFIG QUIET)
 if(zstd_FOUND)
     message(STATUS "Found zstd via CMake config")
-    # zstd provides imported targets: zstd::libzstd_static or zstd::libzstd_shared
-    if(TARGET zstd::libzstd_static)
+    # When building a shared library, prefer shared deps to avoid -fPIC issues
+    # with static libraries that weren't compiled with -fPIC.
+    if(CARQUET_BUILD_SHARED AND TARGET zstd::libzstd_shared)
+        set(ZSTD_LIBRARIES zstd::libzstd_shared)
+    elseif(TARGET zstd::libzstd_static)
         set(ZSTD_LIBRARIES zstd::libzstd_static)
     elseif(TARGET zstd::libzstd_shared)
         set(ZSTD_LIBRARIES zstd::libzstd_shared)
@@ -99,6 +110,49 @@ else()
     set(ZLIB_INCLUDE_DIRS ${zlib_SOURCE_DIR} ${zlib_BINARY_DIR})
 endif()
 
+# Try to find system lz4 first, fetch if not found
+find_package(PkgConfig QUIET)
+if(PkgConfig_FOUND)
+    pkg_check_modules(LZ4 QUIET liblz4)
+endif()
+
+if(LZ4_FOUND)
+    message(STATUS "Found system liblz4")
+else()
+    # Try CMake config (vcpkg, conda, etc.)
+    find_package(lz4 CONFIG QUIET)
+    if(lz4_FOUND)
+        message(STATUS "Found lz4 via CMake config")
+        if(CARQUET_BUILD_SHARED AND TARGET LZ4::lz4_shared)
+            set(LZ4_LIBRARIES LZ4::lz4_shared)
+        elseif(TARGET LZ4::lz4_static)
+            set(LZ4_LIBRARIES LZ4::lz4_static)
+        elseif(TARGET LZ4::lz4_shared)
+            set(LZ4_LIBRARIES LZ4::lz4_shared)
+        elseif(TARGET lz4::lz4)
+            set(LZ4_LIBRARIES lz4::lz4)
+        endif()
+        set(LZ4_FOUND TRUE)
+    endif()
+endif()
+
+if(NOT LZ4_FOUND)
+    message(STATUS "Fetching lz4...")
+    FetchContent_Declare(
+        lz4
+        GIT_REPOSITORY https://github.com/lz4/lz4.git
+        GIT_TAG        v1.10.0
+        SOURCE_SUBDIR  build/cmake
+    )
+    set(LZ4_BUILD_CLI OFF CACHE BOOL "" FORCE)
+    set(LZ4_BUILD_LEGACY_LZ4C OFF CACHE BOOL "" FORCE)
+    set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+    set(BUILD_STATIC_LIBS ON CACHE BOOL "" FORCE)
+    FetchContent_MakeAvailable(lz4)
+    set(LZ4_LIBRARIES lz4_static)
+    set(LZ4_INCLUDE_DIRS ${lz4_SOURCE_DIR}/lib)
+endif()
+
 # Compiler detection
 if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
     set(CARQUET_COMPILER_GCC_LIKE TRUE)
@@ -130,7 +184,7 @@ if(CARQUET_COMPILER_GCC_LIKE)
 
     # Debug/Release flags
     set(CMAKE_C_FLAGS_DEBUG "-g -O0 -DCARQUET_DEBUG")
-    set(CMAKE_C_FLAGS_RELEASE "-O3 -DNDEBUG -flto")
+    set(CMAKE_C_FLAGS_RELEASE "-O3 -DNDEBUG -flto=auto")
     set(CMAKE_C_FLAGS_RELWITHDEBINFO "-O2 -g -DNDEBUG")
 
     # When using LTO, ensure ar/ranlib match the compiler toolchain
@@ -234,50 +288,90 @@ set(CARQUET_UTIL_SOURCES
     src/util/xxhash.c
 )
 
-# x86 SIMD sources (conditionally compiled)
+# x86 SIMD sources — only compile files for enabled instruction sets
 if(CARQUET_ARCH_X86)
-    set(CARQUET_SIMD_X86_SOURCES
-        src/simd/x86/sse_ops.c
-        src/simd/x86/avx2_ops.c
-        src/simd/x86/avx512_ops.c
-    )
+    # Auto-detect: disable AVX-512 if compiler lacks _mm512_set_epi8 (GCC < 9)
+    if(CARQUET_ENABLE_AVX512 AND CARQUET_COMPILER_GCC_LIKE)
+        include(CheckCSourceCompiles)
+        set(CMAKE_REQUIRED_FLAGS "-mavx512f -mavx512bw -mavx512vl")
+        check_c_source_compiles("
+            #include <immintrin.h>
+            int main(void) {
+                __m512i v = _mm512_set_epi8(
+                    0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,
+                    16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,
+                    32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,
+                    48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63);
+                (void)v; return 0;
+            }
+        " CARQUET_HAS_AVX512_INTRINSICS)
+        unset(CMAKE_REQUIRED_FLAGS)
+        if(NOT CARQUET_HAS_AVX512_INTRINSICS)
+            message(WARNING "Compiler lacks full AVX-512 intrinsic support — disabling AVX-512")
+            set(CARQUET_ENABLE_AVX512 OFF)
+        endif()
+    endif()
 
-    # Set architecture-specific compiler flags
-    if(CARQUET_COMPILER_GCC_LIKE)
-        set_source_files_properties(src/simd/x86/sse_ops.c PROPERTIES
-            COMPILE_FLAGS "-msse4.2")
-        set_source_files_properties(src/simd/x86/avx2_ops.c PROPERTIES
-            COMPILE_FLAGS "-mavx2 -mbmi2")
-        set_source_files_properties(src/simd/x86/avx512_ops.c PROPERTIES
-            COMPILE_FLAGS "-mavx512f -mavx512bw -mavx512vl")
-    elseif(CARQUET_COMPILER_MSVC)
-        # MSVC: SSE4.2 is enabled by default on x64, no flag needed
-        # AVX2 requires /arch:AVX2
-        set_source_files_properties(src/simd/x86/avx2_ops.c PROPERTIES
-            COMPILE_FLAGS "/arch:AVX2")
-        # AVX-512 requires /arch:AVX512
-        set_source_files_properties(src/simd/x86/avx512_ops.c PROPERTIES
-            COMPILE_FLAGS "/arch:AVX512")
+    set(CARQUET_SIMD_X86_SOURCES "")
+
+    if(CARQUET_ENABLE_SSE)
+        list(APPEND CARQUET_SIMD_X86_SOURCES src/simd/x86/sse_ops.c)
+        if(CARQUET_COMPILER_GCC_LIKE)
+            set_source_files_properties(src/simd/x86/sse_ops.c PROPERTIES
+                COMPILE_FLAGS "-msse4.2")
+        endif()
+    endif()
+
+    if(CARQUET_ENABLE_AVX)
+        list(APPEND CARQUET_SIMD_X86_SOURCES src/simd/x86/avx_ops.c)
+        if(CARQUET_COMPILER_GCC_LIKE)
+            set_source_files_properties(src/simd/x86/avx_ops.c PROPERTIES
+                COMPILE_FLAGS "-mavx -msse4.2")
+        endif()
+    endif()
+
+    if(CARQUET_ENABLE_AVX2)
+        list(APPEND CARQUET_SIMD_X86_SOURCES src/simd/x86/avx2_ops.c)
+        if(CARQUET_COMPILER_GCC_LIKE)
+            set_source_files_properties(src/simd/x86/avx2_ops.c PROPERTIES
+                COMPILE_FLAGS "-mavx2 -mbmi2")
+        elseif(CARQUET_COMPILER_MSVC)
+            set_source_files_properties(src/simd/x86/avx2_ops.c PROPERTIES
+                COMPILE_FLAGS "/arch:AVX2")
+        endif()
+    endif()
+
+    if(CARQUET_ENABLE_AVX512)
+        list(APPEND CARQUET_SIMD_X86_SOURCES src/simd/x86/avx512_ops.c)
+        if(CARQUET_COMPILER_GCC_LIKE)
+            set_source_files_properties(src/simd/x86/avx512_ops.c PROPERTIES
+                COMPILE_FLAGS "-mavx512f -mavx512bw -mavx512vl")
+        elseif(CARQUET_COMPILER_MSVC)
+            set_source_files_properties(src/simd/x86/avx512_ops.c PROPERTIES
+                COMPILE_FLAGS "/arch:AVX512")
+        endif()
     endif()
 endif()
 
-# ARM SIMD sources (conditionally compiled)
+# ARM SIMD sources — only compile files for enabled instruction sets
 if(CARQUET_ARCH_ARM)
-    set(CARQUET_SIMD_ARM_SOURCES
-        src/simd/arm/neon_ops.c
-        src/simd/arm/sve_ops.c
-        src/simd/arm/crc32_arm.c
-    )
+    set(CARQUET_SIMD_ARM_SOURCES "")
 
-    if(CARQUET_COMPILER_GCC_LIKE AND CARQUET_ENABLE_SVE)
-        set_source_files_properties(src/simd/arm/sve_ops.c PROPERTIES
-            COMPILE_FLAGS "-march=armv8-a+sve")
+    if(CARQUET_ENABLE_NEON)
+        list(APPEND CARQUET_SIMD_ARM_SOURCES src/simd/arm/neon_ops.c)
+        list(APPEND CARQUET_SIMD_ARM_SOURCES src/simd/arm/crc32_arm.c)
+        if(CARQUET_COMPILER_GCC_LIKE)
+            set_source_files_properties(src/simd/arm/crc32_arm.c PROPERTIES
+                COMPILE_FLAGS "-march=armv8-a+crc")
+        endif()
     endif()
 
-    # Enable ARM CRC32 instructions
-    if(CARQUET_COMPILER_GCC_LIKE)
-        set_source_files_properties(src/simd/arm/crc32_arm.c PROPERTIES
-            COMPILE_FLAGS "-march=armv8-a+crc")
+    if(CARQUET_ENABLE_SVE)
+        list(APPEND CARQUET_SIMD_ARM_SOURCES src/simd/arm/sve_ops.c)
+        if(CARQUET_COMPILER_GCC_LIKE)
+            set_source_files_properties(src/simd/arm/sve_ops.c PROPERTIES
+                COMPILE_FLAGS "-march=armv8-a+sve")
+        endif()
     endif()
 endif()
 
@@ -323,13 +417,21 @@ target_include_directories(carquet
         ${CMAKE_CURRENT_SOURCE_DIR}/src
         ${ZSTD_INCLUDE_DIRS}
         ${ZLIB_INCLUDE_DIRS}
+        ${LZ4_INCLUDE_DIRS}
 )
 
 # Link external compression libraries
 if(ZLIB_FOUND)
-    target_link_libraries(carquet PRIVATE ${ZSTD_LIBRARIES} ZLIB::ZLIB)
+    target_link_libraries(carquet PRIVATE ${ZSTD_LIBRARIES} ZLIB::ZLIB ${LZ4_LIBRARIES})
 else()
-    target_link_libraries(carquet PRIVATE ${ZSTD_LIBRARIES} ${ZLIB_LIBRARIES})
+    target_link_libraries(carquet PRIVATE ${ZSTD_LIBRARIES} ${ZLIB_LIBRARIES} ${LZ4_LIBRARIES})
+endif()
+
+# Link libm for math functions (bloom_filter.c uses log())
+# PUBLIC so that consumers of the shared library also link -lm; on some toolchains
+# (RHEL with --no-copy-dt-needed-entries) PRIVATE alone is not sufficient.
+if(UNIX)
+    target_link_libraries(carquet PUBLIC m)
 endif()
 
 # Link OpenMP for parallel column reading
@@ -342,6 +444,9 @@ if(CARQUET_ARCH_X86)
     target_compile_definitions(carquet PRIVATE CARQUET_ARCH_X86)
     if(CARQUET_ENABLE_SSE)
         target_compile_definitions(carquet PRIVATE CARQUET_ENABLE_SSE)
+    endif()
+    if(CARQUET_ENABLE_AVX)
+        target_compile_definitions(carquet PRIVATE CARQUET_ENABLE_AVX)
     endif()
     if(CARQUET_ENABLE_AVX2)
         target_compile_definitions(carquet PRIVATE CARQUET_ENABLE_AVX2)
@@ -371,7 +476,11 @@ if(CARQUET_BUILD_TESTS)
         target_link_libraries(${TEST_NAME} PRIVATE carquet)
         target_include_directories(${TEST_NAME} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
         # Tests use assert() for validation — keep assertions enabled in all build types
-        target_compile_options(${TEST_NAME} PRIVATE -UNDEBUG)
+        if(MSVC)
+            target_compile_options(${TEST_NAME} PRIVATE /UNDEBUG)
+        else()
+            target_compile_options(${TEST_NAME} PRIVATE -UNDEBUG)
+        endif()
         if(CARQUET_COMPILER_GCC_LIKE)
             target_compile_options(${TEST_NAME} PRIVATE -Wno-unused-result)
         endif()
@@ -407,7 +516,6 @@ if(CARQUET_BUILD_TESTS)
 endif()
 
 # Examples
-option(CARQUET_BUILD_EXAMPLES "Build examples" ON)
 if(CARQUET_BUILD_EXAMPLES)
     # Helper function to configure example targets
     function(add_carquet_example EXAMPLE_NAME EXAMPLE_SOURCE)
@@ -425,7 +533,6 @@ if(CARQUET_BUILD_EXAMPLES)
 endif()
 
 # Benchmarks
-option(CARQUET_BUILD_BENCHMARKS "Build benchmarks" ON)
 if(CARQUET_BUILD_BENCHMARKS)
     add_executable(benchmark_carquet benchmark/benchmark_carquet.c)
     target_link_libraries(benchmark_carquet PRIVATE carquet)
@@ -441,6 +548,62 @@ if(CARQUET_BUILD_BENCHMARKS)
     target_link_libraries(generate_test_files PRIVATE carquet)
     if(CARQUET_COMPILER_GCC_LIKE)
         target_compile_options(generate_test_files PRIVATE -Wno-unused-result)
+    endif()
+
+    if(CARQUET_BUILD_ARROW_CPP_BENCHMARK)
+        include(CheckLanguage)
+        check_language(CXX)
+        if(CMAKE_CXX_COMPILER)
+            enable_language(CXX)
+
+            if(CARQUET_ARROW_CPP_ROOT)
+                find_package(Arrow CONFIG QUIET PATHS ${CARQUET_ARROW_CPP_ROOT})
+                find_package(Parquet CONFIG QUIET PATHS ${CARQUET_ARROW_CPP_ROOT})
+            endif()
+
+            if(NOT Arrow_FOUND)
+                find_package(Arrow CONFIG QUIET)
+            endif()
+            if(NOT Parquet_FOUND)
+                find_package(Parquet CONFIG QUIET)
+            endif()
+
+            set(CARQUET_ARROW_TARGET "")
+            set(CARQUET_PARQUET_TARGET "")
+            if(TARGET Arrow::arrow_shared)
+                set(CARQUET_ARROW_TARGET Arrow::arrow_shared)
+            elseif(TARGET Arrow::arrow_static)
+                set(CARQUET_ARROW_TARGET Arrow::arrow_static)
+            endif()
+            if(TARGET Parquet::parquet_shared)
+                set(CARQUET_PARQUET_TARGET Parquet::parquet_shared)
+            elseif(TARGET Parquet::parquet_static)
+                set(CARQUET_PARQUET_TARGET Parquet::parquet_static)
+            endif()
+
+            if(CARQUET_ARROW_TARGET AND CARQUET_PARQUET_TARGET)
+                add_executable(benchmark_arrow_cpp benchmark/benchmark_arrow_cpp.cpp)
+                target_link_libraries(benchmark_arrow_cpp PRIVATE
+                    ${CARQUET_PARQUET_TARGET}
+                    ${CARQUET_ARROW_TARGET}
+                )
+                set_target_properties(benchmark_arrow_cpp PROPERTIES
+                    CXX_STANDARD 20
+                    CXX_STANDARD_REQUIRED YES
+                )
+                if(CARQUET_COMPILER_GCC_LIKE)
+                    target_compile_options(benchmark_arrow_cpp PRIVATE -Wno-unused-result)
+                endif()
+            else()
+                message(STATUS
+                    "Skipping benchmark_arrow_cpp: Arrow/Parquet C++ libraries were not found. "
+                    "Install system packages or configure -DCARQUET_ARROW_CPP_ROOT=/path/to/prefix. "
+                    "The benchmark remains fully opt-in to keep normal builds lean.")
+            endif()
+        else()
+            message(STATUS
+                "Skipping benchmark_arrow_cpp: no C++ compiler available for the optional Arrow C++ benchmark.")
+        endif()
     endif()
 
     # Profiling benchmark for CPU profiling (sample, Instruments, perf)
@@ -464,6 +627,24 @@ if(CARQUET_BUILD_BENCHMARKS)
         target_include_directories(profile_micro PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
         if(NOT APPLE)
             target_link_libraries(profile_micro PRIVATE m)
+        endif()
+    endif()
+endif()
+
+# Interoperability tests
+if(CARQUET_BUILD_INTEROP)
+    if(NOT WIN32)
+        add_executable(test_interop interop/test_interop.c)
+        target_link_libraries(test_interop PRIVATE carquet)
+        target_include_directories(test_interop PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        if(CARQUET_COMPILER_GCC_LIKE)
+            target_compile_options(test_interop PRIVATE -Wno-unused-result)
+        endif()
+
+        add_executable(roundtrip_writer interop/roundtrip_writer.c)
+        target_link_libraries(roundtrip_writer PRIVATE carquet)
+        if(CARQUET_COMPILER_GCC_LIKE)
+            target_compile_options(roundtrip_writer PRIVATE -Wno-unused-result)
         endif()
     endif()
 endif()

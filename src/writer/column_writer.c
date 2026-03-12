@@ -77,9 +77,17 @@ extern carquet_status_t carquet_page_writer_finalize(
     size_t* page_size,
     int32_t* uncompressed_size,
     int32_t* compressed_size);
+extern carquet_status_t carquet_page_writer_finalize_to_buffer(
+    carquet_page_writer_t* writer,
+    carquet_buffer_t* output_buffer,
+    size_t* page_size,
+    int32_t* uncompressed_size,
+    int32_t* compressed_size);
 
 extern size_t carquet_page_writer_estimated_size(const carquet_page_writer_t* writer);
 extern int64_t carquet_page_writer_num_values(const carquet_page_writer_t* writer);
+extern void carquet_page_writer_set_crc(carquet_page_writer_t* writer, bool enabled);
+extern void carquet_page_writer_set_statistics(carquet_page_writer_t* writer, bool enabled);
 
 /* ============================================================================
  * Column Writer Structure
@@ -121,10 +129,12 @@ typedef struct carquet_column_writer_internal {
 
     /* Bloom filter (optional) */
     carquet_bloom_filter_t* bloom_filter;
+    int64_t bloom_ndv;
 
     /* Page index builders (optional) */
     carquet_column_index_builder_t* column_index;
     carquet_offset_index_builder_t* offset_index;
+    bool page_index_enabled;
     int64_t page_row_offset;      /* Row offset for current page (for offset index) */
     int64_t column_file_offset;   /* File offset where this column starts */
 } carquet_column_writer_internal_t;
@@ -199,6 +209,50 @@ void carquet_column_writer_destroy(carquet_column_writer_internal_t* writer) {
     }
 }
 
+void carquet_column_writer_set_crc(carquet_column_writer_internal_t* writer, bool enabled) {
+    if (writer) {
+        carquet_page_writer_set_crc(writer->page_writer, enabled);
+    }
+}
+
+void carquet_column_writer_reset(carquet_column_writer_internal_t* writer) {
+    if (!writer) return;
+
+    carquet_page_writer_reset(writer->page_writer);
+    carquet_buffer_clear(&writer->column_buffer);
+
+    writer->total_values = 0;
+    writer->total_nulls = 0;
+    writer->total_uncompressed_size = 0;
+    writer->total_compressed_size = 0;
+    writer->num_pages = 0;
+    writer->has_min_max = false;
+    writer->min_max_size = 0;
+    writer->page_row_offset = 0;
+    writer->column_file_offset = 0;
+
+    if (writer->bloom_filter) {
+        carquet_bloom_filter_destroy(writer->bloom_filter);
+        writer->bloom_filter = NULL;
+    }
+    if (writer->bloom_ndv > 0) {
+        writer->bloom_filter = carquet_bloom_filter_create_with_ndv(writer->bloom_ndv, 0.01);
+    }
+
+    if (writer->column_index) {
+        carquet_column_index_builder_destroy(writer->column_index);
+        writer->column_index = NULL;
+    }
+    if (writer->offset_index) {
+        carquet_offset_index_builder_destroy(writer->offset_index);
+        writer->offset_index = NULL;
+    }
+    if (writer->page_index_enabled) {
+        writer->column_index = carquet_column_index_builder_create(writer->type, writer->type_length);
+        writer->offset_index = carquet_offset_index_builder_create(true);
+    }
+}
+
 /* ============================================================================
  * Page Flushing
  * ============================================================================
@@ -216,7 +270,6 @@ static carquet_status_t flush_current_page(carquet_column_writer_internal_t* wri
         return CARQUET_OK;
     }
 
-    const uint8_t* page_data;
     size_t page_size;
     int32_t uncompressed_size;
     int32_t compressed_size;
@@ -233,8 +286,9 @@ static carquet_status_t flush_current_page(carquet_column_writer_internal_t* wri
             writer->page_writer, &page_min, &page_max, &stat_size, &page_null_count);
     }
 
-    carquet_status_t status = carquet_page_writer_finalize(
-        writer->page_writer, &page_data, &page_size,
+    size_t page_start = writer->column_buffer.size;
+    carquet_status_t status = carquet_page_writer_finalize_to_buffer(
+        writer->page_writer, &writer->column_buffer, &page_size,
         &uncompressed_size, &compressed_size);
 
     if (status != CARQUET_OK) {
@@ -255,7 +309,7 @@ static carquet_status_t flush_current_page(carquet_column_writer_internal_t* wri
 
     if (writer->offset_index) {
         /* Page offset = column's file offset + current buffer position (before append) */
-        int64_t page_offset = writer->column_file_offset + (int64_t)writer->column_buffer.size;
+        int64_t page_offset = writer->column_file_offset + (int64_t)page_start;
         carquet_offset_index_add_page(
             writer->offset_index,
             page_offset,
@@ -263,12 +317,6 @@ static carquet_status_t flush_current_page(carquet_column_writer_internal_t* wri
             writer->page_row_offset,
             uncompressed_size);
         writer->page_row_offset += carquet_page_writer_num_values(writer->page_writer);
-    }
-
-    /* Append page to column buffer */
-    status = carquet_buffer_append(&writer->column_buffer, page_data, page_size);
-    if (status != CARQUET_OK) {
-        return status;
     }
 
     /* Update statistics */
@@ -460,6 +508,14 @@ carquet_status_t carquet_column_writer_finalize(
     return CARQUET_OK;
 }
 
+void carquet_column_writer_set_statistics(
+    carquet_column_writer_internal_t* writer,
+    bool enabled) {
+    if (writer && writer->page_writer) {
+        carquet_page_writer_set_statistics(writer->page_writer, enabled);
+    }
+}
+
 int64_t carquet_column_writer_num_values(const carquet_column_writer_internal_t* writer) {
     return writer ? writer->total_values : 0;
 }
@@ -471,13 +527,15 @@ int32_t carquet_column_writer_num_pages(const carquet_column_writer_internal_t* 
 void carquet_column_writer_enable_bloom_filter(
     carquet_column_writer_internal_t* writer, int64_t ndv) {
     if (!writer || writer->bloom_filter) return;
+    writer->bloom_ndv = ndv > 0 ? ndv : 100000;
     writer->bloom_filter = carquet_bloom_filter_create_with_ndv(
-        ndv > 0 ? ndv : 100000, 0.01);
+        writer->bloom_ndv, 0.01);
 }
 
 void carquet_column_writer_enable_page_index(
     carquet_column_writer_internal_t* writer) {
     if (!writer) return;
+    writer->page_index_enabled = true;
     if (!writer->column_index) {
         writer->column_index = carquet_column_index_builder_create(
             writer->type, writer->type_length);

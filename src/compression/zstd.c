@@ -14,116 +14,123 @@
 #include <omp.h>
 #endif
 
-/*
- * Thread-local storage compatibility:
- * - __thread requires macOS 10.7+ / iOS 9.0+
- * - For older targets, use pthread-based TLS
- */
-#if defined(__APPLE__)
-#include <AvailabilityMacros.h>
-#if defined(MAC_OS_X_VERSION_MIN_REQUIRED) && MAC_OS_X_VERSION_MIN_REQUIRED < 1070
-#define CARQUET_USE_PTHREAD_TLS 1
-#endif
-#endif
+/* ============================================================================
+ * Thread-local ZSTD context management
+ *
+ * ZSTD contexts are expensive to create (~650KB each) so we cache them per
+ * thread.  The challenge is cleanup: __thread / __declspec(thread) have no
+ * destructor, so contexts allocated by OMP worker threads leak when the
+ * thread pool is torn down.
+ *
+ * Strategy:
+ *   POSIX + OpenMP  → pthread_key_create with destructors.  The pthread
+ *                      runtime calls the destructor when each thread exits,
+ *                      including OMP worker threads joined by libgomp's
+ *                      atexit handler.
+ *   MSVC + OpenMP   → __declspec(thread) with explicit carquet_zstd_cleanup.
+ *   No OpenMP       → plain global statics with explicit carquet_zstd_cleanup.
+ *
+ * carquet_cleanup() (public API) calls carquet_zstd_cleanup() for the
+ * calling thread.  On POSIX+OMP the worker-thread contexts are freed
+ * automatically; on MSVC+OMP callers must arrange per-thread cleanup.
+ * ============================================================================ */
 
-/* Thread-local decompression contexts for parallel column reading */
 #ifdef _OPENMP
 
-#if defined(CARQUET_USE_PTHREAD_TLS)
-/* Use pthread TLS for older macOS (< 10.7) */
+#if !defined(_MSC_VER)
+/* ---- POSIX + OpenMP: pthread_key with destructors ---- */
 #include <pthread.h>
 
 static pthread_key_t tls_dctx_key;
-static pthread_once_t tls_dctx_once = PTHREAD_ONCE_INIT;
 static pthread_key_t tls_cctx_key;
-static pthread_once_t tls_cctx_once = PTHREAD_ONCE_INIT;
+static pthread_once_t tls_keys_once = PTHREAD_ONCE_INIT;
 
 static void destroy_dctx(void* ctx) {
-    if (ctx) {
-        ZSTD_freeDCtx((ZSTD_DCtx*)ctx);
-    }
+    if (ctx) ZSTD_freeDCtx((ZSTD_DCtx*)ctx);
 }
 
 static void destroy_cctx(void* ctx) {
-    if (ctx) {
-        ZSTD_freeCCtx((ZSTD_CCtx*)ctx);
-    }
+    if (ctx) ZSTD_freeCCtx((ZSTD_CCtx*)ctx);
 }
 
-static void init_tls_key(void) {
+static void init_tls_keys(void) {
     pthread_key_create(&tls_dctx_key, destroy_dctx);
-}
-
-static void init_cctx_key(void) {
     pthread_key_create(&tls_cctx_key, destroy_cctx);
 }
 
 static ZSTD_DCtx* get_dctx(void) {
-    pthread_once(&tls_dctx_once, init_tls_key);
+    pthread_once(&tls_keys_once, init_tls_keys);
     ZSTD_DCtx* dctx = (ZSTD_DCtx*)pthread_getspecific(tls_dctx_key);
     if (!dctx) {
         dctx = ZSTD_createDCtx();
-        if (dctx) {
-            pthread_setspecific(tls_dctx_key, dctx);
-        }
+        if (dctx) pthread_setspecific(tls_dctx_key, dctx);
     }
     return dctx;
 }
 
 static ZSTD_CCtx* get_cctx(void) {
-    pthread_once(&tls_cctx_once, init_cctx_key);
+    pthread_once(&tls_keys_once, init_tls_keys);
     ZSTD_CCtx* cctx = (ZSTD_CCtx*)pthread_getspecific(tls_cctx_key);
     if (!cctx) {
         cctx = ZSTD_createCCtx();
-        if (cctx) {
-            pthread_setspecific(tls_cctx_key, cctx);
-        }
+        if (cctx) pthread_setspecific(tls_cctx_key, cctx);
     }
     return cctx;
 }
 
+void carquet_zstd_cleanup(void) {
+    pthread_once(&tls_keys_once, init_tls_keys);
+    ZSTD_DCtx* dctx = (ZSTD_DCtx*)pthread_getspecific(tls_dctx_key);
+    if (dctx) {
+        ZSTD_freeDCtx(dctx);
+        pthread_setspecific(tls_dctx_key, NULL);
+    }
+    ZSTD_CCtx* cctx = (ZSTD_CCtx*)pthread_getspecific(tls_cctx_key);
+    if (cctx) {
+        ZSTD_freeCCtx(cctx);
+        pthread_setspecific(tls_cctx_key, NULL);
+    }
+}
+
 #else
-/* Use thread-local storage for modern systems */
-#ifdef _MSC_VER
+/* ---- MSVC + OpenMP: __declspec(thread) with explicit cleanup ---- */
 static __declspec(thread) ZSTD_DCtx* tls_dctx = NULL;
 static __declspec(thread) ZSTD_CCtx* tls_cctx = NULL;
-#else
-static __thread ZSTD_DCtx* tls_dctx = NULL;
-static __thread ZSTD_CCtx* tls_cctx = NULL;
-#endif
 
 static ZSTD_DCtx* get_dctx(void) {
-    if (!tls_dctx) {
-        tls_dctx = ZSTD_createDCtx();
-    }
+    if (!tls_dctx) tls_dctx = ZSTD_createDCtx();
     return tls_dctx;
 }
 
 static ZSTD_CCtx* get_cctx(void) {
-    if (!tls_cctx) {
-        tls_cctx = ZSTD_createCCtx();
-    }
+    if (!tls_cctx) tls_cctx = ZSTD_createCCtx();
     return tls_cctx;
 }
-#endif /* CARQUET_USE_PTHREAD_TLS */
+
+void carquet_zstd_cleanup(void) {
+    if (tls_dctx) { ZSTD_freeDCtx(tls_dctx); tls_dctx = NULL; }
+    if (tls_cctx) { ZSTD_freeCCtx(tls_cctx); tls_cctx = NULL; }
+}
+#endif /* !_MSC_VER */
 
 #else
-/* No OpenMP - use global contexts */
+/* ---- No OpenMP: global contexts ---- */
 static ZSTD_DCtx* global_dctx = NULL;
 static ZSTD_CCtx* global_cctx = NULL;
 
 static ZSTD_DCtx* get_dctx(void) {
-    if (!global_dctx) {
-        global_dctx = ZSTD_createDCtx();
-    }
+    if (!global_dctx) global_dctx = ZSTD_createDCtx();
     return global_dctx;
 }
 
 static ZSTD_CCtx* get_cctx(void) {
-    if (!global_cctx) {
-        global_cctx = ZSTD_createCCtx();
-    }
+    if (!global_cctx) global_cctx = ZSTD_createCCtx();
     return global_cctx;
+}
+
+void carquet_zstd_cleanup(void) {
+    if (global_dctx) { ZSTD_freeDCtx(global_dctx); global_dctx = NULL; }
+    if (global_cctx) { ZSTD_freeCCtx(global_cctx); global_cctx = NULL; }
 }
 #endif /* _OPENMP */
 

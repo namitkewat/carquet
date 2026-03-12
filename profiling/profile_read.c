@@ -187,12 +187,15 @@ static carquet_schema_t* create_test_schema(int nullable, carquet_error_t* err) 
     carquet_field_repetition_t rep = nullable ? CARQUET_REPETITION_OPTIONAL : CARQUET_REPETITION_REQUIRED;
 
     /* Comprehensive set of column types to exercise all paths */
-    (void)carquet_schema_add_column(schema, "id", CARQUET_PHYSICAL_INT64, NULL,
-                                    CARQUET_REPETITION_REQUIRED, 0, 0);
-    (void)carquet_schema_add_column(schema, "int64_col", CARQUET_PHYSICAL_INT64, NULL, rep, 0, 0);
-    (void)carquet_schema_add_column(schema, "double_col", CARQUET_PHYSICAL_DOUBLE, NULL, rep, 0, 0);
-    (void)carquet_schema_add_column(schema, "int32_col", CARQUET_PHYSICAL_INT32, NULL, rep, 0, 0);
-    (void)carquet_schema_add_column(schema, "float_col", CARQUET_PHYSICAL_FLOAT, NULL, rep, 0, 0);
+    if (carquet_schema_add_column(schema, "id", CARQUET_PHYSICAL_INT64, NULL,
+                                  CARQUET_REPETITION_REQUIRED, 0, 0) != CARQUET_OK ||
+        carquet_schema_add_column(schema, "int64_col", CARQUET_PHYSICAL_INT64, NULL, rep, 0, 0) != CARQUET_OK ||
+        carquet_schema_add_column(schema, "double_col", CARQUET_PHYSICAL_DOUBLE, NULL, rep, 0, 0) != CARQUET_OK ||
+        carquet_schema_add_column(schema, "int32_col", CARQUET_PHYSICAL_INT32, NULL, rep, 0, 0) != CARQUET_OK ||
+        carquet_schema_add_column(schema, "float_col", CARQUET_PHYSICAL_FLOAT, NULL, rep, 0, 0) != CARQUET_OK) {
+        carquet_schema_free(schema);
+        return NULL;
+    }
 
     return schema;
 }
@@ -246,20 +249,23 @@ static double write_test_file(const profile_config_t* config, const test_data_t*
         for (int64_t i = 0; i < to_write; i++) {
             ids[i] = offset + i;
         }
-        (void)carquet_writer_write_batch(writer, 0, ids, to_write, NULL, NULL);
+        if (carquet_writer_write_batch(writer, 0, ids, to_write, NULL, NULL) != CARQUET_OK) {
+            free(ids);
+            if (carquet_writer_close(writer) != CARQUET_OK) { /* best-effort cleanup */ }
+            carquet_schema_free(schema);
+            return -1;
+        }
         free(ids);
 
-        /* Column 1: int64_col */
-        (void)carquet_writer_write_batch(writer, 1, data->int64_data + offset, to_write, def, NULL);
-
-        /* Column 2: double_col */
-        (void)carquet_writer_write_batch(writer, 2, data->double_data + offset, to_write, def, NULL);
-
-        /* Column 3: int32_col */
-        (void)carquet_writer_write_batch(writer, 3, data->int32_data + offset, to_write, def, NULL);
-
-        /* Column 4: float_col */
-        (void)carquet_writer_write_batch(writer, 4, data->float_data + offset, to_write, def, NULL);
+        /* Columns 1-4 */
+        if (carquet_writer_write_batch(writer, 1, data->int64_data + offset, to_write, def, NULL) != CARQUET_OK ||
+            carquet_writer_write_batch(writer, 2, data->double_data + offset, to_write, def, NULL) != CARQUET_OK ||
+            carquet_writer_write_batch(writer, 3, data->int32_data + offset, to_write, def, NULL) != CARQUET_OK ||
+            carquet_writer_write_batch(writer, 4, data->float_data + offset, to_write, def, NULL) != CARQUET_OK) {
+            if (carquet_writer_close(writer) != CARQUET_OK) { /* best-effort cleanup */ }
+            carquet_schema_free(schema);
+            return -1;
+        }
 
         offset += to_write;
         remaining -= to_write;

@@ -1,164 +1,295 @@
-# Carquet
+<p align="center">
+  <img src="res/img/carquet_logo.png" alt="Carquet" width="280" />
+</p>
 
-[![Build](https://github.com/Vitruves/carquet/actions/workflows/cpp.yml/badge.svg)](https://github.com/Vitruves/carquet/actions/workflows/cpp.yml)
-![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-blue)
-![C Standard](https://img.shields.io/badge/C-C11-blue)
-[![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+<h1 align="center">Carquet</h1>
 
-A fast, pure C library for reading and writing Apache Parquet files.
+<p align="center">
+  A fast, pure C library for reading and writing Apache Parquet files.
+</p>
 
-<img width="1792" height="592" alt="carquet" src="https://github.com/user-attachments/assets/ef669e62-6cf0-4dc0-9de8-dd2ab5afaeb3" />
+<p align="center">
+  <a href="https://github.com/Vitruves/carquet/actions/workflows/cpp.yml"><img src="https://github.com/Vitruves/carquet/actions/workflows/cpp.yml/badge.svg" alt="Build" /></a>
+  <img src="https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-blue" alt="Platform" />
+  <img src="https://img.shields.io/badge/C-C11-blue" alt="C Standard" />
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green" alt="License" /></a>
+  <br/>
+  <img src="https://img.shields.io/badge/SIMD-SSE4.2%20%7C%20AVX%20%7C%20AVX2%20%7C%20AVX--512-red" alt="x86 SIMD" />
+  <img src="https://img.shields.io/badge/SIMD-NEON%20%7C%20SVE-orange" alt="ARM SIMD" />
+</p>
 
+## Highlights
 
-## Why Carquet?
+- **Pure C11** with three external dependencies (zstd, zlib, lz4) -- all auto-fetched by CMake
+- **~200KB binary** vs ~50MB+ for Arrow
+- **Compressed reads 1.5-2.1x faster** than Arrow C++ on x86 (snappy, zstd, lz4)
+- **Writes 1.3-2.5x faster** than Arrow C++ and PyArrow on ARM
+- Full Parquet spec: all types, encodings, compression codecs, nested schemas, bloom filters, page indexes
+- SIMD-optimized (SSE4.2, AVX2, AVX-512, NEON, SVE) with runtime detection and scalar fallbacks
+- PyArrow, DuckDB, Spark compatible out of the box
 
-Carquet brings full Parquet support to C for the first time. It reads and writes all standard Parquet features (nested types, all encodings, all compression codecs, bloom filters, page indexes) while being significantly faster than PyArrow on ARM and competitive on x86.
+## Performance
 
-| Aspect | Arrow Parquet | Carquet |
-|--------|---------------|---------|
-| Language | C++ | **Pure C11** |
-| Dependencies | Many (Boost, etc.) | **zstd + zlib only** |
-| Binary size | ~50MB+ | **~200KB** |
-| Write speed (ARM) | Baseline | **1.1-2.1x faster** |
-| Write speed (x86) | Baseline | **1.2-1.4x faster** |
-| Read speed (ARM) | Baseline | **up to 9x faster** |
-| Read speed (x86) | Baseline | 0.5-0.7x slower |
-| ZSTD file size | Baseline | **~10% smaller** |
-| Nested types | Full support | Full support |
-| Bloom filters | Yes | Yes |
-| Page indexes | Yes | Yes |
-| Encryption | Yes | No |
+All benchmarks use identical data (deterministic LCG PRNG), identical Parquet settings (no dictionary, BYTE_STREAM_SPLIT for floats, page checksums, mmap reads), trimmed median of 11-51 iterations, with OS page cache purged between write and read phases and cooldown between configurations. Schema: 3 columns (INT64, DOUBLE, INT32). Compared against Arrow C++ 23.0.1 (native C++) and PyArrow 23.0.0/23.0.1 (Python bindings to the same C++ library).
 
-### Use Cases
+### x86: Intel Xeon D-1531 (Linux)
 
-- **Embedded systems** - No C++ runtime, no exceptions, minimal dependencies
-- **C codebases** - Native integration without FFI or language bridges
-- **Minimal binaries** - ~200KB vs ~50MB+ for Arrow
-- **Performance-sensitive paths** - Faster reads on ARM, competitive writes everywhere
-- **Constrained environments** - IoT, microcontrollers, legacy systems
+*12 threads @ 2.7GHz, 32GB RAM, Ubuntu 24.04 -- ZSTD level 1*
 
-## Features
+#### Compressed reads: the headline result
 
-- **Pure C11** - Only external dependencies are zstd and zlib (auto-fetched by CMake if missing). Snappy and LZ4 are internal implementations.
-- **Portable** - Works on any architecture. SIMD optimizations (SSE4.2, AVX2, AVX-512, NEON, SVE) with automatic runtime detection and scalar fallbacks. ARM CRC32 hardware acceleration.
-- **Big-Endian Support** - Proper byte-order handling for s390x, SPARC, PowerPC, etc.
-- **Parquet Support**:
-  - All physical types (BOOLEAN, INT32, INT64, INT96, FLOAT, DOUBLE, BYTE_ARRAY, FIXED_LEN_BYTE_ARRAY)
-  - All encodings (PLAIN, RLE, DICTIONARY, DELTA_BINARY_PACKED, DELTA_LENGTH_BYTE_ARRAY, BYTE_STREAM_SPLIT)
-  - All compression codecs (UNCOMPRESSED, SNAPPY, GZIP, LZ4, ZSTD)
-  - Nullable columns with definition levels
-  - Full nested schema support (groups, lists, maps, definition/repetition levels)
-- **Production Features**:
-  - CRC32 page verification for data integrity (hardware-accelerated on ARM)
-  - Column statistics for predicate pushdown
-  - Bloom filters for efficient value lookups
-  - Page indexes (column index + offset index) for page-level pruning
-  - Memory-mapped I/O with zero-copy reads
-  - Column projection for efficient reads
-  - OpenMP parallel column reading (when available)
-- **Streaming API** - Read and write large files without loading everything into memory
-- **PyArrow Compatible** - Full interoperability with Python's PyArrow library
+These numbers reflect full decompression + decoding of every value -- no shortcuts.
 
-### Current Limitations
+| | 100M rows | | 10M rows | | 1M rows | |
+|--------|-----------|-------|----------|-------|---------|-------|
+| **Codec** | **Carquet** | **vs Arrow C++** | **Carquet** | **vs Arrow C++** | **Carquet** | **vs Arrow C++** |
+| snappy | 1939ms | **1.4x** | 147ms | **2.1x** | 17ms | **2.1x** |
+| zstd | 1653ms | **1.4x** | 168ms | **1.5x** | 17ms | **1.5x** |
+| lz4 | — | — | 68ms | **2.0x** | 6.4ms | **1.7x** |
 
-- No encryption support
+Carquet reads compressed Parquet **1.5-2.1x faster than Arrow C++** across every codec and dataset size tested. Snappy and LZ4 show the largest advantage (~2x at 10M rows) while ZSTD is consistently ~1.5x faster.
 
-## Table of Contents
+#### Full results vs Arrow C++ (10M rows)
 
-- [Features](#features)
-- [Building](#building)
-- [Quick Start](#quick-start)
-- [Reading Parquet Files](#reading-parquet-files)
-- [Writing Parquet Files](#writing-parquet-files)
-- [Schema API](#schema-api)
-- [Compression](#compression)
-- [Batch Reading](#batch-reading)
-- [Error Handling](#error-handling)
-- [Memory Management](#memory-management)
-- [API Reference](#api-reference)
-- [Examples](#examples)
-- [Interoperability](#interoperability)
-- [Performance](#performance)
+| Codec | Carquet Write | Arrow C++ Write | W ratio | Carquet Read | Arrow C++ Read | R ratio | Size |
+|-------|--------------|-----------------|---------|-------------|----------------|---------|------|
+| none | 855ms | 833ms | 0.97x | **30ms** | 105ms | **3.5x**\* | 190.7MB |
+| snappy | 1093ms | 980ms | 0.90x | **147ms** | 301ms | **2.1x** | 125.2MB |
+| zstd | **1483ms** | 1569ms | **1.06x** | **168ms** | 254ms | **1.5x** | 95.3MB |
+| lz4 | 1526ms | 1527ms | 1.00x | **68ms** | 138ms | **2.0x** | 122.9MB |
+
+\* Uncompressed reads use mmap zero-copy (see note below). Compressed reads involve full decompression and decoding.
+
+#### 100M rows (partial -- PyArrow timed out on zstd/lz4)
+
+| Codec | Carquet Write | Arrow C++ Write | W ratio | Carquet Read | Arrow C++ Read | R ratio |
+|-------|--------------|-----------------|---------|-------------|----------------|---------|
+| none | **10.2s** | 16.8s | **1.65x** | **216ms** | 757ms | **3.5x**\* |
+| snappy | **13.6s** | 14.9s | **1.09x** | **1939ms** | 2724ms | **1.4x** |
+| zstd | **14.7s** | 16.0s | **1.09x** | **1653ms** | 2262ms | **1.4x** |
+
+At 100M rows, Carquet writes faster than Arrow C++ across the board (1.09-1.65x).
+
+<details>
+<summary>Full results: 100K and 1M rows</summary>
+
+#### 1M rows vs Arrow C++
+
+| Codec | Carquet Write | Arrow C++ Write | W ratio | Carquet Read | Arrow C++ Read | R ratio |
+|-------|--------------|-----------------|---------|-------------|----------------|---------|
+| none | **179ms** | 189ms | **1.06x** | **0.20ms** | 6.4ms | 32x\* |
+| snappy | 205ms | **85ms** | 0.41x | **17ms** | 35ms | **2.1x** |
+| zstd | 178ms | **160ms** | 0.90x | **17ms** | 26ms | **1.5x** |
+| lz4 | **138ms** | 152ms | **1.10x** | **6.4ms** | 11ms | **1.7x** |
+
+#### 100K rows vs Arrow C++
+
+| Codec | Carquet Write | Arrow C++ Write | W ratio | Carquet Read | Arrow C++ Read | R ratio |
+|-------|--------------|-----------------|---------|-------------|----------------|---------|
+| none | 17.4ms | **16.6ms** | 0.95x | **0.07ms** | 0.91ms | 13x\* |
+| snappy | **9.7ms** | 10.7ms | **1.10x** | **1.6ms** | 5.2ms | **3.2x** |
+| zstd | **10.3ms** | 14.2ms | **1.38x** | **1.6ms** | 3.1ms | **2.0x** |
+| lz4 | **10.0ms** | 10.5ms | **1.05x** | **0.7ms** | 1.2ms | **1.7x** |
+
+\* Zero-copy mmap path
+
+</details>
+
+<details>
+<summary>Full results: vs PyArrow</summary>
+
+#### 10M rows vs PyArrow
+
+| Codec | Carquet Write | PyArrow Write | W ratio | Carquet Read | PyArrow Read | R ratio |
+|-------|--------------|---------------|---------|-------------|--------------|---------|
+| none | **855ms** | 1224ms | **1.43x** | **30ms** | 210ms | **6.9x**\* |
+| snappy | 1093ms | **1078ms** | 0.99x | **147ms** | 403ms | **2.8x** |
+| zstd | **1483ms** | 1767ms | **1.19x** | **168ms** | 353ms | **2.1x** |
+| lz4 | 1526ms | **1051ms** | 0.69x | **68ms** | 279ms | **4.1x** |
+
+#### 1M rows vs PyArrow
+
+| Codec | Carquet Write | PyArrow Write | W ratio | Carquet Read | PyArrow Read | R ratio |
+|-------|--------------|---------------|---------|-------------|--------------|---------|
+| none | **179ms** | 194ms | **1.09x** | **0.20ms** | 9.2ms | 46x\* |
+| snappy | 205ms | **152ms** | 0.74x | **17ms** | 19ms | **1.2x** |
+| zstd | 178ms | **161ms** | 0.90x | 17ms | **16ms** | 0.97x |
+| lz4 | **138ms** | 145ms | **1.05x** | **6.4ms** | 9.9ms | **1.5x** |
+
+#### 100K rows vs PyArrow
+
+| Codec | Carquet Write | PyArrow Write | W ratio | Carquet Read | PyArrow Read | R ratio |
+|-------|--------------|---------------|---------|-------------|--------------|---------|
+| none | 17.4ms | **16.4ms** | 0.94x | **0.07ms** | 2.5ms | 36x\* |
+| snappy | **9.7ms** | 9.9ms | **1.02x** | **1.6ms** | 6.9ms | **4.2x** |
+| zstd | **10.3ms** | 15.1ms | **1.46x** | **1.6ms** | 7.7ms | **5.0x** |
+| lz4 | **10.0ms** | 10.5ms | **1.05x** | **0.7ms** | 1.9ms | **2.7x** |
+
+Carquet reads faster than PyArrow across nearly all codecs and sizes. The sole exception is 1M zstd reads where PyArrow is marginally faster (0.97x).
+
+\* Zero-copy mmap path
+
+</details>
+
+### ARM: Apple M3 (macOS)
+
+*MacBook Air M3, 16GB RAM, macOS 26.2, Arrow C++ 23.0.1, PyArrow 23.0.1 -- `-DCARQUET_NATIVE_ARCH=ON`, ZSTD level 1*
+
+#### 10M rows vs Arrow C++
+
+| Codec | Carquet Write | Arrow C++ Write | W ratio | Carquet Read | Arrow C++ Read | R ratio |
+|-------|--------------|-----------------|---------|-------------|----------------|---------|
+| none | 136ms | 132ms | 0.97x | **8.7ms** | 14.2ms | **1.6x**\* |
+| snappy | **218ms** | 240ms | **1.10x** | 86ms | **53ms** | 0.62x |
+| zstd | **202ms** | 338ms | **1.68x** | **66ms** | 70ms | 1.07x |
+| lz4 | **206ms** | 254ms | **1.23x** | **25ms** | 31ms | **1.25x** |
+
+#### 1M rows vs Arrow C++
+
+| Codec | Carquet Write | Arrow C++ Write | W ratio | Carquet Read | Arrow C++ Read | R ratio |
+|-------|--------------|-----------------|---------|-------------|----------------|---------|
+| none | **9.0ms** | 12.8ms | **1.42x** | **0.04ms** | 0.92ms | 23x\* |
+| snappy | **13.6ms** | 24.2ms | **1.78x** | 8.6ms | **4.8ms** | 0.56x |
+| zstd | **16.0ms** | 34.6ms | **2.16x** | **6.1ms** | 6.4ms | 1.05x |
+| lz4 | **13.5ms** | 25.0ms | **1.86x** | **2.4ms** | 2.5ms | 1.05x |
+
+On ARM, the standout is **write performance**: Carquet is **1.1-2.2x faster than Arrow C++** across all codecs and sizes, with ZSTD writes reaching 2.16x. Reads are competitive -- faster on uncompressed and LZ4, roughly even on ZSTD, slower on snappy (Arrow C++ has stronger snappy decompression on this platform).
+
+<details>
+<summary>Full results: vs PyArrow on ARM</summary>
+
+#### 10M rows vs PyArrow
+
+| Codec | Carquet Write | PyArrow Write | W ratio | Carquet Read | PyArrow Read | R ratio |
+|-------|--------------|---------------|---------|-------------|--------------|---------|
+| none | **136ms** | 187ms | **1.38x** | **8.7ms** | 35ms | **4.0x**\* |
+| snappy | **218ms** | 293ms | **1.34x** | 86ms | **46ms** | 0.53x |
+| zstd | **202ms** | 398ms | **1.97x** | 66ms | **57ms** | 0.86x |
+| lz4 | **206ms** | 307ms | **1.49x** | **25ms** | 39ms | **1.56x** |
+
+#### 1M rows vs PyArrow
+
+| Codec | Carquet Write | PyArrow Write | W ratio | Carquet Read | PyArrow Read | R ratio |
+|-------|--------------|---------------|---------|-------------|--------------|---------|
+| none | **9.0ms** | 17.5ms | **1.95x** | **0.04ms** | 2.6ms | 65x\* |
+| snappy | **13.6ms** | 29.8ms | **2.18x** | 8.6ms | **3.6ms** | 0.42x |
+| zstd | **16.0ms** | 40.0ms | **2.50x** | 6.1ms | **4.4ms** | 0.72x |
+| lz4 | **13.5ms** | 30.6ms | **2.28x** | **2.4ms** | 3.1ms | **1.30x** |
+
+Carquet writes **1.3-2.5x faster than PyArrow** across the board on ARM. Reads are faster on uncompressed and LZ4; PyArrow is faster on snappy and zstd reads (dictionary encoding advantage on this data shape).
+
+\* Zero-copy mmap path
+
+</details>
+
+### A note on uncompressed read numbers
+
+Uncompressed reads marked with \* use Carquet's **mmap zero-copy path**: for PLAIN-encoded, uncompressed, fixed-size, required columns, the batch reader returns pointers directly into the memory-mapped file with no memcpy. The OS only pages in data the application actually touches. This explains the extreme ratios (10-65x) for uncompressed reads -- Arrow always materializes into its own columnar format regardless.
+
+This is a real API-level advantage for workloads like filtering, sampling, or partial scans. For full sequential scans that touch every value, the effective speedup is lower. **The compressed read numbers (snappy, zstd, lz4) involve full decompression and decoding of every value** and are the most representative measure of end-to-end read throughput.
+
+### Summary
+
+| | x86 (Xeon D-1531) | ARM (Apple M3) |
+|---|---|---|
+| **Compressed reads** | **1.5-2.1x faster** than Arrow C++ | Even to 1.25x faster (LZ4); 0.6x slower (snappy) |
+| **Uncompressed reads** | **3.5x faster**\* (mmap zero-copy) | **1.6x faster**\* |
+| **Writes** | Competitive (0.90-1.65x, best at scale) | **1.1-2.2x faster** across the board |
+| **File sizes** | Equal or slightly smaller | Equal or slightly smaller |
+
+\* Zero-copy path; see note above.
 
 ## Building
 
 ### Requirements
 
-- C11-compatible compiler (GCC 4.9+, Clang 3.4+, MSVC 2015+)
+- C11 compiler (GCC 4.9+, Clang 3.4+, MSVC 2015+)
 - CMake 3.16+
-- zstd and zlib (automatically fetched via FetchContent if not found on system)
+- zstd, zlib, lz4 (auto-fetched if missing)
 - OpenMP (optional, for parallel column reading)
 
-Works on Linux, macOS, Windows, and any POSIX system. Tested on x86_64, ARM64, and should work on RISC-V, MIPS, PowerPC, s390x, etc.
-
-### Basic Build
+### Quick Start
 
 ```bash
-git clone https://github.com/user/carquet.git
+git clone https://github.com/Vitruves/carquet.git
 cd carquet
-mkdir build && cd build
-cmake ..
-make -j$(nproc)
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j$(nproc)
 ```
 
 ### Build Options
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `CARQUET_BUILD_TESTS` | ON | Build test suite |
-| `CARQUET_BUILD_EXAMPLES` | ON | Build example programs |
-| `CARQUET_BUILD_BENCHMARKS` | ON | Build benchmark programs |
+| `CARQUET_BUILD_DEV` | OFF | Build everything (tests, examples, benchmarks) |
+| `CARQUET_BUILD_TESTS` | OFF | Build test suite only |
 | `CARQUET_BUILD_SHARED` | OFF | Build shared library instead of static |
-| `CARQUET_ENABLE_SSE` | ON | Enable SSE optimizations (x86) |
-| `CARQUET_ENABLE_AVX2` | ON | Enable AVX2 optimizations (x86) |
-| `CARQUET_ENABLE_AVX512` | ON | Enable AVX-512 optimizations (x86) |
-| `CARQUET_ENABLE_NEON` | ON | Enable NEON optimizations (ARM) |
-| `CARQUET_ENABLE_SVE` | OFF | Enable SVE optimizations (ARM) |
-| `CARQUET_NATIVE_ARCH` | OFF | Build with `-march=native` for max performance |
+| `CARQUET_NATIVE_ARCH` | OFF | `-march=native` for max performance |
+| `CARQUET_ENABLE_SVE` | OFF | ARM SVE (experimental) |
 
-### Maximum Performance Build
+All x86 SIMD (SSE, AVX, AVX2, AVX-512) and ARM NEON are auto-detected and enabled by default.
+
+<details>
+<summary>All build options</summary>
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `CARQUET_BUILD_EXAMPLES` | OFF | Build example programs |
+| `CARQUET_BUILD_BENCHMARKS` | OFF | Build benchmark and profiling programs |
+| `CARQUET_BUILD_ARROW_CPP_BENCHMARK` | OFF | Optional Arrow C++ comparison benchmark |
+| `CARQUET_BUILD_INTEROP` | OFF | Build interoperability tests |
+| `CARQUET_BUILD_FUZZ` | OFF | Build fuzz targets |
+| `CARQUET_ENABLE_SSE` | ON | SSE optimizations (x86, auto-detected) |
+| `CARQUET_ENABLE_AVX` | ON | AVX optimizations (x86, auto-detected) |
+| `CARQUET_ENABLE_AVX2` | ON | AVX2 optimizations (x86, auto-detected) |
+| `CARQUET_ENABLE_AVX512` | ON | AVX-512 optimizations (x86, auto-detected) |
+| `CARQUET_ENABLE_NEON` | ON | NEON optimizations (ARM, auto-detected) |
+
+</details>
+
+### Development Build
 
 ```bash
-cmake .. -DCMAKE_BUILD_TYPE=Release -DCARQUET_NATIVE_ARCH=ON
-make -j$(nproc)
+cmake -B build -DCARQUET_BUILD_DEV=ON
+cmake --build build -j$(nproc)
+cd build && ctest --output-on-failure
 ```
 
-This enables `-O3`, link-time optimization (`-flto`), and CPU-specific codegen (`-march=native`). Use this for benchmarks and production deployments on known hardware.
+## Usage
 
-### Example: Release Build with Shared Library
-
-```bash
-cmake .. -DCMAKE_BUILD_TYPE=Release -DCARQUET_BUILD_SHARED=ON
-make -j$(nproc)
-sudo make install
-```
-
-### Running Tests
-
-```bash
-cd build
-ctest --output-on-failure
-```
-
-## Quick Start
-
-### Include Header
+### Write a Parquet File
 
 ```c
 #include <carquet/carquet.h>
+
+int main(void) {
+    carquet_error_t err = CARQUET_ERROR_INIT;
+
+    // Define schema
+    carquet_schema_t* schema = carquet_schema_create(&err);
+    carquet_schema_add_column(schema, "id",    CARQUET_PHYSICAL_INT64,  NULL, CARQUET_REPETITION_REQUIRED, 0, 0);
+    carquet_schema_add_column(schema, "value", CARQUET_PHYSICAL_DOUBLE, NULL, CARQUET_REPETITION_REQUIRED, 0, 0);
+
+    // Configure writer
+    carquet_writer_options_t opts;
+    carquet_writer_options_init(&opts);
+    opts.compression = CARQUET_COMPRESSION_ZSTD;
+
+    // Write
+    carquet_writer_t* w = carquet_writer_create("output.parquet", schema, &opts, &err);
+
+    int64_t ids[]    = {1, 2, 3, 4, 5};
+    double values[]  = {1.1, 2.2, 3.3, 4.4, 5.5};
+    carquet_writer_write_batch(w, 0, ids, 5, NULL, NULL);
+    carquet_writer_write_batch(w, 1, values, 5, NULL, NULL);
+    carquet_writer_close(w);
+
+    carquet_schema_free(schema);
+    return 0;
+}
 ```
 
-### Link Library
-
-```bash
-# Static linking
-gcc myprogram.c -I/path/to/carquet/include -L/path/to/carquet/build -lcarquet -o myprogram
-
-# Or with pkg-config (after install)
-gcc myprogram.c $(pkg-config --cflags --libs carquet) -o myprogram
-```
-
-### Minimal Example
+### Read a Parquet File
 
 ```c
 #include <carquet/carquet.h>
@@ -167,209 +298,102 @@ gcc myprogram.c $(pkg-config --cflags --libs carquet) -o myprogram
 int main(void) {
     carquet_error_t err = CARQUET_ERROR_INIT;
 
-    // Create schema with two columns
-    carquet_schema_t* schema = carquet_schema_create(&err);
-    carquet_schema_add_column(schema, "id", CARQUET_PHYSICAL_INT32,
-                              NULL, CARQUET_REPETITION_REQUIRED, 0, 0);
-    carquet_schema_add_column(schema, "value", CARQUET_PHYSICAL_DOUBLE,
-                              NULL, CARQUET_REPETITION_REQUIRED, 0, 0);
+    // Open with mmap for best read performance
+    carquet_reader_options_t opts;
+    carquet_reader_options_init(&opts);
+    opts.use_mmap = true;
 
-    // Write data
-    carquet_writer_t* writer = carquet_writer_create("test.parquet", schema, NULL, &err);
+    carquet_reader_t* r = carquet_reader_open("output.parquet", &opts, &err);
+    if (!r) { printf("Error: %s\n", err.message); return 1; }
 
-    int32_t ids[] = {1, 2, 3, 4, 5};
-    double values[] = {1.1, 2.2, 3.3, 4.4, 5.5};
+    printf("Rows: %lld, Columns: %d\n",
+           (long long)carquet_reader_num_rows(r),
+           carquet_reader_num_columns(r));
 
-    carquet_writer_write_batch(writer, 0, ids, 5, NULL, NULL);
-    carquet_writer_write_batch(writer, 1, values, 5, NULL, NULL);
-    carquet_writer_close(writer);
+    // Batch reader for efficient iteration
+    carquet_batch_reader_config_t cfg;
+    carquet_batch_reader_config_init(&cfg);
+    cfg.batch_size = 65536;
 
-    // Read data back
-    carquet_reader_t* reader = carquet_reader_open("test.parquet", NULL, &err);
-    printf("Rows: %lld\n", (long long)carquet_reader_num_rows(reader));
-    carquet_reader_close(reader);
+    carquet_batch_reader_t* br = carquet_batch_reader_create(r, &cfg, &err);
+    carquet_row_batch_t* batch = NULL;
 
-    carquet_schema_free(schema);
+    while (carquet_batch_reader_next(br, &batch) == CARQUET_OK && batch) {
+        const void* data;
+        const uint8_t* nulls;
+        int64_t n;
+        carquet_row_batch_column(batch, 0, &data, &nulls, &n);
+        const int64_t* ids = (const int64_t*)data;
+        // process ids[0..n-1] ...
+        carquet_row_batch_free(batch);
+        batch = NULL;
+    }
+
+    carquet_batch_reader_free(br);
+    carquet_reader_close(r);
     return 0;
 }
 ```
 
-## Reading Parquet Files
-
-### Opening a File
+### Nullable Columns
 
 ```c
-carquet_error_t err = CARQUET_ERROR_INIT;
+// Schema with nullable column
+carquet_schema_add_column(schema, "name", CARQUET_PHYSICAL_BYTE_ARRAY,
+                          NULL, CARQUET_REPETITION_OPTIONAL, 0, 0);
 
-// Basic open
-carquet_reader_t* reader = carquet_reader_open("data.parquet", NULL, &err);
-if (!reader) {
-    printf("Error: %s\n", err.message);
-    return 1;
-}
-
-// With options
-carquet_reader_options_t opts;
-carquet_reader_options_init(&opts);
-opts.use_mmap = true;  // Use memory-mapped I/O
-
-carquet_reader_t* reader = carquet_reader_open("data.parquet", &opts, &err);
+// Write with definition levels (1 = present, 0 = null)
+carquet_byte_array_t names[] = {{(uint8_t*)"Alice", 5}, {(uint8_t*)"Bob", 3}};
+int16_t def_levels[] = {1, 0, 1};  // Alice, NULL, Bob (3 rows, 2 values)
+carquet_writer_write_batch(writer, col, names, 3, def_levels, NULL);
 ```
 
-### Getting File Metadata
+### Nested Types (Lists, Maps)
 
 ```c
-int64_t num_rows = carquet_reader_num_rows(reader);
-int32_t num_columns = carquet_reader_num_columns(reader);
-int32_t num_row_groups = carquet_reader_num_row_groups(reader);
+// list<int32>
+int32_t list_leaf = carquet_schema_add_list(
+    schema, "tags", CARQUET_PHYSICAL_INT32, NULL,
+    CARQUET_REPETITION_OPTIONAL, 0, 0);
 
-// Get schema
-const carquet_schema_t* schema = carquet_reader_schema(reader);
+// map<string, int32>
+int32_t map_val = carquet_schema_add_map(
+    schema, "props",
+    CARQUET_PHYSICAL_BYTE_ARRAY, NULL, 0,   // key: string
+    CARQUET_PHYSICAL_INT32, NULL, 0,         // value: int32
+    CARQUET_REPETITION_OPTIONAL, 0);
 
-// Get column info
-for (int32_t i = 0; i < num_columns; i++) {
-    const char* name = carquet_schema_column_name(schema, i);
-    carquet_physical_type_t type = carquet_schema_column_type(schema, i);
-    printf("Column %d: %s (type: %s)\n", i, name, carquet_physical_type_name(type));
-}
-```
-
-### Reading Column Data (Low-Level API)
-
-```c
-// Get column reader for row group 0, column 0
-carquet_column_reader_t* col = carquet_reader_get_column(reader, 0, 0, &err);
-if (!col) {
-    printf("Error: %s\n", err.message);
-}
-
-// Read values
-int64_t values[1024];
-int16_t def_levels[1024];  // For nullable columns
-int16_t rep_levels[1024];  // For nested/repeated columns
-
-int64_t count = carquet_column_read_batch(col, values, 1024, def_levels, rep_levels);
-printf("Read %lld values\n", (long long)count);
-
-carquet_column_reader_free(col);
-```
-
-### Reading with Batch Reader (High-Level API)
-
-```c
-// Configure batch reader
-carquet_batch_reader_config_t config;
-carquet_batch_reader_config_init(&config);
-config.batch_size = 10000;  // Rows per batch
-
-// Create batch reader
-carquet_batch_reader_t* batch_reader = carquet_batch_reader_create(reader, &config, &err);
-
-// Read batches
-carquet_row_batch_t* batch = NULL;
-while (carquet_batch_reader_next(batch_reader, &batch) == CARQUET_OK && batch) {
-    int64_t num_rows = carquet_row_batch_num_rows(batch);
-    int32_t num_cols = carquet_row_batch_num_columns(batch);
-
-    // Access column data
-    const void* data;
-    const uint8_t* null_bitmap;
-    int64_t num_values;
-
-    carquet_row_batch_column(batch, 0, &data, &null_bitmap, &num_values);
-    const int32_t* ids = (const int32_t*)data;
-
-    // Process data...
-
-    carquet_row_batch_free(batch);
-    batch = NULL;
-}
-
-carquet_batch_reader_free(batch_reader);
+// Write list data: row0=[100,200], row1=NULL, row2=[300]
+int32_t vals[] = {100, 200, 300};
+int16_t def[]  = {  3,   3,   0,   3};
+int16_t rep[]  = {  0,   1,   0,   0};
+carquet_writer_write_batch(writer, col, vals, 4, def, rep);
 ```
 
 ### Column Projection
 
-Read only specific columns for better performance:
-
 ```c
-carquet_batch_reader_config_t config;
-carquet_batch_reader_config_init(&config);
+carquet_batch_reader_config_t cfg;
+carquet_batch_reader_config_init(&cfg);
 
-// By column indices
-int32_t columns[] = {0, 3, 5};  // Only columns 0, 3, and 5
-config.column_indices = columns;
-config.num_columns = 3;
-
-// Or by column names
-const char* names[] = {"id", "timestamp", "value"};
-config.column_names = names;
-config.num_column_names = 3;
+// Read only specific columns
+const char* names[] = {"id", "timestamp"};
+cfg.column_names = names;
+cfg.num_column_names = 2;
 ```
 
-### Row Group Filtering (Predicate Pushdown)
+### Compression
 
-Filter row groups using statistics before reading:
-
-```c
-// Find row groups where column 0 (id) might contain value > 1000
-int32_t search_value = 1000;
-int32_t matching_rgs[100];
-
-int32_t num_matching = carquet_reader_filter_row_groups(
-    reader,
-    0,                      // Column index
-    CARQUET_COMPARE_GT,     // Greater than
-    &search_value,
-    sizeof(int32_t),
-    matching_rgs,
-    100                     // Max results
-);
-
-printf("Found %d row groups that might contain id > 1000\n", num_matching);
-```
-
-### Reading from Memory Buffer
+| Codec | Enum | Best For |
+|-------|------|----------|
+| ZSTD | `CARQUET_COMPRESSION_ZSTD` | Best overall (great ratio + speed) |
+| LZ4 | `CARQUET_COMPRESSION_LZ4_RAW` | Read-heavy workloads (fastest decompression) |
+| Snappy | `CARQUET_COMPRESSION_SNAPPY` | Wide compatibility |
+| GZIP | `CARQUET_COMPRESSION_GZIP` | Maximum compatibility with older tools |
 
 ```c
-// Read file into memory (e.g., from network, embedded resource)
-uint8_t* buffer = ...;
-size_t size = ...;
-
-carquet_reader_t* reader = carquet_reader_open_buffer(buffer, size, NULL, &err);
-// Use reader as normal...
-carquet_reader_close(reader);
-```
-
-### Closing the Reader
-
-```c
-carquet_reader_close(reader);
-```
-
-## Writing Parquet Files
-
-### Creating a Schema
-
-```c
-carquet_error_t err = CARQUET_ERROR_INIT;
-carquet_schema_t* schema = carquet_schema_create(&err);
-
-// Add required column (non-nullable)
-carquet_schema_add_column(schema, "id", CARQUET_PHYSICAL_INT64,
-                          NULL, CARQUET_REPETITION_REQUIRED, 0, 0);
-
-// Add optional column (nullable)
-carquet_schema_add_column(schema, "name", CARQUET_PHYSICAL_BYTE_ARRAY,
-                          NULL, CARQUET_REPETITION_OPTIONAL, 0, 0);
-
-// Add column with logical type
-carquet_logical_type_t timestamp_type = {
-    .type = CARQUET_LOGICAL_TIMESTAMP,
-    .timestamp = { .unit = CARQUET_TIME_MILLIS, .is_adjusted_to_utc = true }
-};
-carquet_schema_add_column(schema, "created_at", CARQUET_PHYSICAL_INT64,
-                          &timestamp_type, CARQUET_REPETITION_REQUIRED, 0, 0);
+opts.compression = CARQUET_COMPRESSION_ZSTD;
+opts.compression_level = 1;  // 0 = codec default; ZSTD: 1-22, GZIP: 1-9
 ```
 
 ### Writer Options
@@ -377,642 +401,175 @@ carquet_schema_add_column(schema, "created_at", CARQUET_PHYSICAL_INT64,
 ```c
 carquet_writer_options_t opts;
 carquet_writer_options_init(&opts);
-
-opts.compression = CARQUET_COMPRESSION_ZSTD;  // Compression codec
-opts.compression_level = 0;                    // 0 = codec default
-opts.row_group_size = 128 * 1024 * 1024;      // 128 MB row groups
-opts.page_size = 1024 * 1024;                  // 1 MB nominal page target
-                                               // ZSTD keeps this API default but
-                                               // internally uses 4 MB pages when
-                                               // you leave the default unchanged
-opts.write_statistics = true;                  // Enable min/max statistics
-opts.write_page_checksums = true;              // Enable CRC32 verification
-opts.write_bloom_filters = true;              // Enable bloom filters per column
-opts.write_page_index = true;                 // Enable column/offset page indexes
+opts.compression        = CARQUET_COMPRESSION_ZSTD;
+opts.row_group_size     = 128 * 1024 * 1024;  // 128 MB row groups
+opts.write_statistics   = true;                // min/max for predicate pushdown
+opts.write_crc          = true;                // CRC32 page verification
+opts.write_bloom_filters = true;               // bloom filters per column
+opts.write_page_index   = true;                // column/offset page indexes
 ```
 
-### Creating a Writer
+### Error Handling
 
 ```c
-carquet_writer_t* writer = carquet_writer_create(
-    "output.parquet",
-    schema,
-    &opts,  // NULL for defaults
-    &err
-);
-
-if (!writer) {
-    printf("Error: %s\n", err.message);
-    carquet_schema_free(schema);
+carquet_error_t err = CARQUET_ERROR_INIT;
+carquet_reader_t* r = carquet_reader_open("data.parquet", NULL, &err);
+if (!r) {
+    printf("[%s] %s\n", carquet_status_name(err.code), err.message);
+    printf("Hint: %s\n", carquet_error_recovery_hint(err.code));
     return 1;
 }
 ```
 
-### Writing Data
-
-```c
-// Write column 0 (id)
-int64_t ids[] = {1, 2, 3, 4, 5};
-carquet_writer_write_batch(writer, 0, ids, 5, NULL, NULL);
-
-// Write column 1 (name) - with nulls (sparse: only non-null values in array)
-carquet_byte_array_t names[] = {
-    {5, (uint8_t*)"Alice"},
-    {3, (uint8_t*)"Bob"},
-    {5, (uint8_t*)"David"},
-    {3, (uint8_t*)"Eve"}
-};
-int16_t def_levels[] = {1, 1, 0, 1, 1};  // 5 rows: 0 = null, 1 = present
-carquet_writer_write_batch(writer, 1, names, 5, def_levels, NULL);
-
-// Write column 2 (timestamp)
-int64_t timestamps[] = {1703980800000, 1703984400000, 1703988000000,
-                         1703991600000, 1703995200000};
-carquet_writer_write_batch(writer, 2, timestamps, 5, NULL, NULL);
-```
-
-### Starting a New Row Group
-
-```c
-// Manually start a new row group (optional - automatic based on row_group_size)
-carquet_writer_new_row_group(writer);
-```
-
-### Closing the Writer
-
-```c
-carquet_status_t status = carquet_writer_close(writer);
-if (status != CARQUET_OK) {
-    printf("Error closing file\n");
-}
-
-carquet_schema_free(schema);
-```
-
-## Schema API
-
-### Physical Types
-
-| Type | C Type | Description |
-|------|--------|-------------|
-| `CARQUET_PHYSICAL_BOOLEAN` | `uint8_t` | Boolean (0 or 1) |
-| `CARQUET_PHYSICAL_INT32` | `int32_t` | 32-bit signed integer |
-| `CARQUET_PHYSICAL_INT64` | `int64_t` | 64-bit signed integer |
-| `CARQUET_PHYSICAL_INT96` | `uint8_t[12]` | 96-bit integer (legacy timestamp) |
-| `CARQUET_PHYSICAL_FLOAT` | `float` | 32-bit IEEE 754 |
-| `CARQUET_PHYSICAL_DOUBLE` | `double` | 64-bit IEEE 754 |
-| `CARQUET_PHYSICAL_BYTE_ARRAY` | `carquet_byte_array_t` | Variable-length bytes |
-| `CARQUET_PHYSICAL_FIXED_LEN_BYTE_ARRAY` | `uint8_t[]` | Fixed-length bytes |
-
-### Logical Types
-
-| Logical Type | Physical Type | Description |
-|--------------|---------------|-------------|
-| `CARQUET_LOGICAL_STRING` | BYTE_ARRAY | UTF-8 string |
-| `CARQUET_LOGICAL_DATE` | INT32 | Days since epoch |
-| `CARQUET_LOGICAL_TIME` | INT32/INT64 | Time of day |
-| `CARQUET_LOGICAL_TIMESTAMP` | INT64 | Timestamp with timezone |
-| `CARQUET_LOGICAL_DECIMAL` | INT32/INT64/FIXED | Decimal with precision/scale |
-| `CARQUET_LOGICAL_UUID` | FIXED[16] | UUID |
-| `CARQUET_LOGICAL_JSON` | BYTE_ARRAY | JSON string |
-
-### Repetition Types
-
-| Type | Description |
-|------|-------------|
-| `CARQUET_REPETITION_REQUIRED` | Non-nullable, exactly one value |
-| `CARQUET_REPETITION_OPTIONAL` | Nullable, zero or one value |
-| `CARQUET_REPETITION_REPEATED` | Zero or more values (list) |
-
-### Nested Schemas
-
-```c
-// Create a nested schema: person { name: string, address { street, city } }
-carquet_schema_t* schema = carquet_schema_create(&err);
-
-// Add group for person (root is implicit)
-int32_t person_idx = carquet_schema_add_group(schema, "person",
-                                               CARQUET_REPETITION_REQUIRED, 0);
-
-// Add leaf columns under person
-carquet_schema_add_column(schema, "name", CARQUET_PHYSICAL_BYTE_ARRAY,
-                          NULL, CARQUET_REPETITION_REQUIRED, 0, person_idx);
-
-// Add nested group for address
-int32_t address_idx = carquet_schema_add_group(schema, "address",
-                                                CARQUET_REPETITION_OPTIONAL, person_idx);
-
-// Add columns under address
-carquet_schema_add_column(schema, "street", CARQUET_PHYSICAL_BYTE_ARRAY,
-                          NULL, CARQUET_REPETITION_REQUIRED, 0, address_idx);
-carquet_schema_add_column(schema, "city", CARQUET_PHYSICAL_BYTE_ARRAY,
-                          NULL, CARQUET_REPETITION_REQUIRED, 0, address_idx);
-```
-
-### Lists and Maps
-
-Carquet provides helpers that create standard Parquet 3-level LIST and MAP structures:
-
-```c
-// Add a list<int32> column (creates the standard 3-level encoding)
-int32_t list_leaf = carquet_schema_add_list(
-    schema, "tags",
-    CARQUET_PHYSICAL_INT32,     // element physical type
-    NULL,                       // element logical type (optional)
-    CARQUET_REPETITION_OPTIONAL, // list repetition (OPTIONAL = nullable list)
-    0,                          // type_length (for FIXED_LEN_BYTE_ARRAY)
-    0                           // parent_index (0 = root)
-);
-
-// Add a map<string, int32> column
-int32_t map_val_leaf = carquet_schema_add_map(
-    schema, "properties",
-    CARQUET_PHYSICAL_BYTE_ARRAY, NULL, 0,   // key type (string)
-    CARQUET_PHYSICAL_INT32, NULL, 0,         // value type
-    CARQUET_REPETITION_OPTIONAL,             // map repetition
-    0                                        // parent_index
-);
-
-// Write list data using definition/repetition levels
-// Example: row0=[100,200], row1=NULL, row2=[300], row3=[400,500,600]
-int32_t values[] = {100, 200, 300, 400, 500, 600};
-int16_t def[]    = {  3,   3,   0,   3,   3,   3,   3};
-int16_t rep[]    = {  0,   1,   0,   0,   0,   1,   1};
-carquet_writer_write_batch(writer, col_index, values, 7, def, rep);
-```
-
-### Nested Type Utilities
-
-```c
-// Count logical rows from repetition levels (rep_level==0 starts a new row)
-int64_t num_rows = carquet_count_rows(rep_levels, num_entries);
-
-// Reconstruct list boundaries as Arrow-style offsets from repetition levels
-int64_t offsets[1024];
-int64_t num_lists = carquet_list_offsets(
-    rep_levels, num_entries,
-    1,          // list_rep_level (repetition level of the repeated group)
-    offsets,    // output: offsets[i]..offsets[i+1] = range for list i
-    1024        // max offsets
-);
-
-// Query accumulated definition/repetition levels for a leaf column
-int16_t max_def = carquet_schema_max_def_level(schema, leaf_index);
-int16_t max_rep = carquet_schema_max_rep_level(schema, leaf_index);
-
-// Get the full dotted path for a leaf column (e.g., "person.address.street")
-const char* path = carquet_schema_column_path(schema, leaf_index);
-```
-
-## Compression
-
-### Available Codecs
-
-| Codec | Enum Value | Compression | Decompression | Ratio |
-|-------|------------|-------------|---------------|-------|
-| Uncompressed | `CARQUET_COMPRESSION_UNCOMPRESSED` | N/A | N/A | 1.0x |
-| Snappy | `CARQUET_COMPRESSION_SNAPPY` | Very Fast | Very Fast | ~4x |
-| LZ4 | `CARQUET_COMPRESSION_LZ4` | Very Fast | Fastest | ~4x |
-| GZIP | `CARQUET_COMPRESSION_GZIP` | Slow | Medium | ~6x |
-| ZSTD | `CARQUET_COMPRESSION_ZSTD` | Fast | Fast | ~7x |
-
-### Choosing a Codec
-
-- **ZSTD**: Best overall choice - excellent compression with good speed
-- **LZ4**: Best for read-heavy workloads - fastest decompression
-- **Snappy**: Good balance, widely compatible
-- **GZIP**: Maximum compatibility with older tools
-
-### Setting Compression Level
-
-```c
-opts.compression = CARQUET_COMPRESSION_ZSTD;
-opts.compression_level = 0;  // 0 = codec default
-                              // ZSTD: 1-22
-                              // GZIP: 1-9
-```
-
-## Batch Reading
-
-The batch reader provides an efficient way to read data in chunks:
-
-```c
-carquet_batch_reader_config_t config;
-carquet_batch_reader_config_init(&config);
-config.batch_size = 65536;  // 64K rows per batch
-
-carquet_batch_reader_t* batch_reader = carquet_batch_reader_create(reader, &config, &err);
-
-carquet_row_batch_t* batch = NULL;
-int64_t total_rows = 0;
-
-while (carquet_batch_reader_next(batch_reader, &batch) == CARQUET_OK && batch) {
-    int64_t batch_rows = carquet_row_batch_num_rows(batch);
-    total_rows += batch_rows;
-
-    // Access data for each column
-    for (int32_t col = 0; col < carquet_row_batch_num_columns(batch); col++) {
-        const void* data;
-        const uint8_t* null_bitmap;
-        int64_t num_values;
-
-        carquet_row_batch_column(batch, col, &data, &null_bitmap, &num_values);
-
-        // Process column data...
-        // null_bitmap: bit i is 1 if value i is NOT null
-    }
-
-    carquet_row_batch_free(batch);
-    batch = NULL;
-}
-
-printf("Total rows: %lld\n", (long long)total_rows);
-carquet_batch_reader_free(batch_reader);
-```
-
-## Error Handling
-
-### Error Structure
-
-```c
-carquet_error_t err = CARQUET_ERROR_INIT;
-
-carquet_reader_t* reader = carquet_reader_open("data.parquet", NULL, &err);
-if (!reader) {
-    printf("Error code: %d\n", err.code);
-    printf("Message: %s\n", err.message);
-    printf("Function: %s\n", err.function);
-    printf("File: %s:%d\n", err.file, err.line);
-
-    // Get recovery hint
-    const char* hint = carquet_error_recovery_hint(err.code);
-    if (hint) {
-        printf("Hint: %s\n", hint);
-    }
-}
-```
-
-### Formatting Errors
-
-```c
-char error_buffer[1024];
-carquet_error_format(&err, error_buffer, sizeof(error_buffer));
-printf("%s\n", error_buffer);
-// Output: [File not found] Failed to open data.parquet (file offset: 0)
-//         Hint: Check that the file exists and is readable
-```
-
-### Error Codes
-
-| Category | Codes | Description |
-|----------|-------|-------------|
-| Success | `CARQUET_OK` | Operation succeeded |
-| General | `CARQUET_ERROR_OUT_OF_MEMORY` | Memory allocation failed |
-| File I/O | `CARQUET_ERROR_FILE_*` | File operation errors |
-| Format | `CARQUET_ERROR_INVALID_MAGIC`, `CARQUET_ERROR_INVALID_FOOTER` | Invalid file format |
-| Encoding | `CARQUET_ERROR_DECODE`, `CARQUET_ERROR_INVALID_ENCODING` | Encoding errors |
-| Compression | `CARQUET_ERROR_COMPRESSION`, `CARQUET_ERROR_UNSUPPORTED_CODEC` | Compression errors |
-| Integrity | `CARQUET_ERROR_CRC_MISMATCH`, `CARQUET_ERROR_CHECKSUM` | Data corruption |
-
-### API Design: Assertions vs Error Returns
-
-Carquet distinguishes between **programming errors** (bugs) and **runtime errors** (expected failures):
-
-| Error Type | Handling | Example |
-|------------|----------|---------|
-| Programming error | `assert()` | Passing NULL to `carquet_buffer_init()` |
-| Runtime error | Return status | File not found, corrupted data, out of memory |
-
-**Rationale**: If you pass NULL where a valid pointer is required, that's a bug in your code - not something to "handle" at runtime. Assertions catch these during development. Runtime errors (bad files, memory exhaustion) return proper error codes since they can legitimately occur in production.
-
-```c
-// These assert on NULL (programming errors - fix your code!)
-carquet_buffer_init(&buf);      // buf must not be NULL
-carquet_arena_destroy(&arena);  // arena must not be NULL
-
-// These return errors (runtime failures - handle gracefully)
-carquet_reader_t* r = carquet_reader_open("bad.parquet", NULL, &err);
-if (!r) { /* file might not exist or be corrupted */ }
-```
-
-### Checking Recoverability
-
-```c
-if (!carquet_error_is_recoverable(err.code)) {
-    printf("Fatal error - cannot continue\n");
-} else {
-    printf("Recoverable error - can retry or skip\n");
-}
-```
-
-## Memory Management
-
-### Arena Allocator
-
-Carquet uses arena allocation internally for efficient memory management:
-
-```c
-// Arenas are used internally - you typically don't need to manage them directly
-// The reader/writer handle all memory management automatically
-```
-
-### Custom Allocator
-
-```c
-// Set a custom allocator before any Carquet calls
-carquet_allocator_t alloc = {
-    .malloc = my_malloc,
-    .realloc = my_realloc,
-    .free = my_free,
-    .ctx = my_context
-};
-carquet_set_allocator(&alloc);
-```
-
-### Memory Tips
-
-1. **Use batch reading** - Reads data in chunks instead of loading entire file
-2. **Use column projection** - Only read columns you need
-3. **Use memory-mapped I/O** - Let OS handle paging for large files
-4. **Close readers/writers promptly** - Free memory when done
-
-## API Reference
-
-### Initialization
-
-```c
-carquet_status_t carquet_init(void);
-const char* carquet_version(void);
-const carquet_cpu_info_t* carquet_get_cpu_info(void);
-```
-
-### Schema
-
-```c
-carquet_schema_t* carquet_schema_create(carquet_error_t* error);
-void carquet_schema_free(carquet_schema_t* schema);
-int32_t carquet_schema_add_column(carquet_schema_t* schema, const char* name,
-                                   carquet_physical_type_t type,
-                                   const carquet_logical_type_t* logical_type,
-                                   carquet_field_repetition_t repetition,
-                                   int32_t type_length,
-                                   int32_t parent_index);
-int32_t carquet_schema_add_group(carquet_schema_t* schema, const char* name,
-                                  carquet_field_repetition_t repetition,
-                                  int32_t parent_index);
-int32_t carquet_schema_add_list(carquet_schema_t* schema, const char* name,
-                                 carquet_physical_type_t element_type,
-                                 const carquet_logical_type_t* element_logical_type,
-                                 carquet_field_repetition_t list_repetition,
-                                 int32_t type_length, int32_t parent_index);
-int32_t carquet_schema_add_map(carquet_schema_t* schema, const char* name,
-                                carquet_physical_type_t key_type,
-                                const carquet_logical_type_t* key_logical_type,
-                                int32_t key_type_length,
-                                carquet_physical_type_t value_type,
-                                const carquet_logical_type_t* value_logical_type,
-                                int32_t value_type_length,
-                                carquet_field_repetition_t map_repetition,
-                                int32_t parent_index);
-int32_t carquet_schema_num_columns(const carquet_schema_t* schema);
-const char* carquet_schema_column_name(const carquet_schema_t* schema, int32_t index);
-carquet_physical_type_t carquet_schema_column_type(const carquet_schema_t* schema, int32_t index);
-const char* carquet_schema_column_path(const carquet_schema_t* schema, int32_t index);
-int16_t carquet_schema_max_def_level(const carquet_schema_t* schema, int32_t index);
-int16_t carquet_schema_max_rep_level(const carquet_schema_t* schema, int32_t index);
-int64_t carquet_count_rows(const int16_t* rep_levels, int64_t num_values);
-int64_t carquet_list_offsets(const int16_t* rep_levels, int64_t num_values,
-                              int16_t list_rep_level,
-                              int64_t* offsets_out, int64_t max_offsets);
-```
-
-### Reader
-
-```c
-carquet_reader_t* carquet_reader_open(const char* path,
-                                       const carquet_reader_options_t* options,
-                                       carquet_error_t* error);
-carquet_reader_t* carquet_reader_open_buffer(const void* buffer, size_t size,
-                                              const carquet_reader_options_t* options,
-                                              carquet_error_t* error);
-void carquet_reader_close(carquet_reader_t* reader);
-int64_t carquet_reader_num_rows(const carquet_reader_t* reader);
-int32_t carquet_reader_num_columns(const carquet_reader_t* reader);
-int32_t carquet_reader_num_row_groups(const carquet_reader_t* reader);
-const carquet_schema_t* carquet_reader_schema(const carquet_reader_t* reader);
-carquet_column_reader_t* carquet_reader_get_column(carquet_reader_t* reader,
-                                                    int32_t row_group,
-                                                    int32_t column,
-                                                    carquet_error_t* error);
-```
-
-### Batch Reader
-
-```c
-void carquet_batch_reader_config_init(carquet_batch_reader_config_t* config);
-carquet_batch_reader_t* carquet_batch_reader_create(carquet_reader_t* reader,
-                                                     const carquet_batch_reader_config_t* config,
-                                                     carquet_error_t* error);
-void carquet_batch_reader_free(carquet_batch_reader_t* batch_reader);
-carquet_status_t carquet_batch_reader_next(carquet_batch_reader_t* batch_reader,
-                                            carquet_row_batch_t** batch);
-int64_t carquet_row_batch_num_rows(const carquet_row_batch_t* batch);
-int32_t carquet_row_batch_num_columns(const carquet_row_batch_t* batch);
-carquet_status_t carquet_row_batch_column(const carquet_row_batch_t* batch,
-                                           int32_t column,
-                                           const void** data,
-                                           const uint8_t** null_bitmap,
-                                           int64_t* num_values);
-void carquet_row_batch_free(carquet_row_batch_t* batch);
-```
-
-### Writer
-
-```c
-void carquet_writer_options_init(carquet_writer_options_t* options);
-carquet_writer_t* carquet_writer_create(const char* path,
-                                         const carquet_schema_t* schema,
-                                         const carquet_writer_options_t* options,
-                                         carquet_error_t* error);
-carquet_status_t carquet_writer_write_batch(carquet_writer_t* writer,
-                                             int32_t column,
-                                             const void* values,
-                                             int64_t num_values,
-                                             const int16_t* def_levels,
-                                             const int16_t* rep_levels);
-carquet_status_t carquet_writer_new_row_group(carquet_writer_t* writer);
-carquet_status_t carquet_writer_close(carquet_writer_t* writer);
-```
-
-### Statistics and Filtering
-
-```c
-carquet_status_t carquet_reader_column_statistics(const carquet_reader_t* reader,
-                                                   int32_t row_group_index,
-                                                   int32_t column_index,
-                                                   carquet_column_statistics_t* stats);
-int32_t carquet_reader_filter_row_groups(const carquet_reader_t* reader,
-                                          int32_t column_index,
-                                          carquet_compare_op_t op,
-                                          const void* value,
-                                          int32_t value_size,
-                                          int32_t* matching_row_groups,
-                                          int32_t max_results);
-```
-
-## Examples
-
-Example programs are in the `examples/` directory:
-
-- **basic_write_read.c** - Simple write and read example
-- **data_types.c** - Using different data types
-- **compression_codecs.c** - Comparing compression codecs
-- **nullable_columns.c** - Working with NULL values
-
-Build and run examples:
-
-```bash
-cd build
-./example_basic_write_read
-./example_compression
-./example_data_types
-./example_nullable
-```
+All functions return `carquet_status_t` or use `carquet_error_t*` out-parameters. Programming errors (NULL where a valid pointer is required) trigger assertions; runtime errors (bad files, OOM) return error codes.
 
 ## Interoperability
 
-Carquet is tested bidirectionally with PyArrow, DuckDB, and fastparquet. Run `./interop/run_interop_tests.sh` to verify both directions (carquet reads others' files, others read carquet's files).
-
-### PyArrow Compatibility
-
-Files written by Carquet can be read by PyArrow and vice versa:
+Carquet files are fully compatible with PyArrow, DuckDB, Spark, and any Parquet reader:
 
 ```python
 import pyarrow.parquet as pq
-
-# Read Carquet-written file
-table = pq.read_table("carquet_output.parquet")
-print(table.to_pandas())
-
-# Write file for Carquet to read
-import pyarrow as pa
-table = pa.table({'id': [1, 2, 3], 'value': [1.1, 2.2, 3.3]})
-pq.write_table(table, "pyarrow_output.parquet", compression='snappy')
+table = pq.read_table("carquet_output.parquet")  # just works
 ```
-
-### Apache Spark
-
-```scala
-// Read Carquet file in Spark
-val df = spark.read.parquet("carquet_output.parquet")
-df.show()
-```
-
-### DuckDB
 
 ```sql
--- Read Carquet file in DuckDB
+-- DuckDB
 SELECT * FROM read_parquet('carquet_output.parquet');
 ```
+
+Bidirectional interop testing:
+
+```bash
+cmake -B build -DCARQUET_BUILD_INTEROP=ON && cmake --build build
+python3 interop/run_interop.py
+```
+
+## Parquet Feature Support
+
+| Feature | Status |
+|---------|--------|
+| Physical types | All 8 (BOOLEAN through FIXED_LEN_BYTE_ARRAY) |
+| Logical types | STRING, DATE, TIME, TIMESTAMP, DECIMAL, UUID, JSON |
+| Encodings | PLAIN, RLE, DICTIONARY, DELTA_BINARY_PACKED, DELTA_LENGTH_BYTE_ARRAY, DELTA_BYTE_ARRAY, BYTE_STREAM_SPLIT |
+| Compression | UNCOMPRESSED, SNAPPY, GZIP, LZ4, ZSTD |
+| Nested schemas | Groups, lists, maps with definition/repetition levels |
+| Bloom filters | Read and write |
+| Page indexes | Column index + offset index |
+| Statistics | Min/max/null count per column chunk |
+| CRC32 | Page-level verification (HW-accelerated on ARM) |
+| Memory-mapped I/O | Zero-copy reads for uncompressed PLAIN data |
+| Column projection | Read only selected columns |
+| OpenMP parallel reads | When available |
+| Encryption | Not supported |
+
+## Running Benchmarks
+
+```bash
+# Build with max optimizations
+cmake -B build -DCMAKE_BUILD_TYPE=Release -DCARQUET_NATIVE_ARCH=ON -DCARQUET_BUILD_DEV=ON
+cmake --build build -j$(nproc)
+
+cd build
+./benchmark_carquet                     # Carquet standalone
+python3 ../benchmark/run_benchmark.py   # Full comparison (+ PyArrow, + Arrow C++)
+
+# Skip 100M-row (xlarge) configs — they write ~2GB files per codec
+# and can take 30+ minutes depending on hardware
+python3 ../benchmark/run_benchmark.py --skip-xlarge
+
+# Override ZSTD level (default: 1)
+CARQUET_BENCH_ZSTD_LEVEL=3 python3 ../benchmark/run_benchmark.py
+```
+
+<details>
+<summary>Optional Arrow C++ benchmark</summary>
+
+```bash
+cmake -B build -DCMAKE_BUILD_TYPE=Release -DCARQUET_NATIVE_ARCH=ON \
+  -DCARQUET_BUILD_BENCHMARKS=ON \
+  -DCARQUET_BUILD_ARROW_CPP_BENCHMARK=ON
+cmake --build build -j$(nproc)
+
+# Or point at a custom Arrow install
+cmake -B build ... -DCARQUET_ARROW_CPP_ROOT=/path/to/arrow-prefix
+```
+
+The Arrow C++ benchmark mirrors Carquet's methodology: same data, row group sizing, no dictionary, page checksums, mmap reads, BYTE_STREAM_SPLIT for floats.
+
+</details>
+
+## API Reference
+
+Full API is in [`include/carquet/carquet.h`](include/carquet/carquet.h). Key types:
+
+| Type | Purpose |
+|------|---------|
+| `carquet_reader_t` | File reader (open from path, FILE*, or memory buffer) |
+| `carquet_writer_t` | File writer |
+| `carquet_batch_reader_t` | High-level batch iteration |
+| `carquet_schema_t` | Schema definition and introspection |
+| `carquet_error_t` | Rich error info (code, message, source location, recovery hint) |
+
+<details>
+<summary>Core API functions</summary>
+
+**Reader**
+```c
+carquet_reader_t* carquet_reader_open(const char* path, const carquet_reader_options_t* opts, carquet_error_t* err);
+carquet_reader_t* carquet_reader_open_buffer(const void* buf, size_t size, const carquet_reader_options_t* opts, carquet_error_t* err);
+void              carquet_reader_close(carquet_reader_t* reader);
+int64_t           carquet_reader_num_rows(const carquet_reader_t* reader);
+int32_t           carquet_reader_num_columns(const carquet_reader_t* reader);
+```
+
+**Batch Reader**
+```c
+carquet_batch_reader_t* carquet_batch_reader_create(carquet_reader_t* reader, const carquet_batch_reader_config_t* cfg, carquet_error_t* err);
+carquet_status_t        carquet_batch_reader_next(carquet_batch_reader_t* br, carquet_row_batch_t** batch);
+carquet_status_t        carquet_row_batch_column(const carquet_row_batch_t* batch, int32_t col, const void** data, const uint8_t** nulls, int64_t* n);
+```
+
+**Writer**
+```c
+carquet_writer_t*  carquet_writer_create(const char* path, const carquet_schema_t* schema, const carquet_writer_options_t* opts, carquet_error_t* err);
+carquet_status_t   carquet_writer_write_batch(carquet_writer_t* w, int32_t col, const void* values, int64_t n, const int16_t* def, const int16_t* rep);
+carquet_status_t   carquet_writer_close(carquet_writer_t* w);
+```
+
+**Schema**
+```c
+carquet_schema_t* carquet_schema_create(carquet_error_t* err);
+carquet_status_t  carquet_schema_add_column(carquet_schema_t* s, const char* name, carquet_physical_type_t type, const carquet_logical_type_t* logical, carquet_field_repetition_t rep, int32_t type_len, int32_t parent);
+int32_t           carquet_schema_add_list(carquet_schema_t* s, const char* name, carquet_physical_type_t elem_type, const carquet_logical_type_t* elem_logical, carquet_field_repetition_t rep, int32_t type_len, int32_t parent);
+int32_t           carquet_schema_add_map(carquet_schema_t* s, const char* name, carquet_physical_type_t key_type, const carquet_logical_type_t* key_logical, int32_t key_len, carquet_physical_type_t val_type, const carquet_logical_type_t* val_logical, int32_t val_len, carquet_field_repetition_t rep, int32_t parent);
+```
+
+**Filtering**
+```c
+int32_t carquet_reader_filter_row_groups(const carquet_reader_t* reader, int32_t col, carquet_compare_op_t op, const void* value, int32_t value_size, int32_t* matching, int32_t max);
+```
+
+</details>
 
 ## Project Structure
 
 ```
-carquet/
-├── include/carquet/     # Public headers
-│   ├── carquet.h        # Main API
-│   ├── types.h          # Type definitions
-│   └── error.h          # Error codes
-├── src/
-│   ├── compression/     # Compression codecs (LZ4, Snappy, GZIP, ZSTD)
-│   ├── core/            # Core utilities (arena, buffer, endian)
-│   ├── encoding/        # Parquet encodings (PLAIN, RLE, DELTA, etc.)
-│   ├── metadata/        # File metadata, schema, statistics
-│   ├── reader/          # File reader, batch reader, column reader
-│   ├── writer/          # File writer, page writer
-│   ├── simd/            # SIMD implementations (SSE, AVX, NEON)
-│   ├── thrift/          # Thrift compact protocol
-│   └── util/            # Utilities (CRC32, xxHash)
-├── tests/               # Test suite
-├── examples/            # Example programs
-├── benchmark/           # Performance benchmarks
-└── CMakeLists.txt
-```
-
-## Performance
-
-Benchmarked against PyArrow (Apache Arrow's C++ Parquet implementation via Python bindings). Three columns: INT64, DOUBLE, INT32. Trimmed median of 11-51 iterations per config, page cache purged between phases, 3s cooldown between configs.
-
-### Apple M3 (ARM64, macOS)
-
-*MacBook Air M3, macOS Tahoe 26.2, Carquet 0.2.0, PyArrow 20.0.0, `-DCARQUET_NATIVE_ARCH=ON`, ZSTD level 1*
-
-#### 10M rows (large)
-
-|                | Write (Carquet) | Write (PyArrow) | ratio | Read (Carquet) | Read (PyArrow) | ratio |
-|----------------|-----------------|-----------------|-------|----------------|----------------|-------|
-| UNCOMPRESSED   | 85.7ms          | 112.4ms         | **1.31x** | 8.4ms          | 44.0ms         | **5.3x** |
-| SNAPPY         | 195.3ms         | 245.0ms         | **1.25x** | 15.6ms         | 52.3ms         | **3.4x** |
-| ZSTD           | 309.1ms         | 367.7ms         | **1.19x** | 67.5ms         | 61.7ms         | 0.91x |
-
-#### 100M rows (xlarge)
-
-|                | Write (Carquet) | Write (PyArrow) | ratio | Read (Carquet) | Read (PyArrow) | ratio |
-|----------------|-----------------|-----------------|-------|----------------|----------------|-------|
-| UNCOMPRESSED   | 1399ms          | 1596ms          | **1.14x** | 92ms           | 741ms          | **8.0x** |
-| SNAPPY         | 2484ms          | 2711ms          | **1.09x** | 159ms          | 900ms          | **5.7x** |
-| ZSTD           | 3162ms          | 3755ms          | **1.19x** | 677ms          | 1120ms         | **1.7x** |
-
-#### Compression ratio (10M rows)
-
-| Codec | Carquet | PyArrow |
-|-------|---------|---------|
-| ZSTD  | 102.6 MB | 113.6 MB (**10% smaller**) |
-| SNAPPY | 187.1 MB | 144.7 MB |
-| UNCOMPRESSED | 190.7 MB | 190.8 MB |
-
-Carquet produces smaller ZSTD files because PyArrow writes dictionary-encoded pages with separate plain fallback, adding metadata overhead. For SNAPPY, PyArrow's dictionary encoding yields better compression on this data.
-
-### Intel Xeon D-1531 (x86_64, Linux)
-
-*Supermicro SYS-5038MD-H24TRF, Intel Xeon D-1531 (12 threads @ 2.7GHz), 32GB RAM, Ubuntu 24.04, PyArrow 23.0.0*
-
-#### Writing (10M rows)
-
-| Codec | Carquet | PyArrow | Speedup |
-|-------|---------|---------|---------|
-| UNCOMPRESSED | 5.6 M rows/sec | 4.0 M rows/sec | **1.40x** |
-| SNAPPY | 4.6 M rows/sec | 3.8 M rows/sec | **1.22x** |
-| ZSTD | 4.1 M rows/sec | 3.5 M rows/sec | **1.17x** |
-
-#### Reading (10M rows)
-
-| Codec | Carquet | PyArrow | Ratio |
-|-------|---------|---------|-------|
-| UNCOMPRESSED | 35 M rows/sec | 67 M rows/sec | 0.53x |
-| SNAPPY | 36 M rows/sec | 53 M rows/sec | 0.67x |
-| ZSTD | 26 M rows/sec | 49 M rows/sec | 0.52x |
-
-PyArrow reads faster on this x86 server. Arrow's C++ Parquet reader benefits from more aggressive SIMD vectorization on older x86 microarchitectures.
-
-### Running Benchmarks
-
-```bash
-# Build with maximum optimizations first
-cmake .. -DCMAKE_BUILD_TYPE=Release -DCARQUET_NATIVE_ARCH=ON
-make -j$(nproc)
-
-./benchmark_carquet                    # Carquet only
-python3 ../benchmark/run_benchmark.py   # Full comparison with PyArrow
-
-# Optional: override benchmark ZSTD level (default: 1)
-CARQUET_BENCH_ZSTD_LEVEL=3 python3 ../benchmark/run_benchmark.py
+include/carquet/   Public API (carquet.h, types.h, error.h)
+src/
+  core/            Arena allocator, buffer, bitpack, endian
+  encoding/        PLAIN, RLE, DELTA, DICTIONARY, BYTE_STREAM_SPLIT
+  compression/     Snappy (internal), GZIP, ZSTD, LZ4 (wrappers)
+  thrift/          Thrift compact protocol for Parquet metadata
+  simd/            Runtime dispatch + x86 (SSE/AVX2/AVX-512) + ARM (NEON/SVE)
+  reader/          File, row group, column, page, batch readers + mmap
+  writer/          File, row group, column, page writers
+  metadata/        Schema, statistics, bloom filters, page indexes
+  util/            CRC32, xxHash
+tests/             18 test files
+examples/          basic_write_read, data_types, compression_codecs, nullable_columns
+benchmark/         Performance benchmarks and comparison tools
 ```
 
 ## License
 
-MIT License
-
-## Contributing
-
-Contributions are welcome!
+MIT

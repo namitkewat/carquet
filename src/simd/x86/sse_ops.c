@@ -41,10 +41,81 @@ static inline int msvc_ctz(unsigned int x) {
 #include <smmintrin.h>
 #include <nmmintrin.h>
 
+static inline uint16_t sse_read_le16(const uint8_t* p) {
+    return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
+}
+
+static inline uint32_t sse_read_le24(const uint8_t* p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16);
+}
+
+static inline uint64_t sse_read_le40(const uint8_t* p) {
+    return (uint64_t)p[0] | ((uint64_t)p[1] << 8) | ((uint64_t)p[2] << 16) |
+           ((uint64_t)p[3] << 24) | ((uint64_t)p[4] << 32);
+}
+
+static inline uint64_t sse_read_le48(const uint8_t* p) {
+    return (uint64_t)p[0] | ((uint64_t)p[1] << 8) | ((uint64_t)p[2] << 16) |
+           ((uint64_t)p[3] << 24) | ((uint64_t)p[4] << 32) | ((uint64_t)p[5] << 40);
+}
+
+static inline uint64_t sse_read_le56(const uint8_t* p) {
+    return (uint64_t)p[0] | ((uint64_t)p[1] << 8) | ((uint64_t)p[2] << 16) |
+           ((uint64_t)p[3] << 24) | ((uint64_t)p[4] << 32) | ((uint64_t)p[5] << 40) |
+           ((uint64_t)p[6] << 48);
+}
+
 /* ============================================================================
  * Bit Unpacking - SSE Optimized
  * ============================================================================
  */
+
+/**
+ * Unpack 8 1-bit values using SSE.
+ */
+void carquet_sse_bitunpack8_1bit(const uint8_t* input, uint32_t* values) {
+    __m128i bytes = _mm_set1_epi8((char)input[0]);
+    const __m128i bit_mask = _mm_setr_epi8(
+        0x01, 0x02, 0x04, 0x08,
+        0x10, 0x20, 0x40, (char)0x80,
+        0, 0, 0, 0, 0, 0, 0, 0
+    );
+    __m128i masked = _mm_and_si128(bytes, bit_mask);
+    __m128i cmp = _mm_cmpeq_epi8(masked, bit_mask);
+    __m128i ones = _mm_set1_epi8(1);
+    __m128i result8 = _mm_and_si128(cmp, ones);
+    __m128i zero = _mm_setzero_si128();
+    __m128i words = _mm_unpacklo_epi8(result8, zero);
+    __m128i v0 = _mm_unpacklo_epi16(words, zero);
+    __m128i v1 = _mm_unpackhi_epi16(words, zero);
+
+    _mm_storeu_si128((__m128i*)(values + 0), v0);
+    _mm_storeu_si128((__m128i*)(values + 4), v1);
+}
+
+void carquet_sse_bitunpack8_2bit(const uint8_t* input, uint32_t* values) {
+    uint16_t v = sse_read_le16(input);
+    __m128i lo = _mm_setr_epi32(
+        (int)((v >> 0) & 0x3), (int)((v >> 2) & 0x3),
+        (int)((v >> 4) & 0x3), (int)((v >> 6) & 0x3));
+    __m128i hi = _mm_setr_epi32(
+        (int)((v >> 8) & 0x3), (int)((v >> 10) & 0x3),
+        (int)((v >> 12) & 0x3), (int)((v >> 14) & 0x3));
+    _mm_storeu_si128((__m128i*)(values + 0), lo);
+    _mm_storeu_si128((__m128i*)(values + 4), hi);
+}
+
+void carquet_sse_bitunpack8_3bit(const uint8_t* input, uint32_t* values) {
+    uint32_t v = sse_read_le24(input);
+    __m128i lo = _mm_setr_epi32(
+        (int)((v >> 0) & 0x7), (int)((v >> 3) & 0x7),
+        (int)((v >> 6) & 0x7), (int)((v >> 9) & 0x7));
+    __m128i hi = _mm_setr_epi32(
+        (int)((v >> 12) & 0x7), (int)((v >> 15) & 0x7),
+        (int)((v >> 18) & 0x7), (int)((v >> 21) & 0x7));
+    _mm_storeu_si128((__m128i*)(values + 0), lo);
+    _mm_storeu_si128((__m128i*)(values + 4), hi);
+}
 
 /**
  * Unpack 32 1-bit values using SSE.
@@ -136,6 +207,42 @@ void carquet_sse_bitunpack8_4bit(const uint8_t* input, uint32_t* values) {
     _mm_storeu_si128((__m128i*)(values + 4), v1);
 }
 
+void carquet_sse_bitunpack8_5bit(const uint8_t* input, uint32_t* values) {
+    uint64_t v = sse_read_le40(input);
+    __m128i lo = _mm_setr_epi32(
+        (int)((v >> 0) & 0x1F), (int)((v >> 5) & 0x1F),
+        (int)((v >> 10) & 0x1F), (int)((v >> 15) & 0x1F));
+    __m128i hi = _mm_setr_epi32(
+        (int)((v >> 20) & 0x1F), (int)((v >> 25) & 0x1F),
+        (int)((v >> 30) & 0x1F), (int)((v >> 35) & 0x1F));
+    _mm_storeu_si128((__m128i*)(values + 0), lo);
+    _mm_storeu_si128((__m128i*)(values + 4), hi);
+}
+
+void carquet_sse_bitunpack8_6bit(const uint8_t* input, uint32_t* values) {
+    uint64_t v = sse_read_le48(input);
+    __m128i lo = _mm_setr_epi32(
+        (int)((v >> 0) & 0x3F), (int)((v >> 6) & 0x3F),
+        (int)((v >> 12) & 0x3F), (int)((v >> 18) & 0x3F));
+    __m128i hi = _mm_setr_epi32(
+        (int)((v >> 24) & 0x3F), (int)((v >> 30) & 0x3F),
+        (int)((v >> 36) & 0x3F), (int)((v >> 42) & 0x3F));
+    _mm_storeu_si128((__m128i*)(values + 0), lo);
+    _mm_storeu_si128((__m128i*)(values + 4), hi);
+}
+
+void carquet_sse_bitunpack8_7bit(const uint8_t* input, uint32_t* values) {
+    uint64_t v = sse_read_le56(input);
+    __m128i lo = _mm_setr_epi32(
+        (int)((v >> 0) & 0x7F), (int)((v >> 7) & 0x7F),
+        (int)((v >> 14) & 0x7F), (int)((v >> 21) & 0x7F));
+    __m128i hi = _mm_setr_epi32(
+        (int)((v >> 28) & 0x7F), (int)((v >> 35) & 0x7F),
+        (int)((v >> 42) & 0x7F), (int)((v >> 49) & 0x7F));
+    _mm_storeu_si128((__m128i*)(values + 0), lo);
+    _mm_storeu_si128((__m128i*)(values + 4), hi);
+}
+
 /**
  * Unpack 8 8-bit values using SSE (widen u8 to u32).
  */
@@ -154,6 +261,18 @@ void carquet_sse_bitunpack8_8bit(const uint8_t* input, uint32_t* values) {
     _mm_storeu_si128((__m128i*)(values + 4), v1);
 }
 
+/**
+ * Unpack 8 16-bit values using SSE.
+ */
+void carquet_sse_bitunpack8_16bit(const uint8_t* input, uint32_t* values) {
+    __m128i words = _mm_loadu_si128((const __m128i*)input);
+    __m128i lo = _mm_cvtepu16_epi32(words);
+    __m128i hi = _mm_cvtepu16_epi32(_mm_srli_si128(words, 8));
+
+    _mm_storeu_si128((__m128i*)(values + 0), lo);
+    _mm_storeu_si128((__m128i*)(values + 4), hi);
+}
+
 /* ============================================================================
  * Byte Stream Split - SSE Optimized
  * ============================================================================
@@ -170,22 +289,18 @@ void carquet_sse_byte_stream_split_encode_float(
 
     const uint8_t* src = (const uint8_t*)values;
     int64_t i = 0;
+    const __m128i s0 = _mm_setr_epi8(0, 4, 8, 12, -1, -1, -1, -1,
+                                     -1, -1, -1, -1, -1, -1, -1, -1);
+    const __m128i s1 = _mm_setr_epi8(1, 5, 9, 13, -1, -1, -1, -1,
+                                     -1, -1, -1, -1, -1, -1, -1, -1);
+    const __m128i s2 = _mm_setr_epi8(2, 6, 10, 14, -1, -1, -1, -1,
+                                     -1, -1, -1, -1, -1, -1, -1, -1);
+    const __m128i s3 = _mm_setr_epi8(3, 7, 11, 15, -1, -1, -1, -1,
+                                     -1, -1, -1, -1, -1, -1, -1, -1);
 
     /* Process 4 floats (16 bytes) at a time */
     for (; i + 4 <= count; i += 4) {
         __m128i v = _mm_loadu_si128((const __m128i*)(src + i * 4));
-
-        /* Transpose using shuffles */
-        /* v = [a0 a1 a2 a3 | b0 b1 b2 b3 | c0 c1 c2 c3 | d0 d1 d2 d3] */
-        static const int8_t shuf_b0[16] = {0, 4, 8, 12, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1};
-        static const int8_t shuf_b1[16] = {1, 5, 9, 13, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1};
-        static const int8_t shuf_b2[16] = {2, 6, 10, 14, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1};
-        static const int8_t shuf_b3[16] = {3, 7, 11, 15, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1};
-
-        __m128i s0 = _mm_loadu_si128((const __m128i*)shuf_b0);
-        __m128i s1 = _mm_loadu_si128((const __m128i*)shuf_b1);
-        __m128i s2 = _mm_loadu_si128((const __m128i*)shuf_b2);
-        __m128i s3 = _mm_loadu_si128((const __m128i*)shuf_b3);
 
         __m128i out0 = _mm_shuffle_epi8(v, s0);
         __m128i out1 = _mm_shuffle_epi8(v, s1);
@@ -262,14 +377,44 @@ void carquet_sse_byte_stream_split_encode_double(
 
     const uint8_t* src = (const uint8_t*)values;
     int64_t i = 0;
+    const __m128i s0 = _mm_setr_epi8(0, 8, -1, -1, -1, -1, -1, -1,
+                                     -1, -1, -1, -1, -1, -1, -1, -1);
+    const __m128i s1 = _mm_setr_epi8(1, 9, -1, -1, -1, -1, -1, -1,
+                                     -1, -1, -1, -1, -1, -1, -1, -1);
+    const __m128i s2 = _mm_setr_epi8(2, 10, -1, -1, -1, -1, -1, -1,
+                                     -1, -1, -1, -1, -1, -1, -1, -1);
+    const __m128i s3 = _mm_setr_epi8(3, 11, -1, -1, -1, -1, -1, -1,
+                                     -1, -1, -1, -1, -1, -1, -1, -1);
+    const __m128i s4 = _mm_setr_epi8(4, 12, -1, -1, -1, -1, -1, -1,
+                                     -1, -1, -1, -1, -1, -1, -1, -1);
+    const __m128i s5 = _mm_setr_epi8(5, 13, -1, -1, -1, -1, -1, -1,
+                                     -1, -1, -1, -1, -1, -1, -1, -1);
+    const __m128i s6 = _mm_setr_epi8(6, 14, -1, -1, -1, -1, -1, -1,
+                                     -1, -1, -1, -1, -1, -1, -1, -1);
+    const __m128i s7 = _mm_setr_epi8(7, 15, -1, -1, -1, -1, -1, -1,
+                                     -1, -1, -1, -1, -1, -1, -1, -1);
 
     /* Process 2 doubles (16 bytes) at a time */
     for (; i + 2 <= count; i += 2) {
-        /* Transpose using shuffles for 8 byte streams */
-        for (int b = 0; b < 8; b++) {
-            output[b * count + i + 0] = ((const uint8_t*)(src + i * 8))[0 + b];
-            output[b * count + i + 1] = ((const uint8_t*)(src + i * 8))[8 + b];
-        }
+        __m128i v = _mm_loadu_si128((const __m128i*)(src + i * 8));
+
+        uint16_t t0 = (uint16_t)_mm_extract_epi16(_mm_shuffle_epi8(v, s0), 0);
+        uint16_t t1 = (uint16_t)_mm_extract_epi16(_mm_shuffle_epi8(v, s1), 0);
+        uint16_t t2 = (uint16_t)_mm_extract_epi16(_mm_shuffle_epi8(v, s2), 0);
+        uint16_t t3 = (uint16_t)_mm_extract_epi16(_mm_shuffle_epi8(v, s3), 0);
+        uint16_t t4 = (uint16_t)_mm_extract_epi16(_mm_shuffle_epi8(v, s4), 0);
+        uint16_t t5 = (uint16_t)_mm_extract_epi16(_mm_shuffle_epi8(v, s5), 0);
+        uint16_t t6 = (uint16_t)_mm_extract_epi16(_mm_shuffle_epi8(v, s6), 0);
+        uint16_t t7 = (uint16_t)_mm_extract_epi16(_mm_shuffle_epi8(v, s7), 0);
+
+        memcpy(output + 0 * count + i, &t0, sizeof(t0));
+        memcpy(output + 1 * count + i, &t1, sizeof(t1));
+        memcpy(output + 2 * count + i, &t2, sizeof(t2));
+        memcpy(output + 3 * count + i, &t3, sizeof(t3));
+        memcpy(output + 4 * count + i, &t4, sizeof(t4));
+        memcpy(output + 5 * count + i, &t5, sizeof(t5));
+        memcpy(output + 6 * count + i, &t6, sizeof(t6));
+        memcpy(output + 7 * count + i, &t7, sizeof(t7));
     }
 
     /* Handle remaining values */
@@ -291,7 +436,37 @@ void carquet_sse_byte_stream_split_decode_double(
     uint8_t* dst = (uint8_t*)values;
     int64_t i = 0;
 
-    /* Handle values */
+    for (; i + 2 <= count; i += 2) {
+        uint16_t b0, b1, b2, b3, b4, b5, b6, b7;
+        memcpy(&b0, data + 0 * count + i, sizeof(b0));
+        memcpy(&b1, data + 1 * count + i, sizeof(b1));
+        memcpy(&b2, data + 2 * count + i, sizeof(b2));
+        memcpy(&b3, data + 3 * count + i, sizeof(b3));
+        memcpy(&b4, data + 4 * count + i, sizeof(b4));
+        memcpy(&b5, data + 5 * count + i, sizeof(b5));
+        memcpy(&b6, data + 6 * count + i, sizeof(b6));
+        memcpy(&b7, data + 7 * count + i, sizeof(b7));
+
+        __m128i s0 = _mm_cvtsi32_si128((int)b0);
+        __m128i s1 = _mm_cvtsi32_si128((int)b1);
+        __m128i s2 = _mm_cvtsi32_si128((int)b2);
+        __m128i s3 = _mm_cvtsi32_si128((int)b3);
+        __m128i s4 = _mm_cvtsi32_si128((int)b4);
+        __m128i s5 = _mm_cvtsi32_si128((int)b5);
+        __m128i s6 = _mm_cvtsi32_si128((int)b6);
+        __m128i s7 = _mm_cvtsi32_si128((int)b7);
+
+        __m128i u01 = _mm_unpacklo_epi8(s0, s1);
+        __m128i u23 = _mm_unpacklo_epi8(s2, s3);
+        __m128i u45 = _mm_unpacklo_epi8(s4, s5);
+        __m128i u67 = _mm_unpacklo_epi8(s6, s7);
+        __m128i v0 = _mm_unpacklo_epi16(u01, u23);
+        __m128i v1 = _mm_unpacklo_epi16(u45, u67);
+        __m128i result = _mm_unpacklo_epi32(v0, v1);
+
+        _mm_storeu_si128((__m128i*)(dst + i * 8), result);
+    }
+
     for (; i < count; i++) {
         for (int b = 0; b < 8; b++) {
             dst[i * 8 + b] = data[b * count + i];
@@ -361,10 +536,8 @@ void carquet_sse_prefix_sum_i64(int64_t* values, int64_t count, int64_t initial)
         v = _mm_add_epi64(v, sums);
         _mm_storeu_si128((__m128i*)(values + i), v);
 
-        /* Update running sum */
-        int64_t result[2];
-        _mm_storeu_si128((__m128i*)result, v);
-        sum = result[1];
+        /* Update running sum without spilling the whole vector */
+        sum = _mm_extract_epi64(v, 1);
     }
 
     /* Handle remaining values */
@@ -552,6 +725,95 @@ void carquet_sse_gather_double(const double* dict, const uint32_t* indices,
     }
 }
 
+static inline int sse_indices_in_bounds_4(const uint32_t* indices, uint32_t limit) {
+    __m128i idx = _mm_loadu_si128((const __m128i*)indices);
+    __m128i bias = _mm_set1_epi32((int)0x80000000u);
+    __m128i idx_biased = _mm_xor_si128(idx, bias);
+    __m128i limit_biased = _mm_set1_epi32((int)(limit ^ 0x80000000u));
+    __m128i cmp = _mm_cmplt_epi32(idx_biased, limit_biased);
+    return _mm_movemask_epi8(cmp) == 0xFFFF;
+}
+
+bool carquet_sse_checked_gather_i32(const int32_t* dict, int32_t dict_count,
+                                     const uint32_t* indices, int64_t count,
+                                     int32_t* output) {
+    int64_t i = 0;
+    uint32_t limit = (uint32_t)dict_count;
+
+    for (; i + 4 <= count; i += 4) {
+        if (!sse_indices_in_bounds_4(indices + i, limit)) {
+            return false;
+        }
+
+        __builtin_prefetch(indices + i + 8, 0, 1);
+        __builtin_prefetch(dict + indices[i], 0, 0);
+        __builtin_prefetch(dict + indices[i + 2], 0, 0);
+
+        __m128i result = _mm_set_epi32(
+            dict[indices[i + 3]],
+            dict[indices[i + 2]],
+            dict[indices[i + 1]],
+            dict[indices[i + 0]]);
+        _mm_storeu_si128((__m128i*)(output + i), result);
+    }
+
+    for (; i < count; i++) {
+        uint32_t idx = indices[i];
+        if (idx >= limit) {
+            return false;
+        }
+        output[i] = dict[idx];
+    }
+
+    return true;
+}
+
+bool carquet_sse_checked_gather_i64(const int64_t* dict, int32_t dict_count,
+                                     const uint32_t* indices, int64_t count,
+                                     int64_t* output) {
+    int64_t i = 0;
+    uint32_t limit = (uint32_t)dict_count;
+
+    for (; i + 4 <= count; i += 4) {
+        if (!sse_indices_in_bounds_4(indices + i, limit)) {
+            return false;
+        }
+
+        __builtin_prefetch(indices + i + 8, 0, 1);
+        __builtin_prefetch(dict + indices[i], 0, 0);
+        __builtin_prefetch(dict + indices[i + 2], 0, 0);
+
+        __m128i result0 = _mm_set_epi64x(dict[indices[i + 1]], dict[indices[i + 0]]);
+        __m128i result1 = _mm_set_epi64x(dict[indices[i + 3]], dict[indices[i + 2]]);
+        _mm_storeu_si128((__m128i*)(output + i), result0);
+        _mm_storeu_si128((__m128i*)(output + i + 2), result1);
+    }
+
+    for (; i < count; i++) {
+        uint32_t idx = indices[i];
+        if (idx >= limit) {
+            return false;
+        }
+        output[i] = dict[idx];
+    }
+
+    return true;
+}
+
+bool carquet_sse_checked_gather_float(const float* dict, int32_t dict_count,
+                                       const uint32_t* indices, int64_t count,
+                                       float* output) {
+    return carquet_sse_checked_gather_i32(
+        (const int32_t*)dict, dict_count, indices, count, (int32_t*)output);
+}
+
+bool carquet_sse_checked_gather_double(const double* dict, int32_t dict_count,
+                                        const uint32_t* indices, int64_t count,
+                                        double* output) {
+    return carquet_sse_checked_gather_i64(
+        (const int64_t*)dict, dict_count, indices, count, (int64_t*)output);
+}
+
 /* ============================================================================
  * CRC32C - SSE4.2 Hardware Acceleration
  * ============================================================================
@@ -673,6 +935,14 @@ void carquet_sse_memcpy_small(void* dest, const void* src, size_t n) {
  */
 void carquet_sse_unpack_bools(const uint8_t* input, uint8_t* output, int64_t count) {
     int64_t i = 0;
+    const __m128i mask = _mm_set_epi8(
+        (char)0x80, 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01,
+        (char)0x80, 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01
+    );
+    const __m128i shuf = _mm_setr_epi8(
+        0, 0, 0, 0, 0, 0, 0, 0,
+        1, 1, 1, 1, 1, 1, 1, 1
+    );
 
     /* Process 16 bools (2 bytes) at a time */
     for (; i + 16 <= count; i += 16) {
@@ -682,18 +952,8 @@ void carquet_sse_unpack_bools(const uint8_t* input, uint8_t* output, int64_t cou
 
         __m128i bits = _mm_set1_epi16(packed);
 
-        /* Create masks for each bit position */
-        __m128i mask = _mm_set_epi8(
-            (char)0x80, 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01,
-            (char)0x80, 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01
-        );
-
         /* Expand each byte for its corresponding bits */
-        static const int8_t shuf[16] = {
-            0, 0, 0, 0, 0, 0, 0, 0,
-            1, 1, 1, 1, 1, 1, 1, 1
-        };
-        __m128i shuffled = _mm_shuffle_epi8(bits, _mm_loadu_si128((const __m128i*)shuf));
+        __m128i shuffled = _mm_shuffle_epi8(bits, shuf);
 
         /* AND with mask and normalize to 0/1 */
         __m128i masked = _mm_and_si128(shuffled, mask);
@@ -815,11 +1075,42 @@ void carquet_sse_match_copy(uint8_t* dst, const uint8_t* src, size_t len, size_t
         for (size_t i = 0; i < len; i++) {
             dst[i] = src[i];
         }
-    } else {
-        /* General overlapping case: copy byte by byte */
+    } else if (offset >= 8) {
+        /* Offset 8-15: copy 8 bytes at a time (no SSE, but 64-bit safe) */
+        while (len >= 8) {
+            /* Must use memmove-style since src+8 may overlap dst */
+            uint64_t v;
+            memcpy(&v, src, 8);
+            memcpy(dst, &v, 8);
+            dst += 8;
+            src += 8;
+            len -= 8;
+        }
         while (len > 0) {
             *dst++ = *src++;
             len--;
+        }
+    } else {
+        /* Offset 3, 5, 6, 7: expand pattern then use SSE fill */
+        uint8_t pattern[16];
+        /* Copy base pattern bytes */
+        for (size_t i = 0; i < offset && i < 16; i++) {
+            pattern[i] = src[i];
+        }
+        /* Tile pattern to fill 16 bytes; offset is 3..7 here */
+        for (size_t i = offset; i < 16; i++) {
+            pattern[i] = pattern[i % offset];
+        }
+        __m128i v = _mm_loadu_si128((const __m128i*)pattern);
+
+        while (len >= 16) {
+            _mm_storeu_si128((__m128i*)dst, v);
+            dst += 16;
+            len -= 16;
+        }
+        /* Remaining bytes from pattern */
+        for (size_t i = 0; i < len; i++) {
+            dst[i] = pattern[i % offset];
         }
     }
 }
@@ -980,6 +1271,274 @@ void carquet_sse_fill_def_levels(int16_t* def_levels, int64_t count, int16_t val
     for (; i < count; i++) {
         def_levels[i] = value;
     }
+}
+
+void carquet_sse_minmax_i32(const int32_t* values, int64_t count,
+                             int32_t* min_value, int32_t* max_value) {
+    int32_t min_v = values[0];
+    int32_t max_v = values[0];
+    __m128i min_vec = _mm_set1_epi32(min_v);
+    __m128i max_vec = _mm_set1_epi32(max_v);
+    int64_t i = 1;
+
+    for (; i + 4 <= count; i += 4) {
+        __m128i v = _mm_loadu_si128((const __m128i*)(values + i));
+        min_vec = _mm_min_epi32(min_vec, v);
+        max_vec = _mm_max_epi32(max_vec, v);
+    }
+
+    int32_t tmp_min[4];
+    int32_t tmp_max[4];
+    _mm_storeu_si128((__m128i*)tmp_min, min_vec);
+    _mm_storeu_si128((__m128i*)tmp_max, max_vec);
+    for (int j = 0; j < 4; j++) {
+        if (tmp_min[j] < min_v) min_v = tmp_min[j];
+        if (tmp_max[j] > max_v) max_v = tmp_max[j];
+    }
+    for (; i < count; i++) {
+        if (values[i] < min_v) min_v = values[i];
+        if (values[i] > max_v) max_v = values[i];
+    }
+
+    *min_value = min_v;
+    *max_value = max_v;
+}
+
+void carquet_sse_minmax_i64(const int64_t* values, int64_t count,
+                             int64_t* min_value, int64_t* max_value) {
+    int64_t min_v = values[0];
+    int64_t max_v = values[0];
+    __m128i min_vec = _mm_set1_epi64x(min_v);
+    __m128i max_vec = _mm_set1_epi64x(max_v);
+    int64_t i = 1;
+
+    for (; i + 2 <= count; i += 2) {
+        __m128i v = _mm_loadu_si128((const __m128i*)(values + i));
+        __m128i lt = _mm_cmpgt_epi64(min_vec, v);
+        __m128i gt = _mm_cmpgt_epi64(v, max_vec);
+        min_vec = _mm_blendv_epi8(min_vec, v, lt);
+        max_vec = _mm_blendv_epi8(max_vec, v, gt);
+    }
+
+    int64_t tmp_min[2];
+    int64_t tmp_max[2];
+    _mm_storeu_si128((__m128i*)tmp_min, min_vec);
+    _mm_storeu_si128((__m128i*)tmp_max, max_vec);
+    for (int j = 0; j < 2; j++) {
+        if (tmp_min[j] < min_v) min_v = tmp_min[j];
+        if (tmp_max[j] > max_v) max_v = tmp_max[j];
+    }
+    for (; i < count; i++) {
+        if (values[i] < min_v) min_v = values[i];
+        if (values[i] > max_v) max_v = values[i];
+    }
+
+    *min_value = min_v;
+    *max_value = max_v;
+}
+
+void carquet_sse_minmax_float(const float* values, int64_t count,
+                               float* min_value, float* max_value) {
+    float min_v = values[0];
+    float max_v = values[0];
+    __m128 min_vec = _mm_set1_ps(min_v);
+    __m128 max_vec = _mm_set1_ps(max_v);
+    int64_t i = 1;
+
+    for (; i + 4 <= count; i += 4) {
+        __m128 v = _mm_loadu_ps(values + i);
+        __m128 lt = _mm_cmplt_ps(v, min_vec);
+        __m128 gt = _mm_cmpgt_ps(v, max_vec);
+        min_vec = _mm_blendv_ps(min_vec, v, lt);
+        max_vec = _mm_blendv_ps(max_vec, v, gt);
+    }
+
+    float tmp_min[4];
+    float tmp_max[4];
+    _mm_storeu_ps(tmp_min, min_vec);
+    _mm_storeu_ps(tmp_max, max_vec);
+    for (int j = 0; j < 4; j++) {
+        if (tmp_min[j] < min_v) min_v = tmp_min[j];
+        if (tmp_max[j] > max_v) max_v = tmp_max[j];
+    }
+    for (; i < count; i++) {
+        if (values[i] < min_v) min_v = values[i];
+        if (values[i] > max_v) max_v = values[i];
+    }
+
+    *min_value = min_v;
+    *max_value = max_v;
+}
+
+void carquet_sse_minmax_double(const double* values, int64_t count,
+                                double* min_value, double* max_value) {
+    double min_v = values[0];
+    double max_v = values[0];
+    __m128d min_vec = _mm_set1_pd(min_v);
+    __m128d max_vec = _mm_set1_pd(max_v);
+    int64_t i = 1;
+
+    for (; i + 2 <= count; i += 2) {
+        __m128d v = _mm_loadu_pd(values + i);
+        __m128d lt = _mm_cmplt_pd(v, min_vec);
+        __m128d gt = _mm_cmpgt_pd(v, max_vec);
+        min_vec = _mm_blendv_pd(min_vec, v, lt);
+        max_vec = _mm_blendv_pd(max_vec, v, gt);
+    }
+
+    double tmp_min[2];
+    double tmp_max[2];
+    _mm_storeu_pd(tmp_min, min_vec);
+    _mm_storeu_pd(tmp_max, max_vec);
+    for (int j = 0; j < 2; j++) {
+        if (tmp_min[j] < min_v) min_v = tmp_min[j];
+        if (tmp_max[j] > max_v) max_v = tmp_max[j];
+    }
+    for (; i < count; i++) {
+        if (values[i] < min_v) min_v = values[i];
+        if (values[i] > max_v) max_v = values[i];
+    }
+
+    *min_value = min_v;
+    *max_value = max_v;
+}
+
+void carquet_sse_copy_minmax_i32(const int32_t* values, int64_t count, int32_t* output,
+                                  int32_t* min_value, int32_t* max_value) {
+    int32_t min_v = values[0];
+    int32_t max_v = values[0];
+    __m128i min_vec = _mm_set1_epi32(min_v);
+    __m128i max_vec = _mm_set1_epi32(max_v);
+    int64_t i = 0;
+
+    for (; i + 4 <= count; i += 4) {
+        __m128i v = _mm_loadu_si128((const __m128i*)(values + i));
+        _mm_storeu_si128((__m128i*)(output + i), v);
+        min_vec = _mm_min_epi32(min_vec, v);
+        max_vec = _mm_max_epi32(max_vec, v);
+    }
+
+    int32_t tmp_min[4];
+    int32_t tmp_max[4];
+    _mm_storeu_si128((__m128i*)tmp_min, min_vec);
+    _mm_storeu_si128((__m128i*)tmp_max, max_vec);
+    for (int j = 0; j < 4; j++) {
+        if (tmp_min[j] < min_v) min_v = tmp_min[j];
+        if (tmp_max[j] > max_v) max_v = tmp_max[j];
+    }
+    for (; i < count; i++) {
+        int32_t v = values[i];
+        output[i] = v;
+        if (v < min_v) min_v = v;
+        if (v > max_v) max_v = v;
+    }
+    *min_value = min_v;
+    *max_value = max_v;
+}
+
+void carquet_sse_copy_minmax_i64(const int64_t* values, int64_t count, int64_t* output,
+                                  int64_t* min_value, int64_t* max_value) {
+    int64_t min_v = values[0];
+    int64_t max_v = values[0];
+    __m128i min_vec = _mm_set1_epi64x(min_v);
+    __m128i max_vec = _mm_set1_epi64x(max_v);
+    int64_t i = 0;
+
+    for (; i + 2 <= count; i += 2) {
+        __m128i v = _mm_loadu_si128((const __m128i*)(values + i));
+        _mm_storeu_si128((__m128i*)(output + i), v);
+        __m128i lt = _mm_cmpgt_epi64(min_vec, v);
+        __m128i gt = _mm_cmpgt_epi64(v, max_vec);
+        min_vec = _mm_blendv_epi8(min_vec, v, lt);
+        max_vec = _mm_blendv_epi8(max_vec, v, gt);
+    }
+
+    int64_t tmp_min[2];
+    int64_t tmp_max[2];
+    _mm_storeu_si128((__m128i*)tmp_min, min_vec);
+    _mm_storeu_si128((__m128i*)tmp_max, max_vec);
+    for (int j = 0; j < 2; j++) {
+        if (tmp_min[j] < min_v) min_v = tmp_min[j];
+        if (tmp_max[j] > max_v) max_v = tmp_max[j];
+    }
+    for (; i < count; i++) {
+        int64_t v = values[i];
+        output[i] = v;
+        if (v < min_v) min_v = v;
+        if (v > max_v) max_v = v;
+    }
+    *min_value = min_v;
+    *max_value = max_v;
+}
+
+void carquet_sse_copy_minmax_float(const float* values, int64_t count, float* output,
+                                    float* min_value, float* max_value) {
+    float min_v = values[0];
+    float max_v = values[0];
+    __m128 min_vec = _mm_set1_ps(min_v);
+    __m128 max_vec = _mm_set1_ps(max_v);
+    int64_t i = 0;
+
+    for (; i + 4 <= count; i += 4) {
+        __m128 v = _mm_loadu_ps(values + i);
+        _mm_storeu_ps(output + i, v);
+        __m128 lt = _mm_cmplt_ps(v, min_vec);
+        __m128 gt = _mm_cmpgt_ps(v, max_vec);
+        min_vec = _mm_blendv_ps(min_vec, v, lt);
+        max_vec = _mm_blendv_ps(max_vec, v, gt);
+    }
+
+    float tmp_min[4];
+    float tmp_max[4];
+    _mm_storeu_ps(tmp_min, min_vec);
+    _mm_storeu_ps(tmp_max, max_vec);
+    for (int j = 0; j < 4; j++) {
+        if (tmp_min[j] < min_v) min_v = tmp_min[j];
+        if (tmp_max[j] > max_v) max_v = tmp_max[j];
+    }
+    for (; i < count; i++) {
+        float v = values[i];
+        output[i] = v;
+        if (v < min_v) min_v = v;
+        if (v > max_v) max_v = v;
+    }
+    *min_value = min_v;
+    *max_value = max_v;
+}
+
+void carquet_sse_copy_minmax_double(const double* values, int64_t count, double* output,
+                                     double* min_value, double* max_value) {
+    double min_v = values[0];
+    double max_v = values[0];
+    __m128d min_vec = _mm_set1_pd(min_v);
+    __m128d max_vec = _mm_set1_pd(max_v);
+    int64_t i = 0;
+
+    for (; i + 2 <= count; i += 2) {
+        __m128d v = _mm_loadu_pd(values + i);
+        _mm_storeu_pd(output + i, v);
+        __m128d lt = _mm_cmplt_pd(v, min_vec);
+        __m128d gt = _mm_cmpgt_pd(v, max_vec);
+        min_vec = _mm_blendv_pd(min_vec, v, lt);
+        max_vec = _mm_blendv_pd(max_vec, v, gt);
+    }
+
+    double tmp_min[2];
+    double tmp_max[2];
+    _mm_storeu_pd(tmp_min, min_vec);
+    _mm_storeu_pd(tmp_max, max_vec);
+    for (int j = 0; j < 2; j++) {
+        if (tmp_min[j] < min_v) min_v = tmp_min[j];
+        if (tmp_max[j] > max_v) max_v = tmp_max[j];
+    }
+    for (; i < count; i++) {
+        double v = values[i];
+        output[i] = v;
+        if (v < min_v) min_v = v;
+        if (v > max_v) max_v = v;
+    }
+    *min_value = min_v;
+    *max_value = max_v;
 }
 
 #endif /* __SSE4_2__ */

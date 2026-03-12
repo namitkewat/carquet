@@ -50,7 +50,7 @@ jobs:
         cmake   -G "Ninja"  \
               -DCMAKE_BUILD_TYPE=RelWithDebInfo \
               -DBUILD_SHARED_LIBS=$BUILD_SHARED_LIBS \
-              -DBUILD_TESTING=ON \
+              -DCARQUET_BUILD_TESTS=ON \
               -DCMAKE_INSTALL_PREFIX=${CONDA_PREFIX} \
               ..
 
@@ -69,6 +69,36 @@ jobs:
           ctest -VV --rerun-failed --output-on-failure
        working-directory: ./build
 
+  redhat-build:
+    name: Rocky Linux 9
+    runs-on: ubuntu-latest
+    container:
+      image: rockylinux:9
+
+    steps:
+     - name: Install build dependencies
+       run: |
+          dnf install -y \
+            gcc gcc-c++ \
+            cmake ninja-build make git \
+            pkgconf-pkg-config \
+            zlib-devel libzstd-devel lz4-devel
+
+     - uses: actions/checkout@v4
+
+     - name: Configure
+       run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCARQUET_BUILD_TESTS=ON
+
+     - name: Compile
+       run: |
+          cmake --build build --parallel
+
+     - name: Test
+       run: |
+          ctest --test-dir build -VV --rerun-failed --output-on-failure
 
 
 

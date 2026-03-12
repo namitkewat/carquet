@@ -8,6 +8,7 @@
 #include <carquet/error.h>
 #include <stdint.h>
 #include <stddef.h>
+#include <limits.h>
 #include <zlib.h>
 
 int carquet_gzip_decompress(
@@ -18,6 +19,10 @@ int carquet_gzip_decompress(
     size_t* dst_size) {
 
     if (!src || !dst || !dst_size) {
+        return CARQUET_ERROR_INVALID_ARGUMENT;
+    }
+
+    if (src_size > (size_t)UINT_MAX || dst_capacity > (size_t)UINT_MAX) {
         return CARQUET_ERROR_INVALID_ARGUMENT;
     }
 
@@ -53,6 +58,10 @@ int carquet_gzip_compress(
     int level) {
 
     if (!src || !dst || !dst_size) {
+        return CARQUET_ERROR_INVALID_ARGUMENT;
+    }
+
+    if (src_size > (size_t)UINT_MAX || dst_capacity > (size_t)UINT_MAX) {
         return CARQUET_ERROR_INVALID_ARGUMENT;
     }
 
