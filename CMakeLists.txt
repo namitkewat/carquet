@@ -342,6 +342,9 @@ if(CARQUET_ARCH_X86)
         if(CARQUET_COMPILER_GCC_LIKE)
             set_source_files_properties(src/simd/x86/avx_ops.c PROPERTIES
                 COMPILE_FLAGS "-mavx -msse4.2")
+        elseif(CARQUET_COMPILER_MSVC)
+            set_source_files_properties(src/simd/x86/avx_ops.c PROPERTIES
+                COMPILE_FLAGS "/arch:AVX")
         endif()
     endif()
 
