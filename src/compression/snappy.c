@@ -323,14 +323,24 @@ static inline uint8_t* incremental_copy(const uint8_t* src, uint8_t* op,
                 pattern_size *= 2;
             }
             if (SNAPPY_PREDICT_TRUE(op >= op_limit)) return op_limit;
+            /* Pattern is now 8 bytes wide — use 8-byte block copies.
+               We must NOT fall through to copy128 since only 8 bytes of the
+               pattern are valid; a 16-byte read would pick up garbage. */
             src = op - pattern_size;
+            while (op + 8 <= op_limit && op + 8 <= buf_limit) {
+                copy64(src, op);
+                src += 8;
+                op += 8;
+            }
+            if (op >= op_limit) return op_limit;
+            return incremental_copy_slow(src, op, op_limit);
         } else {
             return incremental_copy_slow(src, op, op_limit);
         }
 #endif
     }
 
-    /* pattern_size >= big_pattern: simple block copies */
+    /* pattern_size >= big_pattern (>= 16 with SIMD): simple block copies */
     if (SNAPPY_PREDICT_TRUE(op_limit <= buf_limit - 15)) {
         copy128(src, op);
         if (op + 16 < op_limit) copy128(src + 16, op + 16);
