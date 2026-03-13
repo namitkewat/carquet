@@ -21,7 +21,7 @@ static int test_version(void) {
     carquet_version_components(&major, &minor, &patch);
     assert(major == 0);
     assert(minor == 3);
-    assert(patch == 0);
+    assert(patch == 1);
 
     TEST_PASS("version");
     return 0;
