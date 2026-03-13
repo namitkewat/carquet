@@ -30,7 +30,7 @@
 #define BENCH_ITERATIONS_SMALL 51
 #define BENCH_ITERATIONS_MEDIUM 21
 #define BENCH_ITERATIONS_LARGE 11
-#define MAX_BENCH_ITERATIONS 51
+#define MAX_BENCH_ITERATIONS 201
 
 typedef struct {
     const char* name;
@@ -366,11 +366,17 @@ static bool run_benchmark(const char* dataset_name, int num_rows,
         return false;
     }
 
-    int iters = BENCH_ITERATIONS_LARGE;
-    if (num_rows <= 100000) {
+    int iters;
+    const char* iter_env = std::getenv("CARQUET_BENCH_ITERATIONS");
+    if (iter_env && std::atoi(iter_env) > 0) {
+        iters = std::atoi(iter_env);
+        if (iters > MAX_BENCH_ITERATIONS) iters = MAX_BENCH_ITERATIONS;
+    } else if (num_rows <= 100000) {
         iters = BENCH_ITERATIONS_SMALL;
     } else if (num_rows <= 1000000) {
         iters = BENCH_ITERATIONS_MEDIUM;
+    } else {
+        iters = BENCH_ITERATIONS_LARGE;
     }
 
     for (int i = 0; i < WARMUP_ITERATIONS; ++i) {

@@ -1,8 +1,24 @@
 /**
  * @file snappy.c
- * @brief Pure C Snappy compression/decompression
+ * @brief Optimized C Snappy compression/decompression
+ *
+ * Based on Google's Snappy (BSD-3-Clause license).
+ * Ported from C++ to C with NEON SIMD support for ARM and
+ * branchless decompression loop.
  *
  * Reference: https://github.com/google/snappy/blob/main/format_description.txt
+ *
+ * Copyright 2005 Google Inc. All Rights Reserved.
+ * Copyright 2024 carquet contributors.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *   * Redistributions of source code must retain the above copyright notice.
+ *   * Redistributions in binary form must reproduce the above copyright notice
+ *     in the documentation and/or other materials provided with the distribution.
+ *   * Neither the name of Google Inc. nor the names of its contributors may be
+ *     used to endorse or promote products derived from this software without
+ *     specific prior written permission.
  */
 
 #include <carquet/error.h>
@@ -10,48 +26,175 @@
 #include <stddef.h>
 #include <string.h>
 
-extern size_t carquet_dispatch_match_length(const uint8_t* p, const uint8_t* match, const uint8_t* limit);
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+#include <arm_neon.h>
+#define SNAPPY_HAVE_NEON 1
+#else
+#define SNAPPY_HAVE_NEON 0
+#endif
 
-/* ============================================================================
- * Constants
- * ============================================================================
- */
+#if defined(__SSE2__)
+#include <emmintrin.h>
+#define SNAPPY_HAVE_SSE2 1
+#else
+#define SNAPPY_HAVE_SSE2 0
+#endif
 
-#define SNAPPY_LITERAL         0
-#define SNAPPY_COPY_1          1
-#define SNAPPY_COPY_2          2
-#define SNAPPY_COPY_4          3
+#if defined(__SSSE3__)
+#include <tmmintrin.h>
+#define SNAPPY_HAVE_SSSE3 1
+#else
+#define SNAPPY_HAVE_SSSE3 0
+#endif
 
-#define SNAPPY_HASH_LOG        14
-#define SNAPPY_HASH_SIZE       (1 << SNAPPY_HASH_LOG)
-#define SNAPPY_MAX_OFFSET      65535
-#define SNAPPY_BLOCK_SIZE      (1 << 16)
+#if SNAPPY_HAVE_SSSE3 || SNAPPY_HAVE_NEON
+#define SNAPPY_HAVE_VECTOR_SHUFFLE 1
+#else
+#define SNAPPY_HAVE_VECTOR_SHUFFLE 0
+#endif
+
+#if defined(__GNUC__) || defined(__clang__)
+#define SNAPPY_PREDICT_TRUE(x)  __builtin_expect(!!(x), 1)
+#define SNAPPY_PREDICT_FALSE(x) __builtin_expect(!!(x), 0)
+#define SNAPPY_PREFETCH(addr)   __builtin_prefetch((addr), 0, 1)
+#define SNAPPY_CTZ64(x)         __builtin_ctzll(x)
+#define SNAPPY_CLZ32(x)         __builtin_clz(x)
+#elif defined(_MSC_VER)
+#include <intrin.h>
+#define SNAPPY_PREDICT_TRUE(x)  (x)
+#define SNAPPY_PREDICT_FALSE(x) (x)
+#define SNAPPY_PREFETCH(addr)   ((void)0)
+static inline int snappy_ctz64(uint64_t x) {
+    unsigned long idx; _BitScanForward64(&idx, x); return (int)idx;
+}
+#define SNAPPY_CTZ64(x) snappy_ctz64(x)
+static inline int snappy_clz32(uint32_t x) {
+    unsigned long idx; _BitScanReverse(&idx, x); return 31 - (int)idx;
+}
+#define SNAPPY_CLZ32(x) snappy_clz32(x)
+#else
+#define SNAPPY_PREDICT_TRUE(x)  (x)
+#define SNAPPY_PREDICT_FALSE(x) (x)
+#define SNAPPY_PREFETCH(addr)   ((void)0)
+#define SNAPPY_CTZ64(x)         snappy_ctz64_fallback(x)
+#define SNAPPY_CLZ32(x)         snappy_clz32_fallback(x)
+static inline int snappy_ctz64_fallback(uint64_t x) {
+    int n = 0; while (!(x & 1)) { x >>= 1; n++; } return n;
+}
+static inline int snappy_clz32_fallback(uint32_t x) {
+    int n = 0; while (!(x & 0x80000000u)) { x <<= 1; n++; } return n;
+}
+#endif
+
+/* Tag types */
+#define SNAPPY_LITERAL   0
+#define SNAPPY_COPY_1    1
+#define SNAPPY_COPY_2    2
+#define SNAPPY_COPY_4    3
+
+/* Compression constants */
+#define SNAPPY_HASH_LOG  14
+#define SNAPPY_HASH_SIZE (1 << SNAPPY_HASH_LOG)
+#define SNAPPY_MAX_OFFSET 65535
+#define SNAPPY_BLOCK_SIZE (1 << 16)
+
+/* Slop bytes for unconditional copies in decompression */
+#define SNAPPY_SLOP_BYTES 64
 
 /* Forward declaration */
 size_t carquet_snappy_compress_bound(size_t src_size);
 
 /* ============================================================================
- * Varint Encoding
- * ============================================================================
- */
+ * Unaligned load/store helpers
+ * ============================================================================ */
+
+static inline uint32_t load32(const void* p) {
+    uint32_t v; memcpy(&v, p, 4); return v;
+}
+
+static inline uint64_t load64(const void* p) {
+    uint64_t v; memcpy(&v, p, 8); return v;
+}
+
+static inline void store32(void* p, uint32_t v) {
+    memcpy(p, &v, 4);
+}
+
+static inline void copy64(const void* src, void* dst) {
+    uint64_t v; memcpy(&v, src, 8); memcpy(dst, &v, 8);
+}
+
+static inline void copy128(const void* src, void* dst) {
+    uint64_t lo, hi;
+    memcpy(&lo, src, 8);
+    memcpy(&hi, (const char*)src + 8, 8);
+    memcpy(dst, &lo, 8);
+    memcpy((char*)dst + 8, &hi, 8);
+}
+
+/* ============================================================================
+ * kLengthMinusOffset — Branchless tag decode table
+ * Encodes length - (offset << 8) for fast comparison.
+ * From Google Snappy (BSD-3-Clause).
+ *
+ * For each tag byte, stores the length in the low byte.
+ * For copy-1 tags, this gives us the copy length directly.
+ * For copy-2 tags, this gives us the copy length directly.
+ * ============================================================================ */
+
+static const int16_t kLengthMinusOffset[256] = {
+    /* Generated from: LengthMinusOffset(tag>>2, tag&3) for tag 0..255
+     * Low byte = copy length. Used for fast copy-1/copy-2 length decode. */
+     -255,     4,     1,   255,  -254,     5,     2,   255,
+     -253,     6,     3,   255,  -252,     7,     4,   255,
+     -251,     8,     5,   255,  -250,     9,     6,   255,
+     -249,    10,     7,   255,  -248,    11,     8,   255,
+     -247,  -252,     9,   255,  -246,  -251,    10,   255,
+     -245,  -250,    11,   255,  -244,  -249,    12,   255,
+     -243,  -248,    13,   255,  -242,  -247,    14,   255,
+     -241,  -246,    15,   255,  -240,  -245,    16,   255,
+     -239,  -508,    17,   255,  -238,  -507,    18,   255,
+     -237,  -506,    19,   255,  -236,  -505,    20,   255,
+     -235,  -504,    21,   255,  -234,  -503,    22,   255,
+     -233,  -502,    23,   255,  -232,  -501,    24,   255,
+     -231,  -764,    25,   255,  -230,  -763,    26,   255,
+     -229,  -762,    27,   255,  -228,  -761,    28,   255,
+     -227,  -760,    29,   255,  -226,  -759,    30,   255,
+     -225,  -758,    31,   255,  -224,  -757,    32,   255,
+     -223, -1020,    33,   255,  -222, -1019,    34,   255,
+     -221, -1018,    35,   255,  -220, -1017,    36,   255,
+     -219, -1016,    37,   255,  -218, -1015,    38,   255,
+     -217, -1014,    39,   255,  -216, -1013,    40,   255,
+     -215, -1276,    41,   255,  -214, -1275,    42,   255,
+     -213, -1274,    43,   255,  -212, -1273,    44,   255,
+     -211, -1272,    45,   255,  -210, -1271,    46,   255,
+     -209, -1270,    47,   255,  -208, -1269,    48,   255,
+     -207, -1532,    49,   255,  -206, -1531,    50,   255,
+     -205, -1530,    51,   255,  -204, -1529,    52,   255,
+     -203, -1528,    53,   255,  -202, -1527,    54,   255,
+     -201, -1526,    55,   255,  -200, -1525,    56,   255,
+     -199, -1788,    57,   255,  -198, -1787,    58,   255,
+     -197, -1786,    59,   255,  -196, -1785,    60,   255,
+      255, -1784,    61,   255,   255, -1783,    62,   255,
+      255, -1782,    63,   255,   255, -1781,    64,   255,
+};
+
+/* ============================================================================
+ * Varint Encoding/Decoding
+ * ============================================================================ */
 
 static size_t snappy_read_varint(const uint8_t* p, const uint8_t* end, uint32_t* value) {
     *value = 0;
     int shift = 0;
     const uint8_t* start = p;
-
     while (p < end) {
         uint8_t b = *p++;
         *value |= ((uint32_t)(b & 0x7F)) << shift;
-        if ((b & 0x80) == 0) {
-            return (size_t)(p - start);
-        }
+        if ((b & 0x80) == 0) return (size_t)(p - start);
         shift += 7;
-        if (shift >= 32) {
-            return 0; /* Overflow */
-        }
+        if (shift >= 32) return 0;
     }
-    return 0; /* Truncated */
+    return 0;
 }
 
 static size_t snappy_write_varint(uint8_t* p, uint32_t value) {
@@ -65,111 +208,159 @@ static size_t snappy_write_varint(uint8_t* p, uint32_t value) {
 }
 
 /* ============================================================================
- * Snappy Decompression
- * ============================================================================
- */
+ * SIMD Pattern Extension for Decompression
+ * ============================================================================ */
 
-static inline void snappy_match_copy_fast(uint8_t* dst, size_t len, size_t offset) {
-    const uint8_t* src = dst - offset;
+#if SNAPPY_HAVE_NEON
 
-    if (offset == 1) {
-        memset(dst, *src, len);
-        return;
-    }
-
-    if (offset == 2) {
-        uint16_t pattern16;
-        uint32_t pattern32;
-        uint64_t pattern64;
-
-        memcpy(&pattern16, src, sizeof(pattern16));
-        pattern32 = (uint32_t)pattern16 | ((uint32_t)pattern16 << 16);
-        pattern64 = (uint64_t)pattern32 | ((uint64_t)pattern32 << 32);
-
-        while (len >= 8) {
-            memcpy(dst, &pattern64, sizeof(pattern64));
-            dst += 8;
-            len -= 8;
-        }
-        while (len >= 2) {
-            memcpy(dst, &pattern16, sizeof(pattern16));
-            dst += 2;
-            len -= 2;
-        }
-        if (len) {
-            *dst = *(const uint8_t*)&pattern16;
-        }
-        return;
-    }
-
-    if (offset == 4) {
-        uint32_t pattern32;
-        uint64_t pattern64;
-        memcpy(&pattern32, src, 4);
-        pattern64 = (uint64_t)pattern32 | ((uint64_t)pattern32 << 32);
-
-        while (len >= 8) {
-            memcpy(dst, &pattern64, sizeof(pattern64));
-            dst += 8;
-            len -= 8;
-        }
-        while (len > 0) {
-            *dst++ = *src++;
-            len--;
-        }
-        return;
-    }
-
-    if (offset < 8) {
-        /* For offsets 3, 5, 6, 7 the 8-byte tiling trick doesn't work
-         * (8 % offset != 0 means the pattern drifts after each 8-byte copy).
-         * Use byte-by-byte copy from the repeating source. */
-        for (size_t i = 0; i < len; i++) {
-            dst[i] = src[i % offset];
-        }
-        return;
-    }
-
-    if (offset < 16) {
-        while (len >= 8) {
-            uint64_t chunk;
-            memcpy(&chunk, src, sizeof(chunk));
-            memcpy(dst, &chunk, sizeof(chunk));
-            dst += 8;
-            src += 8;
-            len -= 8;
-        }
-        while (len > 0) {
-            *dst++ = *src++;
-            len--;
-        }
-        return;
-    }
-
-    while (len >= 16) {
-        uint64_t lo;
-        uint64_t hi;
-        memcpy(&lo, src, sizeof(lo));
-        memcpy(&hi, src + 8, sizeof(hi));
-        memcpy(dst, &lo, sizeof(lo));
-        memcpy(dst + 8, &hi, sizeof(hi));
-        dst += 16;
-        src += 16;
-        len -= 16;
-    }
-    if (len >= 8) {
-        uint64_t chunk;
-        memcpy(&chunk, src, sizeof(chunk));
-        memcpy(dst, &chunk, sizeof(chunk));
-        dst += 8;
-        src += 8;
-        len -= 8;
-    }
-    while (len > 0) {
-        *dst++ = *src++;
-        len--;
-    }
+/* NEON: Generate shuffle mask for pattern of given size at given byte offset */
+static inline uint8x16_t neon_pattern_mask(int offset, int pattern_size) {
+    uint8_t mask[16];
+    for (int i = 0; i < 16; i++)
+        mask[i] = (uint8_t)((offset + i) % pattern_size);
+    return vld1q_u8(mask);
 }
+
+/* NEON: Load and expand a small pattern into a 16-byte vector */
+static inline uint8x16_t neon_load_pattern(const uint8_t* src, int pattern_size) {
+    uint8x16_t gen_mask = neon_pattern_mask(0, pattern_size);
+    uint8x16_t raw = vld1q_u8(src);
+    return vqtbl1q_u8(raw, gen_mask);
+}
+
+/* NEON: Get reshuffle mask for next 16 bytes of pattern continuation */
+static inline uint8x16_t neon_reshuffle_mask(int pattern_size) {
+    return neon_pattern_mask(16, pattern_size);
+}
+
+#elif SNAPPY_HAVE_SSSE3
+
+static inline __m128i ssse3_pattern_mask(int offset, int pattern_size) {
+    uint8_t mask[16];
+    for (int i = 0; i < 16; i++)
+        mask[i] = (uint8_t)((offset + i) % pattern_size);
+    return _mm_loadu_si128((const __m128i*)mask);
+}
+
+static inline __m128i ssse3_load_pattern(const uint8_t* src, int pattern_size) {
+    __m128i gen_mask = ssse3_pattern_mask(0, pattern_size);
+    __m128i raw = _mm_loadu_si128((const __m128i*)src);
+    return _mm_shuffle_epi8(raw, gen_mask);
+}
+
+static inline __m128i ssse3_reshuffle_mask(int pattern_size) {
+    return ssse3_pattern_mask(16, pattern_size);
+}
+
+#endif
+
+/* ============================================================================
+ * IncrementalCopy — Overlapping copy for match expansion
+ * ============================================================================ */
+
+static inline uint8_t* incremental_copy_slow(const uint8_t* src, uint8_t* op,
+                                              uint8_t* const op_limit) {
+    while (op < op_limit) *op++ = *src++;
+    return op_limit;
+}
+
+static inline uint8_t* incremental_copy(const uint8_t* src, uint8_t* op,
+                                         uint8_t* const op_limit,
+                                         uint8_t* const buf_limit) {
+    size_t pattern_size = (size_t)(op - src);
+
+#if SNAPPY_HAVE_VECTOR_SHUFFLE
+    const int big_pattern = 16;
+#else
+    const int big_pattern = 8;
+#endif
+
+    if (pattern_size < (size_t)big_pattern) {
+#if SNAPPY_HAVE_VECTOR_SHUFFLE
+        if (SNAPPY_PREDICT_TRUE(op_limit <= buf_limit - 15)) {
+#if SNAPPY_HAVE_NEON
+            uint8x16_t pattern = neon_load_pattern(src, (int)pattern_size);
+            uint8x16_t reshuffle = neon_reshuffle_mask((int)pattern_size);
+            vst1q_u8(op, pattern);
+            if (op + 16 < op_limit) {
+                pattern = vqtbl1q_u8(pattern, reshuffle);
+                vst1q_u8(op + 16, pattern);
+            }
+            if (op + 32 < op_limit) {
+                pattern = vqtbl1q_u8(pattern, reshuffle);
+                vst1q_u8(op + 32, pattern);
+            }
+            if (op + 48 < op_limit) {
+                pattern = vqtbl1q_u8(pattern, reshuffle);
+                vst1q_u8(op + 48, pattern);
+            }
+#else
+            __m128i pattern = ssse3_load_pattern(src, (int)pattern_size);
+            __m128i reshuffle = ssse3_reshuffle_mask((int)pattern_size);
+            _mm_storeu_si128((__m128i*)op, pattern);
+            if (op + 16 < op_limit) {
+                pattern = _mm_shuffle_epi8(pattern, reshuffle);
+                _mm_storeu_si128((__m128i*)(op + 16), pattern);
+            }
+            if (op + 32 < op_limit) {
+                pattern = _mm_shuffle_epi8(pattern, reshuffle);
+                _mm_storeu_si128((__m128i*)(op + 32), pattern);
+            }
+            if (op + 48 < op_limit) {
+                pattern = _mm_shuffle_epi8(pattern, reshuffle);
+                _mm_storeu_si128((__m128i*)(op + 48), pattern);
+            }
+#endif
+            return op_limit;
+        }
+        return incremental_copy_slow(src, op, op_limit);
+#else  /* !SNAPPY_HAVE_VECTOR_SHUFFLE */
+        /* Non-SIMD: expand pattern to at least 8 bytes by doubling */
+        if (SNAPPY_PREDICT_TRUE(op <= buf_limit - 11)) {
+            while (pattern_size < 8) {
+                copy64(src, op);
+                op += pattern_size;
+                pattern_size *= 2;
+            }
+            if (SNAPPY_PREDICT_TRUE(op >= op_limit)) return op_limit;
+            src = op - pattern_size;
+        } else {
+            return incremental_copy_slow(src, op, op_limit);
+        }
+#endif
+    }
+
+    /* pattern_size >= big_pattern: simple block copies */
+    if (SNAPPY_PREDICT_TRUE(op_limit <= buf_limit - 15)) {
+        copy128(src, op);
+        if (op + 16 < op_limit) copy128(src + 16, op + 16);
+        if (op + 32 < op_limit) copy128(src + 32, op + 32);
+        if (op + 48 < op_limit) copy128(src + 48, op + 48);
+        return op_limit;
+    }
+
+    /* Near end of buffer: 16-byte copies until we run out of slop */
+    {
+        uint8_t* op_end = buf_limit - 16;
+        while (op < op_end) {
+            copy128(src, op);
+            op += 16;
+            src += 16;
+        }
+        if (op >= op_limit) return op_limit;
+    }
+
+    if (SNAPPY_PREDICT_FALSE(op <= buf_limit - 8)) {
+        copy64(src, op);
+        src += 8;
+        op += 8;
+    }
+    return incremental_copy_slow(src, op, op_limit);
+}
+
+/* ============================================================================
+ * Snappy Decompression
+ * ============================================================================ */
 
 carquet_status_t carquet_snappy_decompress(
     const uint8_t* src,
@@ -178,115 +369,137 @@ carquet_status_t carquet_snappy_decompress(
     size_t dst_capacity,
     size_t* dst_size) {
 
-    if (!src || !dst || !dst_size) {
+    if (!src || !dst || !dst_size)
         return CARQUET_ERROR_INVALID_ARGUMENT;
+
+    if (src_size == 0) {
+        *dst_size = 0;
+        return CARQUET_OK;
     }
 
     const uint8_t* ip = src;
-    const uint8_t* const iend = src + src_size;
+    const uint8_t* const ip_end = src + src_size;
 
     /* Read uncompressed length */
     uint32_t uncompressed_len;
-    size_t varint_len = snappy_read_varint(ip, iend, &uncompressed_len);
-    if (varint_len == 0) {
+    size_t varint_len = snappy_read_varint(ip, ip_end, &uncompressed_len);
+    if (varint_len == 0)
         return CARQUET_ERROR_INVALID_COMPRESSED_DATA;
-    }
     ip += varint_len;
 
-    if (uncompressed_len > dst_capacity) {
+    if (uncompressed_len > dst_capacity)
         return CARQUET_ERROR_INVALID_COMPRESSED_DATA;
-    }
 
     uint8_t* op = dst;
-    uint8_t* const oend = dst + uncompressed_len;
+    uint8_t* const op_end = dst + uncompressed_len;
+    /* For safe SIMD writes, we need slop at the end */
+    uint8_t* const op_limit_min_slop = (uncompressed_len >= SNAPPY_SLOP_BYTES)
+        ? (op_end - SNAPPY_SLOP_BYTES + 1) : dst;
 
-    while (ip < iend && op < oend) {
-        uint8_t tag = *ip++;
-        uint8_t type = tag & 0x03;
+    while (ip < ip_end && op < op_end) {
+        const uint8_t tag = *ip++;
+        const uint8_t type = tag & 0x03;
 
         if (type == SNAPPY_LITERAL) {
-            /* Literal */
-            size_t len = (tag >> 2) + 1;
-
-            if (len > 60) {
-                /* Extended length */
-                size_t extra_bytes = len - 60;
-                if (ip + extra_bytes > iend) {
+            size_t literal_len = (tag >> 2) + 1;
+            if (SNAPPY_PREDICT_FALSE(literal_len >= 61)) {
+                /* Long literal: length is encoded in 1-4 following bytes */
+                size_t extra_bytes = literal_len - 60;
+                if (SNAPPY_PREDICT_FALSE(ip + extra_bytes > ip_end))
                     return CARQUET_ERROR_INVALID_COMPRESSED_DATA;
-                }
-                len = 1;
-                for (size_t i = 0; i < extra_bytes; i++) {
-                    len += (size_t)ip[i] << (8 * i);
-                }
+                /* Use a 32-bit load and mask (like Google Snappy) */
+                uint32_t raw = 0;
+                memcpy(&raw, ip, extra_bytes <= 4 ? extra_bytes : 4);
+                /* Mask to the relevant bytes */
+                uint64_t mask64 = 0xFFFFFFFF;
+                literal_len = (raw & (uint32_t)~(mask64 << (8 * extra_bytes))) + 1;
                 ip += extra_bytes;
             }
 
-            if (ip + len > iend || op + len > oend) {
-                return CARQUET_ERROR_INVALID_COMPRESSED_DATA;
-            }
-            memcpy(op, ip, len);
-            ip += len;
-            op += len;
-
-        } else if (type == SNAPPY_COPY_1) {
-            /* Copy with 1-byte offset */
-            size_t len = ((tag >> 2) & 0x07) + 4;
-            size_t offset = ((tag >> 5) << 8) | *ip++;
-
-            if (offset == 0 || offset > (size_t)(op - dst)) {
-                return CARQUET_ERROR_INVALID_COMPRESSED_DATA;
-            }
-            if (op + len > oend) {
-                return CARQUET_ERROR_INVALID_COMPRESSED_DATA;
+            /* Fast path for short literals with enough room */
+            if (SNAPPY_PREDICT_TRUE(literal_len <= 16 &&
+                                    ip + 16 <= ip_end &&
+                                    op + 16 <= op_end)) {
+                copy128(ip, op);
+                ip += literal_len;
+                op += literal_len;
+                continue;
             }
 
-            snappy_match_copy_fast(op, len, offset);
-            op += len;
-
-        } else if (type == SNAPPY_COPY_2) {
-            /* Copy with 2-byte offset */
-            size_t len = ((tag >> 2) & 0x3F) + 1;
-            if (ip + 2 > iend) {
+            if (SNAPPY_PREDICT_FALSE(ip + literal_len > ip_end || op + literal_len > op_end))
                 return CARQUET_ERROR_INVALID_COMPRESSED_DATA;
-            }
-            size_t offset = ip[0] | ((size_t)ip[1] << 8);
-            ip += 2;
+            memcpy(op, ip, literal_len);
+            ip += literal_len;
+            op += literal_len;
 
-            if (offset == 0 || offset > (size_t)(op - dst)) {
-                return CARQUET_ERROR_INVALID_COMPRESSED_DATA;
-            }
-            if (op + len > oend) {
-                return CARQUET_ERROR_INVALID_COMPRESSED_DATA;
+        } else if (SNAPPY_PREDICT_TRUE(type != SNAPPY_COPY_4)) {
+            /* COPY_1 or COPY_2 — use kLengthMinusOffset for branchless decode */
+            int16_t entry = kLengthMinusOffset[tag];
+            uint32_t trailer;
+            size_t length;
+            size_t copy_offset;
+
+            if (type == SNAPPY_COPY_1) {
+                if (SNAPPY_PREDICT_FALSE(ip >= ip_end))
+                    return CARQUET_ERROR_INVALID_COMPRESSED_DATA;
+                trailer = ((uint32_t)(tag & 0xE0) << 3) | *ip++;
+                length = (size_t)(entry & 0xFF);
+                copy_offset = trailer;
+            } else { /* SNAPPY_COPY_2 */
+                if (SNAPPY_PREDICT_FALSE(ip + 2 > ip_end))
+                    return CARQUET_ERROR_INVALID_COMPRESSED_DATA;
+                trailer = (uint32_t)ip[0] | ((uint32_t)ip[1] << 8);
+                ip += 2;
+                length = (size_t)(entry & 0xFF);
+                copy_offset = trailer;
             }
 
-            snappy_match_copy_fast(op, len, offset);
-            op += len;
-
-        } else { /* SNAPPY_COPY_4 */
-            /* Copy with 4-byte offset */
-            size_t len = ((tag >> 2) & 0x3F) + 1;
-            if (ip + 4 > iend) {
+            if (SNAPPY_PREDICT_FALSE(copy_offset == 0 ||
+                                     copy_offset > (size_t)(op - dst)))
                 return CARQUET_ERROR_INVALID_COMPRESSED_DATA;
+            if (SNAPPY_PREDICT_FALSE(op + length > op_end))
+                return CARQUET_ERROR_INVALID_COMPRESSED_DATA;
+
+            const uint8_t* match_src = op - copy_offset;
+
+            /* Fast path: offset >= 16, just copy non-overlapping blocks */
+            if (SNAPPY_PREDICT_TRUE(copy_offset >= 16 && op + length <= op_limit_min_slop)) {
+                copy128(match_src, op);
+                if (length > 16) copy128(match_src + 16, op + 16);
+                if (length > 32) copy128(match_src + 32, op + 32);
+                if (length > 48) copy128(match_src + 48, op + 48);
+                op += length;
+            } else if (SNAPPY_PREDICT_TRUE(length <= SNAPPY_SLOP_BYTES &&
+                                           op + length <= op_limit_min_slop &&
+                                           copy_offset >= length)) {
+                /* Non-overlapping but small offset: use memmove */
+                memmove(op, match_src, SNAPPY_SLOP_BYTES);
+                op += length;
+            } else {
+                (void)incremental_copy(match_src, op, op + length, op_end);
+                op += length;
             }
-            size_t offset = ip[0] | ((size_t)ip[1] << 8) |
-                           ((size_t)ip[2] << 16) | ((size_t)ip[3] << 24);
+
+        } else {
+            /* COPY_4: 4-byte offset (rare) */
+            if (SNAPPY_PREDICT_FALSE(ip + 4 > ip_end))
+                return CARQUET_ERROR_INVALID_COMPRESSED_DATA;
+            size_t length = ((tag >> 2) & 0x3F) + 1;
+            size_t copy_offset = (size_t)load32(ip);
             ip += 4;
-
-            if (offset == 0 || offset > (size_t)(op - dst)) {
+            if (SNAPPY_PREDICT_FALSE(copy_offset == 0 ||
+                                     copy_offset > (size_t)(op - dst)))
                 return CARQUET_ERROR_INVALID_COMPRESSED_DATA;
-            }
-            if (op + len > oend) {
+            if (SNAPPY_PREDICT_FALSE(op + length > op_end))
                 return CARQUET_ERROR_INVALID_COMPRESSED_DATA;
-            }
-
-            snappy_match_copy_fast(op, len, offset);
-            op += len;
+            const uint8_t* match_src = op - copy_offset;
+            (void)incremental_copy(match_src, op, op + length, op_end);
+            op += length;
         }
     }
 
-    if ((size_t)(op - dst) != uncompressed_len) {
+    if ((size_t)(op - dst) != uncompressed_len)
         return CARQUET_ERROR_INVALID_COMPRESSED_DATA;
-    }
 
     *dst_size = uncompressed_len;
     return CARQUET_OK;
@@ -294,94 +507,47 @@ carquet_status_t carquet_snappy_decompress(
 
 /* ============================================================================
  * Snappy Compression
- * ============================================================================
- */
+ * ============================================================================ */
 
 static inline uint32_t snappy_hash(uint32_t val) {
     return (val * 0x1e35a7bd) >> (32 - SNAPPY_HASH_LOG);
 }
 
-static inline uint32_t snappy_read32(const uint8_t* p) {
-    uint32_t v;
-    memcpy(&v, p, 4);
-    return v;
-}
-
-/* Prefetch hint - no-op on compilers without support */
-#if defined(__GNUC__) || defined(__clang__)
-#define SNAPPY_PREFETCH(addr) __builtin_prefetch((addr), 0, 1)
-#elif defined(_MSC_VER)
-#include <xmmintrin.h>
-#define SNAPPY_PREFETCH(addr) _mm_prefetch((const char*)(addr), _MM_HINT_T1)
-#else
-#define SNAPPY_PREFETCH(addr) ((void)0)
-#endif
-
-/* Fast inline match length using 64-bit XOR comparison.
- * Avoids SIMD dispatch overhead on the hot compression path.
- * Assumes little-endian byte order (x86/ARM). */
+/* Fast match length using 64-bit XOR comparison */
 static inline size_t fast_match_length(const uint8_t* p, const uint8_t* match,
                                         const uint8_t* limit) {
     const uint8_t* start = p;
-
     while (p + 8 <= limit) {
-        uint64_t a, b;
-        memcpy(&a, p, 8);
-        memcpy(&b, match, 8);
+        uint64_t a = load64(p);
+        uint64_t b = load64(match);
         uint64_t diff = a ^ b;
-        if (diff) {
-#if defined(__GNUC__) || defined(__clang__)
-            return (size_t)(p - start) + ((size_t)__builtin_ctzll(diff) >> 3);
-#elif defined(_MSC_VER) && (defined(_M_X64) || defined(_M_ARM64))
-            unsigned long idx;
-            _BitScanForward64(&idx, diff);
-            return (size_t)(p - start) + (idx >> 3);
-#else
-            for (size_t i = 0; i < 8; i++) {
-                if (p[i] != match[i]) return (size_t)(p - start) + i;
-            }
-#endif
-        }
+        if (diff)
+            return (size_t)(p - start) + ((size_t)SNAPPY_CTZ64(diff) >> 3);
         p += 8;
         match += 8;
     }
-
-    while (p < limit && *p == *match) {
-        p++;
-        match++;
-    }
+    while (p < limit && *p == *match) { p++; match++; }
     return (size_t)(p - start);
 }
 
 static uint8_t* snappy_emit_literal(uint8_t* op, const uint8_t* literal, size_t len) {
-    if (len <= 60) {
-        *op++ = (uint8_t)((len - 1) << 2);
-    } else if (len <= 256) {
-        *op++ = (60 << 2);
-        *op++ = (uint8_t)(len - 1);
-    } else if (len <= 65536) {
-        *op++ = (61 << 2);
-        *op++ = (uint8_t)((len - 1) & 0xFF);
-        *op++ = (uint8_t)((len - 1) >> 8);
-    } else if (len <= 16777216) {
-        *op++ = (62 << 2);
-        *op++ = (uint8_t)((len - 1) & 0xFF);
-        *op++ = (uint8_t)(((len - 1) >> 8) & 0xFF);
-        *op++ = (uint8_t)(((len - 1) >> 16) & 0xFF);
+    size_t n = len - 1;
+    if (n < 60) {
+        *op++ = (uint8_t)(n << 2);
     } else {
-        *op++ = (63 << 2);
-        *op++ = (uint8_t)((len - 1) & 0xFF);
-        *op++ = (uint8_t)(((len - 1) >> 8) & 0xFF);
-        *op++ = (uint8_t)(((len - 1) >> 16) & 0xFF);
-        *op++ = (uint8_t)(((len - 1) >> 24) & 0xFF);
+        /* Encode length in 1-4 extra bytes, like Google Snappy */
+        int count = (31 - SNAPPY_CLZ32((uint32_t)n)) / 8 + 1;
+        *op++ = (uint8_t)((59 + count) << 2);
+        store32(op, (uint32_t)n);
+        op += count;
     }
     memcpy(op, literal, len);
     return op + len;
 }
 
-static uint8_t* snappy_emit_copy(uint8_t* op, size_t offset, size_t len) {
-    while (len >= 68) {
-        /* Emit copy of 64 bytes */
+static inline uint8_t* snappy_emit_copy(uint8_t* op, size_t offset, size_t len) {
+    /* Emit 64-byte chunks */
+    while (SNAPPY_PREDICT_FALSE(len >= 68)) {
         *op++ = (uint8_t)((63 << 2) | SNAPPY_COPY_2);
         *op++ = (uint8_t)(offset & 0xFF);
         *op++ = (uint8_t)(offset >> 8);
@@ -389,22 +555,30 @@ static uint8_t* snappy_emit_copy(uint8_t* op, size_t offset, size_t len) {
     }
 
     if (len > 64) {
-        /* Emit copy of 60 bytes */
         *op++ = (uint8_t)((59 << 2) | SNAPPY_COPY_2);
         *op++ = (uint8_t)(offset & 0xFF);
         *op++ = (uint8_t)(offset >> 8);
         len -= 60;
     }
 
-    if (len >= 12 || offset >= 2048) {
-        /* Use 2-byte offset copy */
+    /* Branchless offset type selection (like Google Snappy) */
+    if (len < 12 && offset < 2048) {
+        /* 1-byte offset copy */
+        uint32_t u = ((uint32_t)len << 2) + ((uint32_t)offset << 8);
+        uint32_t copy1 = SNAPPY_COPY_1 - (4 << 2) + (((uint32_t)offset >> 3) & 0xe0);
+        u += copy1;
+        store32(op, u);
+        op += 2;
+    } else if (len < 12) {
+        /* 2-byte offset copy for small length, large offset */
+        uint32_t u = SNAPPY_COPY_2 + (((uint32_t)len - 1) << 2) + ((uint32_t)offset << 8);
+        store32(op, u);
+        op += 3;
+    } else {
+        /* 2-byte offset copy */
         *op++ = (uint8_t)(((len - 1) << 2) | SNAPPY_COPY_2);
         *op++ = (uint8_t)(offset & 0xFF);
         *op++ = (uint8_t)(offset >> 8);
-    } else {
-        /* Use 1-byte offset copy (len 4-11, offset < 2048) */
-        *op++ = (uint8_t)(((offset >> 8) << 5) | ((len - 4) << 2) | SNAPPY_COPY_1);
-        *op++ = (uint8_t)(offset & 0xFF);
     }
 
     return op;
@@ -427,65 +601,109 @@ static uint8_t* snappy_compress_block(
     const uint8_t* anchor = src;
     const uint8_t* candidate;
 
-    /* Pre-seed hash table for position 0 */
-    hash_table[snappy_hash(snappy_read32(src))] = 0;
-    uint32_t next_hash = snappy_hash(snappy_read32(ip));
+    /* Pre-seed position 0 */
+    hash_table[snappy_hash(load32(src))] = 0;
 
-    for (;;) {
-        /* Accelerating skip loop: find next match candidate */
-        size_t skip = 32;
-        const uint8_t* next_ip = ip;
+    /* Try to match 16 bytes at positions 0..15 for fast startup */
+    if (ilimit - ip >= 16) {
+        uint64_t data = load64(ip);
+        ptrdiff_t delta = (ptrdiff_t)(ip - src);
+        for (int j = 0; j < 4; j++) {
+            for (int k = 0; k < 4; k++) {
+                int i = 4 * j + k;
+                uint32_t dword = (i == 0) ? load32(ip) : (uint32_t)data;
+                uint32_t h = snappy_hash(dword);
+                candidate = src + hash_table[h];
+                hash_table[h] = (uint16_t)(delta + i);
+                if (SNAPPY_PREDICT_FALSE(load32(candidate) == dword)) {
+                    *op = (uint8_t)(SNAPPY_LITERAL | (i << 2));
+                    copy128(anchor, op + 1);
+                    ip += i;
+                    op = op + i + 2;
+                    goto emit_match;
+                }
+                data >>= 8;
+            }
+            data = load64(ip + 4 * j + 4);
+        }
+        ip += 16;
+    }
 
-        do {
-            ip = next_ip;
-            uint32_t h = next_hash;
-            size_t step = skip >> 5;
-            skip++;
-            next_ip = ip + step;
+    {
+        uint32_t skip = 32;
+        for (;;) {
+            uint32_t h = snappy_hash(load32(ip));
+            uint32_t bytes_between = skip >> 5;
+            skip += bytes_between;
+            const uint8_t* next_ip = ip + bytes_between;
 
-            if (next_ip > ilimit) goto emit_remainder;
+            if (SNAPPY_PREDICT_FALSE(next_ip > ilimit)) {
+                ip = anchor;
+                goto emit_remainder;
+            }
 
-            next_hash = snappy_hash(snappy_read32(next_ip));
-            SNAPPY_PREFETCH(&hash_table[next_hash]);
             candidate = src + hash_table[h];
             hash_table[h] = (uint16_t)(ip - src);
-        } while (snappy_read32(ip) != snappy_read32(candidate) ||
-                 (size_t)(ip - candidate) > SNAPPY_MAX_OFFSET);
 
-        /* Emit pending literal bytes */
-        if (ip > anchor) {
-            op = snappy_emit_literal(op, anchor, (size_t)(ip - anchor));
+            if (SNAPPY_PREDICT_FALSE(load32(ip) == load32(candidate)))
+                break;
+
+            ip = next_ip;
+        }
+    }
+
+    /* Emit pending literal */
+    if (ip > anchor)
+        op = snappy_emit_literal(op, anchor, (size_t)(ip - anchor));
+
+emit_match:
+    do {
+        size_t match_len = 4 + fast_match_length(ip + 4, candidate + 4, iend);
+        size_t offset = (size_t)(ip - candidate);
+        ip += match_len;
+        op = snappy_emit_copy(op, offset, match_len);
+
+        if (SNAPPY_PREDICT_FALSE(ip >= ilimit)) {
+            anchor = ip;
+            goto emit_remainder;
         }
 
-        /* Emit match(es), chaining consecutive matches */
-        do {
-            size_t match_len = 4 + fast_match_length(ip + 4, candidate + 4, iend);
-            size_t offset = (size_t)(ip - candidate);
-            ip += match_len;
-            op = snappy_emit_copy(op, offset, match_len);
-            anchor = ip;
+        /* Insert hash entries near match end */
+        hash_table[snappy_hash(load32(ip - 1))] = (uint16_t)(ip - 1 - src);
+        uint32_t h = snappy_hash(load32(ip));
+        candidate = src + hash_table[h];
+        hash_table[h] = (uint16_t)(ip - src);
+    } while (load32(ip) == load32(candidate) &&
+             (size_t)(ip - candidate) <= SNAPPY_MAX_OFFSET);
 
-            if (ip >= ilimit) goto emit_remainder;
+    anchor = ip++;
+    {
+        uint32_t skip = 32;
+        for (;;) {
+            uint32_t h = snappy_hash(load32(ip));
+            uint32_t bytes_between = skip >> 5;
+            skip += bytes_between;
+            const uint8_t* next_ip = ip + bytes_between;
 
-            /* Insert hash entries near match end for future matches */
-            hash_table[snappy_hash(snappy_read32(ip - 2))] = (uint16_t)(ip - 2 - src);
-            hash_table[snappy_hash(snappy_read32(ip - 1))] = (uint16_t)(ip - 1 - src);
+            if (SNAPPY_PREDICT_FALSE(next_ip > ilimit))
+                goto emit_remainder;
 
-            /* Try to chain: check for immediate match at current position */
-            uint32_t h = snappy_hash(snappy_read32(ip));
             candidate = src + hash_table[h];
             hash_table[h] = (uint16_t)(ip - src);
-        } while (snappy_read32(ip) == snappy_read32(candidate) &&
-                 (size_t)(ip - candidate) <= SNAPPY_MAX_OFFSET);
 
-        /* Prepare next hash for the skip loop */
-        next_hash = snappy_hash(snappy_read32(++ip));
+            if (SNAPPY_PREDICT_FALSE(load32(ip) == load32(candidate))) {
+                if (ip > anchor)
+                    op = snappy_emit_literal(op, anchor, (size_t)(ip - anchor));
+                goto emit_match;
+            }
+
+            ip = next_ip;
+        }
     }
 
 emit_remainder:
-    if (anchor < iend) {
+    if (anchor < iend)
         op = snappy_emit_literal(op, anchor, (size_t)(iend - anchor));
-    }
     return op;
 }
 
@@ -496,19 +714,14 @@ carquet_status_t carquet_snappy_compress(
     size_t dst_capacity,
     size_t* dst_size) {
 
-    if (!dst || !dst_size) {
+    if (!dst || !dst_size)
         return CARQUET_ERROR_INVALID_ARGUMENT;
-    }
 
-    /* Check if output buffer is large enough for worst case */
     size_t max_output = carquet_snappy_compress_bound(src_size);
-    if (dst_capacity < max_output) {
+    if (dst_capacity < max_output)
         return CARQUET_ERROR_COMPRESSION;
-    }
 
     uint8_t* op = dst;
-
-    /* Write uncompressed length */
     op += snappy_write_varint(op, (uint32_t)src_size);
 
     if (src_size == 0) {
@@ -516,16 +729,14 @@ carquet_status_t carquet_snappy_compress(
         return CARQUET_OK;
     }
 
-    if (!src) {
+    if (!src)
         return CARQUET_ERROR_INVALID_ARGUMENT;
-    }
 
     size_t pos = 0;
     while (pos < src_size) {
         size_t block_size = src_size - pos;
-        if (block_size > SNAPPY_BLOCK_SIZE) {
+        if (block_size > SNAPPY_BLOCK_SIZE)
             block_size = SNAPPY_BLOCK_SIZE;
-        }
         op = snappy_compress_block(src + pos, block_size, op);
         pos += block_size;
     }
@@ -536,8 +747,7 @@ carquet_status_t carquet_snappy_compress(
 
 /* ============================================================================
  * Utility Functions
- * ============================================================================
- */
+ * ============================================================================ */
 
 size_t carquet_snappy_compress_bound(size_t src_size) {
     return 32 + src_size + src_size / 6;
@@ -548,15 +758,13 @@ carquet_status_t carquet_snappy_get_uncompressed_length(
     size_t src_size,
     size_t* length) {
 
-    if (!src || !length) {
+    if (!src || !length)
         return CARQUET_ERROR_INVALID_ARGUMENT;
-    }
 
     uint32_t len;
     size_t varint_len = snappy_read_varint(src, src + src_size, &len);
-    if (varint_len == 0) {
+    if (varint_len == 0)
         return CARQUET_ERROR_INVALID_COMPRESSED_DATA;
-    }
 
     *length = len;
     return CARQUET_OK;

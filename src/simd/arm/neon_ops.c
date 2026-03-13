@@ -483,34 +483,33 @@ void carquet_neon_byte_stream_split_decode_double(
  * This is used after unpacking deltas to reconstruct original values.
  */
 void carquet_neon_prefix_sum_i32(int32_t* values, int64_t count, int32_t initial) {
-    int32_t sum = initial;
+    /* Use unsigned arithmetic to avoid signed overflow UB.
+     * Delta encoding relies on modular arithmetic — the bit pattern
+     * is identical for signed and unsigned addition. */
+    uint32_t sum = (uint32_t)initial;
     int64_t i = 0;
 
-    /* NEON prefix sum for 4 elements at a time */
+    /* NEON prefix sum for 4 elements at a time (unsigned to avoid UB) */
     for (; i + 4 <= count; i += 4) {
-        int32x4_t v = vld1q_s32(values + i);
+        uint32x4_t v = vld1q_u32((const uint32_t*)(values + i));
 
         /* Partial prefix sums within the vector */
-        /* v = [a, b, c, d] */
-        /* After step 1: [a, a+b, c, c+d] */
-        v = vaddq_s32(v, vextq_s32(vdupq_n_s32(0), v, 3));
-        /* After step 2: [a, a+b, a+c, a+b+c+d] - wrong, need fix */
-        /* Correct: [a, a+b, a+b+c, a+b+c+d] */
-        int32x4_t shifted2 = vextq_s32(vdupq_n_s32(0), v, 2);
-        v = vaddq_s32(v, shifted2);
+        v = vaddq_u32(v, vextq_u32(vdupq_n_u32(0), v, 3));
+        uint32x4_t shifted2 = vextq_u32(vdupq_n_u32(0), v, 2);
+        v = vaddq_u32(v, shifted2);
 
         /* Add running sum */
-        v = vaddq_s32(v, vdupq_n_s32(sum));
-        vst1q_s32(values + i, v);
+        v = vaddq_u32(v, vdupq_n_u32(sum));
+        vst1q_u32((uint32_t*)(values + i), v);
 
         /* Update running sum to last element */
-        sum = vgetq_lane_s32(v, 3);
+        sum = vgetq_lane_u32(v, 3);
     }
 
     /* Handle remaining values */
     for (; i < count; i++) {
-        sum += values[i];
-        values[i] = sum;
+        sum += (uint32_t)values[i];
+        values[i] = (int32_t)sum;
     }
 }
 
@@ -518,28 +517,28 @@ void carquet_neon_prefix_sum_i32(int32_t* values, int64_t count, int32_t initial
  * Apply prefix sum to int64 array using NEON.
  */
 void carquet_neon_prefix_sum_i64(int64_t* values, int64_t count, int64_t initial) {
-    int64_t sum = initial;
+    uint64_t sum = (uint64_t)initial;
     int64_t i = 0;
 
-    /* NEON prefix sum for 2 elements at a time */
+    /* NEON prefix sum for 2 elements at a time (unsigned to avoid UB) */
     for (; i + 2 <= count; i += 2) {
-        int64x2_t v = vld1q_s64(values + i);
+        uint64x2_t v = vld1q_u64((const uint64_t*)(values + i));
 
         /* v = [a, b] -> [a, a+b] */
-        int64x2_t shifted = vextq_s64(vdupq_n_s64(0), v, 1);
-        v = vaddq_s64(v, shifted);
+        uint64x2_t shifted = vextq_u64(vdupq_n_u64(0), v, 1);
+        v = vaddq_u64(v, shifted);
 
         /* Add running sum */
-        v = vaddq_s64(v, vdupq_n_s64(sum));
-        vst1q_s64(values + i, v);
+        v = vaddq_u64(v, vdupq_n_u64(sum));
+        vst1q_u64((uint64_t*)(values + i), v);
 
-        sum = vgetq_lane_s64(v, 1);
+        sum = vgetq_lane_u64(v, 1);
     }
 
     /* Handle remaining values */
     for (; i < count; i++) {
-        sum += values[i];
-        values[i] = sum;
+        sum += (uint64_t)values[i];
+        values[i] = (int64_t)sum;
     }
 }
 

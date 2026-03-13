@@ -776,12 +776,18 @@ static carquet_status_t load_dictionary_page_mmap(
 
     /* Parse page header directly from mmap */
     int64_t dict_offset = col_meta->dictionary_page_offset;
+    if (dict_offset < 0 || (size_t)dict_offset >= file_reader->file_size) {
+        CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_PAGE, "Dictionary page offset out of range");
+        return CARQUET_ERROR_INVALID_PAGE;
+    }
     const uint8_t* header_ptr = mmap_data + dict_offset;
+    size_t remaining = file_reader->file_size - (size_t)dict_offset;
+    size_t max_header = remaining < 256 ? remaining : 256;
 
     parquet_page_header_t page_header;
     size_t header_size;
     carquet_status_t status = parquet_parse_page_header(
-        header_ptr, 256, &page_header, &header_size, error);
+        header_ptr, max_header, &page_header, &header_size, error);
     if (status != CARQUET_OK) {
         return status;
     }
@@ -1009,12 +1015,18 @@ static carquet_status_t load_next_page_mmap(
 
     /* Parse page header directly from mmap */
     int64_t page_offset = reader->data_start_offset + reader->current_page;
+    if (page_offset < 0 || (size_t)page_offset >= file_reader->file_size) {
+        CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_PAGE, "Data page offset out of range");
+        return CARQUET_ERROR_INVALID_PAGE;
+    }
     const uint8_t* header_ptr = mmap_data + page_offset;
+    size_t page_remaining = file_reader->file_size - (size_t)page_offset;
+    size_t max_hdr = page_remaining < 256 ? page_remaining : 256;
 
     parquet_page_header_t page_header;
     size_t header_size;
     carquet_status_t status = parquet_parse_page_header(
-        header_ptr, 256, &page_header, &header_size, error);
+        header_ptr, max_hdr, &page_header, &header_size, error);
     if (status != CARQUET_OK) {
         return status;
     }
@@ -1247,6 +1259,13 @@ static carquet_status_t load_next_page_fread(
     if (fseek(file, data_offset + reader->current_page + (long)header_size, SEEK_SET) != 0) {
         CARQUET_SET_ERROR(error, CARQUET_ERROR_FILE_SEEK, "Failed to seek past header");
         return CARQUET_ERROR_FILE_SEEK;
+    }
+
+    /* Reject absurdly large page sizes from malformed metadata (max 256 MB) */
+    if (page_header.compressed_page_size <= 0 ||
+        (size_t)page_header.compressed_page_size > (256ULL * 1024 * 1024)) {
+        CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_PAGE, "Page size out of range");
+        return CARQUET_ERROR_INVALID_PAGE;
     }
 
     /* Read compressed page data into a reusable buffer */

@@ -125,6 +125,13 @@ void carquet_rle_decoder_init(
     memset(dec, 0, sizeof(*dec));
     dec->data = data;
     dec->size = size;
+    /* RLE values are uint32_t — bit_width must be 0..32 */
+    if (bit_width < 0 || bit_width > 32) {
+        dec->bit_width = 0;
+        dec->value_mask = 0;
+        dec->status = CARQUET_ERROR_INVALID_RLE;
+        return;
+    }
     dec->bit_width = bit_width;
     dec->value_mask = bit_width >= 32 ? ~0U : (1U << bit_width) - 1;
     dec->status = CARQUET_OK;
@@ -298,12 +305,41 @@ static void flush_rle(carquet_rle_encoder_t* enc) {
     enc->repeat_count = 0;
 }
 
+static void flush_bitpack_as_rle(carquet_rle_encoder_t* enc) {
+    /* Emit remaining buffered values as individual RLE runs.
+     * Used when we have a partial group (< 8 values) that can't form
+     * a complete bit-packed group per the Parquet spec. */
+    int value_bytes = (enc->bit_width + 7) / 8;
+
+    int i = 0;
+    while (i < enc->bitpack_count) {
+        uint32_t val = enc->bitpack_buffer[i];
+        int64_t run = 1;
+        while (i + run < enc->bitpack_count && enc->bitpack_buffer[i + run] == val) {
+            run++;
+        }
+        /* RLE header: (count << 1) | 0 */
+        write_varint(enc->buffer, (uint32_t)(run << 1));
+        uint8_t bytes[4];
+        for (int b = 0; b < value_bytes; b++) {
+            bytes[b] = (uint8_t)(val >> (b * 8));
+        }
+        carquet_buffer_append(enc->buffer, bytes, (size_t)value_bytes);
+        i += (int)run;
+    }
+
+    enc->bitpack_count = 0;
+    enc->bitpack_total = 0;
+}
+
 static void flush_bitpack(carquet_rle_encoder_t* enc) {
     if (enc->bitpack_count == 0) return;
 
-    /* Pad buffer to 8 values */
-    while (enc->bitpack_count < 8) {
-        enc->bitpack_buffer[enc->bitpack_count++] = 0;
+    /* If we have a partial group, emit as RLE runs instead of
+     * padding with zeros (which corrupts the output). */
+    if (enc->bitpack_count < 8) {
+        flush_bitpack_as_rle(enc);
+        return;
     }
 
     /* Write bit-packed header: (num_groups << 1) | 1 */
@@ -315,9 +351,6 @@ static void flush_bitpack(carquet_rle_encoder_t* enc) {
     for (int g = 0; g < num_groups; g++) {
         carquet_bitpack8_32(enc->bitpack_buffer, enc->bit_width, packed);
         carquet_buffer_append(enc->buffer, packed, (size_t)enc->bit_width);
-
-        /* Shift remaining values */
-        /* Note: This simplified impl assumes we flush after each group */
     }
 
     enc->bitpack_count = 0;
@@ -442,7 +475,7 @@ int64_t carquet_rle_decode_levels(
     int16_t* output,
     int64_t max_values) {
 
-    if (max_values <= 0 || input_size == 0) {
+    if (max_values <= 0 || input_size == 0 || bit_width < 0 || bit_width > 32) {
         return 0;
     }
 

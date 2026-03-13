@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(carquet VERSION 0.3.0 LANGUAGES C)
+project(carquet VERSION 0.3.1 LANGUAGES C)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -422,7 +422,11 @@ endif()
 # Create library
 if(CARQUET_BUILD_SHARED)
     add_library(carquet SHARED ${CARQUET_SOURCES})
-    target_compile_definitions(carquet PRIVATE CARQUET_BUILD_SHARED CARQUET_BUILDING_DLL)
+    set_target_properties(carquet PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
+    target_compile_definitions(carquet
+        PUBLIC CARQUET_BUILD_SHARED
+        PRIVATE CARQUET_BUILDING_DLL
+    )
 else()
     add_library(carquet STATIC ${CARQUET_SOURCES})
 endif()
@@ -439,10 +443,12 @@ target_include_directories(carquet
 )
 
 # Link external compression libraries
+set(CARQUET_COMPRESSION_LIBS ${ZSTD_LIBRARIES} ${LZ4_LIBRARIES})
+
 if(ZLIB_FOUND)
-    target_link_libraries(carquet PRIVATE ${ZSTD_LIBRARIES} ZLIB::ZLIB ${LZ4_LIBRARIES})
+    target_link_libraries(carquet PRIVATE ${CARQUET_COMPRESSION_LIBS} ZLIB::ZLIB)
 else()
-    target_link_libraries(carquet PRIVATE ${ZSTD_LIBRARIES} ${ZLIB_LIBRARIES} ${LZ4_LIBRARIES})
+    target_link_libraries(carquet PRIVATE ${CARQUET_COMPRESSION_LIBS} ${ZLIB_LIBRARIES})
 endif()
 
 # Link libm for math functions (bloom_filter.c uses log())

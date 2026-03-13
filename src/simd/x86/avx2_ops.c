@@ -483,7 +483,10 @@ void carquet_avx2_byte_stream_split_decode_double(
  * Apply prefix sum (cumulative sum) to int32 array using AVX2.
  */
 void carquet_avx2_prefix_sum_i32(int32_t* values, int64_t count, int32_t initial) {
-    int32_t sum = initial;
+    /* Use unsigned arithmetic to avoid signed overflow UB.
+     * Delta encoding relies on modular arithmetic — _mm256_add_epi32 is
+     * already modular, so only the scalar accumulator needs fixing. */
+    uint32_t sum = (uint32_t)initial;
     int64_t i = 0;
 
     /* AVX2 prefix sum for 8 elements at a time */
@@ -511,18 +514,18 @@ void carquet_avx2_prefix_sum_i32(int32_t* values, int64_t count, int32_t initial
         v = _mm256_inserti128_si256(v, hi, 1);
 
         /* Add running sum */
-        __m256i sums = _mm256_set1_epi32(sum);
+        __m256i sums = _mm256_set1_epi32((int32_t)sum);
         v = _mm256_add_epi32(v, sums);
         _mm256_storeu_si256((__m256i*)(values + i), v);
 
         /* Update running sum to last element */
-        sum = _mm256_extract_epi32(v, 7);
+        sum = (uint32_t)_mm256_extract_epi32(v, 7);
     }
 
     /* Handle remaining values */
     for (; i < count; i++) {
-        sum += values[i];
-        values[i] = sum;
+        sum += (uint32_t)values[i];
+        values[i] = (int32_t)sum;
     }
 }
 
@@ -530,7 +533,8 @@ void carquet_avx2_prefix_sum_i32(int32_t* values, int64_t count, int32_t initial
  * Apply prefix sum to int64 array using AVX2.
  */
 void carquet_avx2_prefix_sum_i64(int64_t* values, int64_t count, int64_t initial) {
-    int64_t sum = initial;
+    /* Use unsigned arithmetic to avoid signed overflow UB. */
+    uint64_t sum = (uint64_t)initial;
     int64_t i = 0;
 
     /* AVX2 prefix sum for 4 elements at a time */
@@ -553,18 +557,18 @@ void carquet_avx2_prefix_sum_i64(int64_t* values, int64_t count, int64_t initial
         v = _mm256_inserti128_si256(v, hi, 1);
 
         /* Add running sum */
-        __m256i sums = _mm256_set1_epi64x(sum);
+        __m256i sums = _mm256_set1_epi64x((int64_t)sum);
         v = _mm256_add_epi64(v, sums);
         _mm256_storeu_si256((__m256i*)(values + i), v);
 
         /* Update running sum */
-        sum = _mm256_extract_epi64(v, 3);
+        sum = (uint64_t)_mm256_extract_epi64(v, 3);
     }
 
     /* Handle remaining values */
     for (; i < count; i++) {
-        sum += values[i];
-        values[i] = sum;
+        sum += (uint64_t)values[i];
+        values[i] = (int64_t)sum;
     }
 }
 

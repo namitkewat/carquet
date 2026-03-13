@@ -31,6 +31,28 @@ extern bool carquet_dispatch_checked_gather_float(const float* dict, int32_t dic
 extern bool carquet_dispatch_checked_gather_double(const double* dict, int32_t dict_count,
                                                     const uint32_t* indices, int64_t count, double* output);
 
+/**
+ * Ensure dict_data is aligned for type T before casting.
+ * If misaligned, copies into a temporary aligned buffer.
+ * Sets 'aligned_ptr' to the aligned pointer (type T*) and
+ * 'aligned_buf' to the temp allocation (NULL if no copy needed).
+ */
+#define ENSURE_DICT_ALIGNED(dict_data, dict_bytes, T, aligned_ptr, aligned_buf) \
+    do { \
+        if (((uintptr_t)(dict_data)) % _Alignof(T) == 0) { \
+            (aligned_ptr) = (const T*)(dict_data); \
+            (aligned_buf) = NULL; \
+        } else { \
+            (aligned_buf) = malloc(dict_bytes); \
+            if (!(aligned_buf)) { \
+                (aligned_ptr) = NULL; \
+            } else { \
+                memcpy((aligned_buf), (dict_data), (dict_bytes)); \
+                (aligned_ptr) = (const T*)(aligned_buf); \
+            } \
+        } \
+    } while (0)
+
 /* ============================================================================
  * Dictionary Builder
  * ============================================================================
@@ -452,11 +474,21 @@ carquet_status_t carquet_dictionary_decode_int32(
         output[i] = carquet_read_i32_le(dict_data + indices[i] * sizeof(int32_t));
     }
 #else
-    if (!carquet_dispatch_checked_gather_i32((const int32_t*)dict_data, dict_count,
+    const int32_t* aligned_dict;
+    void* aligned_buf;
+    size_t dict_bytes = (size_t)dict_count * sizeof(int32_t);
+    ENSURE_DICT_ALIGNED(dict_data, dict_bytes, int32_t, aligned_dict, aligned_buf);
+    if (!aligned_dict) {
+        free(indices);
+        return CARQUET_ERROR_OUT_OF_MEMORY;
+    }
+    if (!carquet_dispatch_checked_gather_i32(aligned_dict, dict_count,
                                              indices, decoded, output)) {
+        free(aligned_buf);
         free(indices);
         return CARQUET_ERROR_DECODE;
     }
+    free(aligned_buf);
 #endif
 
     free(indices);
@@ -511,11 +543,21 @@ carquet_status_t carquet_dictionary_decode_int64(
         output[i] = carquet_read_i64_le(dict_data + indices[i] * sizeof(int64_t));
     }
 #else
-    if (!carquet_dispatch_checked_gather_i64((const int64_t*)dict_data, dict_count,
+    const int64_t* aligned_dict;
+    void* aligned_buf;
+    size_t dict_bytes = (size_t)dict_count * sizeof(int64_t);
+    ENSURE_DICT_ALIGNED(dict_data, dict_bytes, int64_t, aligned_dict, aligned_buf);
+    if (!aligned_dict) {
+        free(indices);
+        return CARQUET_ERROR_OUT_OF_MEMORY;
+    }
+    if (!carquet_dispatch_checked_gather_i64(aligned_dict, dict_count,
                                              indices, decoded, output)) {
+        free(aligned_buf);
         free(indices);
         return CARQUET_ERROR_DECODE;
     }
+    free(aligned_buf);
 #endif
 
     free(indices);
@@ -570,11 +612,21 @@ carquet_status_t carquet_dictionary_decode_float(
         output[i] = carquet_read_f32_le(dict_data + indices[i] * sizeof(float));
     }
 #else
-    if (!carquet_dispatch_checked_gather_float((const float*)dict_data, dict_count,
+    const float* aligned_dict;
+    void* aligned_buf;
+    size_t dict_bytes = (size_t)dict_count * sizeof(float);
+    ENSURE_DICT_ALIGNED(dict_data, dict_bytes, float, aligned_dict, aligned_buf);
+    if (!aligned_dict) {
+        free(indices);
+        return CARQUET_ERROR_OUT_OF_MEMORY;
+    }
+    if (!carquet_dispatch_checked_gather_float(aligned_dict, dict_count,
                                                indices, decoded, output)) {
+        free(aligned_buf);
         free(indices);
         return CARQUET_ERROR_DECODE;
     }
+    free(aligned_buf);
 #endif
 
     free(indices);
@@ -629,11 +681,21 @@ carquet_status_t carquet_dictionary_decode_double(
         output[i] = carquet_read_f64_le(dict_data + indices[i] * sizeof(double));
     }
 #else
-    if (!carquet_dispatch_checked_gather_double((const double*)dict_data, dict_count,
+    const double* aligned_dict;
+    void* aligned_buf;
+    size_t dict_bytes = (size_t)dict_count * sizeof(double);
+    ENSURE_DICT_ALIGNED(dict_data, dict_bytes, double, aligned_dict, aligned_buf);
+    if (!aligned_dict) {
+        free(indices);
+        return CARQUET_ERROR_OUT_OF_MEMORY;
+    }
+    if (!carquet_dispatch_checked_gather_double(aligned_dict, dict_count,
                                                 indices, decoded, output)) {
+        free(aligned_buf);
         free(indices);
         return CARQUET_ERROR_DECODE;
     }
+    free(aligned_buf);
 #endif
 
     free(indices);

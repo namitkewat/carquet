@@ -34,7 +34,7 @@
 #define BENCH_ITERATIONS_SMALL 51   /* sub-ms ops need more samples */
 #define BENCH_ITERATIONS_MEDIUM 21
 #define BENCH_ITERATIONS_LARGE 11
-#define MAX_BENCH_ITERATIONS 51
+#define MAX_BENCH_ITERATIONS 201
 
 static int compare_double(const void* a, const void* b) {
     double da = *(const double*)a;
@@ -359,11 +359,20 @@ static void run_benchmark(const char* dataset_name, int num_rows,
 
     test_data_t* td = test_data_create(num_rows);
 
-    /* Scale iterations: small datasets need more samples for stability */
+    /* Scale iterations: small datasets need more samples for stability.
+     * CARQUET_BENCH_ITERATIONS env var overrides all sizes. */
     int iters;
-    if (num_rows <= 100000) iters = BENCH_ITERATIONS_SMALL;
-    else if (num_rows <= 1000000) iters = BENCH_ITERATIONS_MEDIUM;
-    else iters = BENCH_ITERATIONS_LARGE;  /* large and xlarge */
+    const char* iter_env = getenv("CARQUET_BENCH_ITERATIONS");
+    if (iter_env && atoi(iter_env) > 0) {
+        iters = atoi(iter_env);
+        if (iters > MAX_BENCH_ITERATIONS) iters = MAX_BENCH_ITERATIONS;
+    } else if (num_rows <= 100000) {
+        iters = BENCH_ITERATIONS_SMALL;
+    } else if (num_rows <= 1000000) {
+        iters = BENCH_ITERATIONS_MEDIUM;
+    } else {
+        iters = BENCH_ITERATIONS_LARGE;  /* large and xlarge */
+    }
 
     /* Warmup writes */
     for (int i = 0; i < WARMUP_ITERATIONS; i++) {

@@ -230,14 +230,19 @@ size_t carquet_bitunpack_32(const uint8_t* input, size_t count,
         bytes_consumed += bit_width;  /* 8 values * bit_width bits = bit_width bytes */
     }
 
-    /* Handle remaining values */
+    /* Handle remaining values (< 8) with a zero-padded buffer to avoid
+     * overreading: the tail may have fewer than bit_width bytes available,
+     * but carquet_bitunpack8_32 always reads bit_width bytes. */
     if (i < count) {
+        size_t tail_bytes = carquet_packed_size(count - i, bit_width);
+        uint8_t padded[32] = {0};  /* max bit_width is 32 */
+        memcpy(padded, input + bytes_consumed, tail_bytes);
         uint32_t temp[8];
-        carquet_bitunpack8_32(input + bytes_consumed, bit_width, temp);
+        carquet_bitunpack8_32(padded, bit_width, temp);
         for (size_t j = 0; j < count - i; j++) {
             values[i + j] = temp[j];
         }
-        bytes_consumed += carquet_packed_size(count - i, bit_width);
+        bytes_consumed += tail_bytes;
     }
 
     return bytes_consumed;

@@ -213,25 +213,20 @@ void carquet_sve_byte_stream_split_decode_double(
  * Apply prefix sum (cumulative sum) to int32 array using SVE.
  */
 void carquet_sve_prefix_sum_i32(int32_t* values, int64_t count, int32_t initial) {
-    int32_t sum = initial;
+    /* Use unsigned arithmetic to avoid signed overflow UB.
+     * Delta encoding relies on modular arithmetic. */
+    uint32_t sum = (uint32_t)initial;
     int64_t i = 0;
 
     /* SVE prefix sum using vector-length chunks */
     while (i < count) {
         svbool_t pg = svwhilelt_b32(i, count);
 
-        /* Load values */
-        svint32_t v = svld1_s32(pg, values + i);
-
-        /* Compute prefix sum within vector using scan */
-        /* Note: SVE doesn't have a direct prefix sum, so we use horizontal add */
-        int32_t chunk_sum = svaddv_s32(pg, v);
-
         /* For correctness, we need to compute element-wise prefix */
         int64_t active = svcntp_b32(pg, pg);
         for (int64_t j = 0; j < active; j++) {
-            sum += values[i + j];
-            values[i + j] = sum;
+            sum += (uint32_t)values[i + j];
+            values[i + j] = (int32_t)sum;
         }
 
         i += svcntw();
@@ -242,7 +237,8 @@ void carquet_sve_prefix_sum_i32(int32_t* values, int64_t count, int32_t initial)
  * Apply prefix sum to int64 array using SVE.
  */
 void carquet_sve_prefix_sum_i64(int64_t* values, int64_t count, int64_t initial) {
-    int64_t sum = initial;
+    /* Use unsigned arithmetic to avoid signed overflow UB. */
+    uint64_t sum = (uint64_t)initial;
     int64_t i = 0;
 
     while (i < count) {
@@ -250,8 +246,8 @@ void carquet_sve_prefix_sum_i64(int64_t* values, int64_t count, int64_t initial)
 
         int64_t active = svcntp_b64(pg, pg);
         for (int64_t j = 0; j < active; j++) {
-            sum += values[i + j];
-            values[i + j] = sum;
+            sum += (uint64_t)values[i + j];
+            values[i + j] = (int64_t)sum;
         }
 
         i += svcntd();

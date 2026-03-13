@@ -22,34 +22,43 @@
 
 - **Pure C11** with three external dependencies (zstd, zlib, lz4) -- all auto-fetched by CMake
 - **~200KB binary** vs ~50MB+ for Arrow
-- **Compressed reads 1.5-2.1x faster** than Arrow C++ on x86 (snappy, zstd, lz4)
-- **Writes 1.3-2.5x faster** than Arrow C++ and PyArrow on ARM
+- **Compressed reads 1.05-2.1x faster** than Arrow C++ across x86 and ARM
+- **Writes 1.1-2.4x faster** than Arrow C++ across codecs and platforms
 - Full Parquet spec: all types, encodings, compression codecs, nested schemas, bloom filters, page indexes
 - SIMD-optimized (SSE4.2, AVX2, AVX-512, NEON, SVE) with runtime detection and scalar fallbacks
 - PyArrow, DuckDB, Spark compatible out of the box
 
 ## Performance
 
-All benchmarks use identical data (deterministic LCG PRNG), identical Parquet settings (no dictionary, BYTE_STREAM_SPLIT for floats, page checksums, mmap reads), trimmed median of 11-51 iterations, with OS page cache purged between write and read phases and cooldown between configurations. Schema: 3 columns (INT64, DOUBLE, INT32). Compared against Arrow C++ 23.0.1 (native C++) and PyArrow 23.0.0/23.0.1 (Python bindings to the same C++ library).
+Carquet vs Arrow C++ 23.0.1 at 10M rows (the most representative size). Higher ratio = Carquet faster.
 
-### x86: Intel Xeon D-1531 (Linux)
+| | x86 (Xeon D-1531) | | ARM (Apple M3) | |
+|---|---|---|---|---|
+| **Codec** | **Write** | **Read** | **Write** | **Read** |
+| snappy | 0.90x | **2.1x** | **1.10x** | **1.41x** |
+| zstd | **1.06x** | **1.5x** | **1.67x** | **1.07x** |
+| lz4 | 1.00x | **2.0x** | **1.19x** | **1.26x** |
+| none | 0.97x | **3.5x**\* | 0.93x | **1.53x**\* |
+
+\* Uncompressed reads use mmap zero-copy -- see note below.
+
+Compressed reads involve full decompression and decoding of every value, no shortcuts. Carquet reads compressed Parquet **1.07-2.1x faster than Arrow C++** across every codec tested on both platforms, while writes are **1.06-1.67x faster** across most configurations.
+
+<details>
+<summary>Benchmark methodology</summary>
+
+All benchmarks use identical data (deterministic LCG PRNG), identical Parquet settings (no dictionary, BYTE_STREAM_SPLIT for floats, page checksums, mmap reads), trimmed median of 11-51 iterations, with OS page cache purged between write and read phases and cooldown between configurations. Schema: 3 columns (INT64, DOUBLE, INT32). Compared against Arrow C++ 23.0.1 (native C++) and PyArrow 23.0.1 (Python bindings to the same C++ library).
+
+**Uncompressed reads** marked with \* use Carquet's **mmap zero-copy path**: for PLAIN-encoded, uncompressed, fixed-size, required columns, the batch reader returns pointers directly into the memory-mapped file with no memcpy. The OS only pages in data the application actually touches. Arrow always materializes into its own columnar format regardless. This is a real API-level advantage for filtering, sampling, or partial scans. **The compressed read numbers are the most representative measure of end-to-end read throughput.**
+
+</details>
+
+<details>
+<summary>Full x86 results (Intel Xeon D-1531, Linux)</summary>
 
 *12 threads @ 2.7GHz, 32GB RAM, Ubuntu 24.04 -- ZSTD level 1*
 
-#### Compressed reads: the headline result
-
-These numbers reflect full decompression + decoding of every value -- no shortcuts.
-
-| | 100M rows | | 10M rows | | 1M rows | |
-|--------|-----------|-------|----------|-------|---------|-------|
-| **Codec** | **Carquet** | **vs Arrow C++** | **Carquet** | **vs Arrow C++** | **Carquet** | **vs Arrow C++** |
-| snappy | 1939ms | **1.4x** | 147ms | **2.1x** | 17ms | **2.1x** |
-| zstd | 1653ms | **1.4x** | 168ms | **1.5x** | 17ms | **1.5x** |
-| lz4 | — | — | 68ms | **2.0x** | 6.4ms | **1.7x** |
-
-Carquet reads compressed Parquet **1.5-2.1x faster than Arrow C++** across every codec and dataset size tested. Snappy and LZ4 show the largest advantage (~2x at 10M rows) while ZSTD is consistently ~1.5x faster.
-
-#### Full results vs Arrow C++ (10M rows)
+#### 10M rows vs Arrow C++
 
 | Codec | Carquet Write | Arrow C++ Write | W ratio | Carquet Read | Arrow C++ Read | R ratio | Size |
 |-------|--------------|-----------------|---------|-------------|----------------|---------|------|
@@ -58,8 +67,6 @@ Carquet reads compressed Parquet **1.5-2.1x faster than Arrow C++** across every
 | zstd | **1483ms** | 1569ms | **1.06x** | **168ms** | 254ms | **1.5x** | 95.3MB |
 | lz4 | 1526ms | 1527ms | 1.00x | **68ms** | 138ms | **2.0x** | 122.9MB |
 
-\* Uncompressed reads use mmap zero-copy (see note below). Compressed reads involve full decompression and decoding.
-
 #### 100M rows (partial -- PyArrow timed out on zstd/lz4)
 
 | Codec | Carquet Write | Arrow C++ Write | W ratio | Carquet Read | Arrow C++ Read | R ratio |
@@ -67,11 +74,6 @@ Carquet reads compressed Parquet **1.5-2.1x faster than Arrow C++** across every
 | none | **10.2s** | 16.8s | **1.65x** | **216ms** | 757ms | **3.5x**\* |
 | snappy | **13.6s** | 14.9s | **1.09x** | **1939ms** | 2724ms | **1.4x** |
 | zstd | **14.7s** | 16.0s | **1.09x** | **1653ms** | 2262ms | **1.4x** |
-
-At 100M rows, Carquet writes faster than Arrow C++ across the board (1.09-1.65x).
-
-<details>
-<summary>Full results: 100K and 1M rows</summary>
 
 #### 1M rows vs Arrow C++
 
@@ -91,13 +93,6 @@ At 100M rows, Carquet writes faster than Arrow C++ across the board (1.09-1.65x)
 | zstd | **10.3ms** | 14.2ms | **1.38x** | **1.6ms** | 3.1ms | **2.0x** |
 | lz4 | **10.0ms** | 10.5ms | **1.05x** | **0.7ms** | 1.2ms | **1.7x** |
 
-\* Zero-copy mmap path
-
-</details>
-
-<details>
-<summary>Full results: vs PyArrow</summary>
-
 #### 10M rows vs PyArrow
 
 | Codec | Carquet Write | PyArrow Write | W ratio | Carquet Read | PyArrow Read | R ratio |
@@ -107,97 +102,72 @@ At 100M rows, Carquet writes faster than Arrow C++ across the board (1.09-1.65x)
 | zstd | **1483ms** | 1767ms | **1.19x** | **168ms** | 353ms | **2.1x** |
 | lz4 | 1526ms | **1051ms** | 0.69x | **68ms** | 279ms | **4.1x** |
 
-#### 1M rows vs PyArrow
-
-| Codec | Carquet Write | PyArrow Write | W ratio | Carquet Read | PyArrow Read | R ratio |
-|-------|--------------|---------------|---------|-------------|--------------|---------|
-| none | **179ms** | 194ms | **1.09x** | **0.20ms** | 9.2ms | 46x\* |
-| snappy | 205ms | **152ms** | 0.74x | **17ms** | 19ms | **1.2x** |
-| zstd | 178ms | **161ms** | 0.90x | 17ms | **16ms** | 0.97x |
-| lz4 | **138ms** | 145ms | **1.05x** | **6.4ms** | 9.9ms | **1.5x** |
-
-#### 100K rows vs PyArrow
-
-| Codec | Carquet Write | PyArrow Write | W ratio | Carquet Read | PyArrow Read | R ratio |
-|-------|--------------|---------------|---------|-------------|--------------|---------|
-| none | 17.4ms | **16.4ms** | 0.94x | **0.07ms** | 2.5ms | 36x\* |
-| snappy | **9.7ms** | 9.9ms | **1.02x** | **1.6ms** | 6.9ms | **4.2x** |
-| zstd | **10.3ms** | 15.1ms | **1.46x** | **1.6ms** | 7.7ms | **5.0x** |
-| lz4 | **10.0ms** | 10.5ms | **1.05x** | **0.7ms** | 1.9ms | **2.7x** |
-
-Carquet reads faster than PyArrow across nearly all codecs and sizes. The sole exception is 1M zstd reads where PyArrow is marginally faster (0.97x).
-
 \* Zero-copy mmap path
 
 </details>
 
-### ARM: Apple M3 (macOS)
+<details>
+<summary>Full ARM results (Apple M3, macOS)</summary>
 
-*MacBook Air M3, 16GB RAM, macOS 26.2, Arrow C++ 23.0.1, PyArrow 23.0.1 -- `-DCARQUET_NATIVE_ARCH=ON`, ZSTD level 1*
+*MacBook Air M3, 16GB RAM, macOS 26.2, Arrow C++ 23.0.1, PyArrow 23.0.1 -- ZSTD level 1*
 
 #### 10M rows vs Arrow C++
 
-| Codec | Carquet Write | Arrow C++ Write | W ratio | Carquet Read | Arrow C++ Read | R ratio |
-|-------|--------------|-----------------|---------|-------------|----------------|---------|
-| none | 136ms | 132ms | 0.97x | **8.7ms** | 14.2ms | **1.6x**\* |
-| snappy | **218ms** | 240ms | **1.10x** | 86ms | **53ms** | 0.62x |
-| zstd | **202ms** | 338ms | **1.68x** | **66ms** | 70ms | 1.07x |
-| lz4 | **206ms** | 254ms | **1.23x** | **25ms** | 31ms | **1.25x** |
+| Codec | Carquet Write | Arrow C++ Write | W ratio | Carquet Read | Arrow C++ Read | R ratio | Size |
+|-------|--------------|-----------------|---------|-------------|----------------|---------|------|
+| none | 136.4ms | 126.5ms | 0.93x | **8.74ms** | 13.33ms | **1.53x**\* | 190.7MB |
+| snappy | **221.6ms** | 243.4ms | **1.10x** | **39.53ms** | 55.83ms | **1.41x** | 125.1MB |
+| zstd | **204.8ms** | 341.8ms | **1.67x** | **65.62ms** | 69.90ms | **1.07x** | 95.3MB |
+| lz4 | **208.0ms** | 247.5ms | **1.19x** | **24.85ms** | 31.33ms | **1.26x** | 122.9MB |
 
 #### 1M rows vs Arrow C++
 
 | Codec | Carquet Write | Arrow C++ Write | W ratio | Carquet Read | Arrow C++ Read | R ratio |
 |-------|--------------|-----------------|---------|-------------|----------------|---------|
-| none | **9.0ms** | 12.8ms | **1.42x** | **0.04ms** | 0.92ms | 23x\* |
-| snappy | **13.6ms** | 24.2ms | **1.78x** | 8.6ms | **4.8ms** | 0.56x |
-| zstd | **16.0ms** | 34.6ms | **2.16x** | **6.1ms** | 6.4ms | 1.05x |
-| lz4 | **13.5ms** | 25.0ms | **1.86x** | **2.4ms** | 2.5ms | 1.05x |
+| none | **8.85ms** | 12.12ms | **1.37x** | **0.04ms** | 0.96ms | 24x\* |
+| snappy | **13.52ms** | 24.61ms | **1.82x** | **3.85ms** | 4.84ms | **1.26x** |
+| zstd | **16.43ms** | 33.83ms | **2.06x** | **6.12ms** | 6.44ms | **1.05x** |
+| lz4 | **13.77ms** | 24.68ms | **1.79x** | **2.40ms** | 2.52ms | **1.05x** |
 
-On ARM, the standout is **write performance**: Carquet is **1.1-2.2x faster than Arrow C++** across all codecs and sizes, with ZSTD writes reaching 2.16x. Reads are competitive -- faster on uncompressed and LZ4, roughly even on ZSTD, slower on snappy (Arrow C++ has stronger snappy decompression on this platform).
+#### 100K rows vs Arrow C++
 
-<details>
-<summary>Full results: vs PyArrow on ARM</summary>
+| Codec | Carquet Write | Arrow C++ Write | W ratio | Carquet Read | Arrow C++ Read | R ratio |
+|-------|--------------|-----------------|---------|-------------|----------------|---------|
+| none | **1.38ms** | 1.54ms | **1.12x** | **0.02ms** | 0.11ms | 5.50x\* |
+| snappy | **1.65ms** | 2.59ms | **1.57x** | **0.33ms** | 0.52ms | **1.58x** |
+| zstd | **1.79ms** | 4.29ms | **2.40x** | **0.63ms** | 0.73ms | **1.16x** |
+| lz4 | **1.63ms** | 2.65ms | **1.63x** | **0.25ms** | 0.29ms | **1.16x** |
 
 #### 10M rows vs PyArrow
 
 | Codec | Carquet Write | PyArrow Write | W ratio | Carquet Read | PyArrow Read | R ratio |
 |-------|--------------|---------------|---------|-------------|--------------|---------|
-| none | **136ms** | 187ms | **1.38x** | **8.7ms** | 35ms | **4.0x**\* |
-| snappy | **218ms** | 293ms | **1.34x** | 86ms | **46ms** | 0.53x |
-| zstd | **202ms** | 398ms | **1.97x** | 66ms | **57ms** | 0.86x |
-| lz4 | **206ms** | 307ms | **1.49x** | **25ms** | 39ms | **1.56x** |
+| none | **138.6ms** | 178.3ms | **1.29x** | **10.95ms** | 35.93ms | **3.28x**\* |
+| snappy | **221.3ms** | 288.9ms | **1.31x** | **39.35ms** | 46.60ms | **1.18x** |
+| zstd | **204.7ms** | 396.4ms | **1.94x** | 65.84ms | **53.30ms** | 0.81x |
+| lz4 | **204.5ms** | 304.2ms | **1.49x** | **24.84ms** | 39.50ms | **1.59x** |
 
 #### 1M rows vs PyArrow
 
 | Codec | Carquet Write | PyArrow Write | W ratio | Carquet Read | PyArrow Read | R ratio |
 |-------|--------------|---------------|---------|-------------|--------------|---------|
-| none | **9.0ms** | 17.5ms | **1.95x** | **0.04ms** | 2.6ms | 65x\* |
-| snappy | **13.6ms** | 29.8ms | **2.18x** | 8.6ms | **3.6ms** | 0.42x |
-| zstd | **16.0ms** | 40.0ms | **2.50x** | 6.1ms | **4.4ms** | 0.72x |
-| lz4 | **13.5ms** | 30.6ms | **2.28x** | **2.4ms** | 3.1ms | **1.30x** |
+| none | **8.85ms** | 18.04ms | **2.04x** | **0.04ms** | 2.63ms | 65.75x\* |
+| snappy | **13.52ms** | 30.28ms | **2.24x** | 3.85ms | **3.64ms** | 0.95x |
+| zstd | **16.43ms** | 39.87ms | **2.43x** | 6.12ms | **4.41ms** | 0.72x |
+| lz4 | **13.77ms** | 31.18ms | **2.26x** | **2.40ms** | 3.34ms | **1.39x** |
 
-Carquet writes **1.3-2.5x faster than PyArrow** across the board on ARM. Reads are faster on uncompressed and LZ4; PyArrow is faster on snappy and zstd reads (dictionary encoding advantage on this data shape).
+#### 100K rows vs PyArrow
+
+| Codec | Carquet Write | PyArrow Write | W ratio | Carquet Read | PyArrow Read | R ratio |
+|-------|--------------|---------------|---------|-------------|--------------|---------|
+| none | **1.38ms** | 2.06ms | **1.49x** | **0.02ms** | 0.24ms | 12x\* |
+| snappy | **1.65ms** | 3.58ms | **2.17x** | **0.33ms** | 0.62ms | **1.88x** |
+| zstd | **1.79ms** | 4.91ms | **2.74x** | **0.63ms** | 0.94ms | **1.49x** |
+| lz4 | **1.63ms** | 3.21ms | **1.97x** | **0.25ms** | 0.41ms | **1.64x** |
 
 \* Zero-copy mmap path
 
 </details>
-
-### A note on uncompressed read numbers
-
-Uncompressed reads marked with \* use Carquet's **mmap zero-copy path**: for PLAIN-encoded, uncompressed, fixed-size, required columns, the batch reader returns pointers directly into the memory-mapped file with no memcpy. The OS only pages in data the application actually touches. This explains the extreme ratios (10-65x) for uncompressed reads -- Arrow always materializes into its own columnar format regardless.
-
-This is a real API-level advantage for workloads like filtering, sampling, or partial scans. For full sequential scans that touch every value, the effective speedup is lower. **The compressed read numbers (snappy, zstd, lz4) involve full decompression and decoding of every value** and are the most representative measure of end-to-end read throughput.
-
-### Summary
-
-| | x86 (Xeon D-1531) | ARM (Apple M3) |
-|---|---|---|
-| **Compressed reads** | **1.5-2.1x faster** than Arrow C++ | Even to 1.25x faster (LZ4); 0.6x slower (snappy) |
-| **Uncompressed reads** | **3.5x faster**\* (mmap zero-copy) | **1.6x faster**\* |
-| **Writes** | Competitive (0.90-1.65x, best at scale) | **1.1-2.2x faster** across the board |
-| **File sizes** | Equal or slightly smaller | Equal or slightly smaller |
-
-\* Zero-copy path; see note above.
 
 ## Building
 

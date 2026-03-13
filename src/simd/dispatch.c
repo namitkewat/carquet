@@ -99,18 +99,18 @@ typedef void (*copy_minmax_double_fn)(const double* values, int64_t count, doubl
 #endif
 
 static void scalar_prefix_sum_i32(int32_t* values, int64_t count, int32_t initial) {
-    int32_t sum = initial;
+    uint32_t sum = (uint32_t)initial;
     for (int64_t i = 0; i < count; i++) {
-        sum += values[i];
-        values[i] = sum;
+        sum += (uint32_t)values[i];
+        values[i] = (int32_t)sum;
     }
 }
 
 static void scalar_prefix_sum_i64(int64_t* values, int64_t count, int64_t initial) {
-    int64_t sum = initial;
+    uint64_t sum = (uint64_t)initial;
     for (int64_t i = 0; i < count; i++) {
-        sum += values[i];
-        values[i] = sum;
+        sum += (uint64_t)values[i];
+        values[i] = (int64_t)sum;
     }
 }
 

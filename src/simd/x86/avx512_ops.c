@@ -467,7 +467,10 @@ void carquet_avx512_byte_stream_split_decode_double(
  * Apply prefix sum (cumulative sum) to int32 array using AVX-512.
  */
 void carquet_avx512_prefix_sum_i32(int32_t* values, int64_t count, int32_t initial) {
-    int32_t sum = initial;
+    /* Use unsigned arithmetic to avoid signed overflow UB.
+     * Delta encoding relies on modular arithmetic — _mm512_add_epi32 is
+     * already modular, so only the scalar accumulator needs fixing. */
+    uint32_t sum = (uint32_t)initial;
     int64_t i = 0;
 
     /* AVX-512 prefix sum for 16 elements at a time */
@@ -492,18 +495,18 @@ void carquet_avx512_prefix_sum_i32(int32_t* values, int64_t count, int32_t initi
         v = _mm512_add_epi32(v, shifted8);
 
         /* Add running sum */
-        __m512i sums = _mm512_set1_epi32(sum);
+        __m512i sums = _mm512_set1_epi32((int32_t)sum);
         v = _mm512_add_epi32(v, sums);
         _mm512_storeu_si512((__m512i*)(values + i), v);
 
         /* Update running sum to last element */
-        sum = values[i + 15];
+        sum = (uint32_t)values[i + 15];
     }
 
     /* Handle remaining values */
     for (; i < count; i++) {
-        sum += values[i];
-        values[i] = sum;
+        sum += (uint32_t)values[i];
+        values[i] = (int32_t)sum;
     }
 }
 
@@ -511,7 +514,8 @@ void carquet_avx512_prefix_sum_i32(int32_t* values, int64_t count, int32_t initi
  * Apply prefix sum to int64 array using AVX-512.
  */
 void carquet_avx512_prefix_sum_i64(int64_t* values, int64_t count, int64_t initial) {
-    int64_t sum = initial;
+    /* Use unsigned arithmetic to avoid signed overflow UB. */
+    uint64_t sum = (uint64_t)initial;
     int64_t i = 0;
 
     /* AVX-512 prefix sum for 8 elements at a time */
@@ -529,18 +533,18 @@ void carquet_avx512_prefix_sum_i64(int64_t* values, int64_t count, int64_t initi
         v = _mm512_add_epi64(v, shifted4);
 
         /* Add running sum */
-        __m512i sums = _mm512_set1_epi64(sum);
+        __m512i sums = _mm512_set1_epi64((int64_t)sum);
         v = _mm512_add_epi64(v, sums);
         _mm512_storeu_si512((__m512i*)(values + i), v);
 
         /* Update running sum */
-        sum = values[i + 7];
+        sum = (uint64_t)values[i + 7];
     }
 
     /* Handle remaining values */
     for (; i < count; i++) {
-        sum += values[i];
-        values[i] = sum;
+        sum += (uint64_t)values[i];
+        values[i] = (int64_t)sum;
     }
 }
 

@@ -7,9 +7,10 @@ to avoid thermal throttling on fanless laptops (e.g. MacBook Air).
 
 Usage:
     python3 benchmark/run_benchmark.py                # full benchmark
-    python3 benchmark/run_benchmark.py --quick         # large/none only
+    python3 benchmark/run_benchmark.py --quick         # large only (10M rows)
     python3 benchmark/run_benchmark.py --skip-xlarge   # skip 100M row configs
     python3 benchmark/run_benchmark.py --skip-small --skip-medium  # large+ only
+    python3 benchmark/run_benchmark.py --iterations 51  # 51 iters for stable numbers
     python3 benchmark/run_benchmark.py --cooldown 5    # 5s cooldown between configs
     python3 benchmark/run_benchmark.py --no-pyarrow    # skip PyArrow
     python3 benchmark/run_benchmark.py --no-arrow-cpp  # skip Arrow C++
@@ -391,7 +392,7 @@ def main():
         description="Carquet benchmark runner with optional Arrow C++ and PyArrow comparisons"
     )
     parser.add_argument("--quick", action="store_true",
-                        help="Run only large/none config")
+                        help="Run only large configs (10M rows, all codecs)")
     parser.add_argument("--skip-xlarge", action="store_true",
                         help="Skip xlarge (100M rows) configs")
     parser.add_argument("--skip-large", action="store_true",
@@ -412,7 +413,12 @@ def main():
                         help="Skip PyArrow benchmarks")
     parser.add_argument("--no-carquet", action="store_true",
                         help="Skip Carquet benchmarks")
+    parser.add_argument("--iterations", type=int, default=0,
+                        help="Override iteration count for all sizes (default: auto)")
     args = parser.parse_args()
+
+    if args.iterations > 0:
+        os.environ["CARQUET_BENCH_ITERATIONS"] = str(args.iterations)
 
     if args.temp_dir:
         temp_dir = os.path.abspath(args.temp_dir)
@@ -491,7 +497,7 @@ def main():
     # Select configs
     configs = CONFIGS
     if args.quick:
-        configs = [c for c in configs if c[0] == "xlarge" and c[1] == "none"]
+        configs = [c for c in configs if c[0] == "large"]
     else:
         skip = set()
         if args.skip_xlarge:
@@ -515,8 +521,9 @@ def main():
     if has_pyarrow:
         print(f"  {DIM}vs:{RST}   PyArrow {pyarrow_version}")
     zstd_level = get_benchmark_zstd_level()
+    iter_desc = f"{args.iterations} iters (override)" if args.iterations > 0 else "11-51 iters by size"
     print(f"  {DIM}cfg:{RST}  {len(configs)} configs, {args.cooldown}s cooldown, "
-          f"trimmed median, cache purged, 11-51 iters by size")
+          f"trimmed median, cache purged, {iter_desc}")
     print(f"  {DIM}zstd:{RST} level {zstd_level}")
     print(f"  {DIM}timeout:{RST} {args.timeout}s per library/config")
     if args.temp_dir:
@@ -592,7 +599,7 @@ def main():
         "system": sys_info,
         "config": {
             "warmup_iterations": 3,
-            "bench_iterations": {"small": 51, "medium": 21, "large": 11, "xlarge": 11},
+            "bench_iterations": args.iterations if args.iterations > 0 else {"small": 51, "medium": 21, "large": 11, "xlarge": 11},
             "statistic": "trimmed_median",
             "cache_purge": True,
             "cooldown_seconds": args.cooldown,

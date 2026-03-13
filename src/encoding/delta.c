@@ -192,7 +192,7 @@ static carquet_status_t delta_decoder_read_mini_block(delta_decoder_t* dec) {
         }
 
         dec->pos += packed_size;
-    } else {
+    } else if (bit_width <= 64) {
         /* Unpack 64-bit values (stored as little-endian bytes) */
         int bytes_per_value = (bit_width + 7) / 8;
         size_t packed_size = mini_block_size * bytes_per_value;
@@ -208,6 +208,8 @@ static carquet_status_t delta_decoder_read_mini_block(delta_decoder_t* dec) {
             /* Use unsigned addition to avoid overflow UB */
             dec->mini_block_values[i] = (int64_t)((uint64_t)dec->min_delta + val);
         }
+    } else {
+        return CARQUET_ERROR_DECODE;  /* bit_width > 64 is invalid */
     }
 
     dec->current_mini_block++;

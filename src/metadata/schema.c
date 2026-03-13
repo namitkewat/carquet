@@ -325,7 +325,7 @@ const carquet_schema_node_t* carquet_schema_get_element(
 const char* carquet_schema_node_name(const carquet_schema_node_t* node) {
     /* node is nonnull per API contract */
     const parquet_schema_element_t* elem = (const parquet_schema_element_t*)node;
-    return elem->name;
+    return elem->name ? elem->name : "";
 }
 
 bool carquet_schema_node_is_leaf(const carquet_schema_node_t* node) {

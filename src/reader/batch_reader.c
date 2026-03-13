@@ -338,7 +338,20 @@ static void reset_column_reader_for_row_group(
 
     col_reader->row_group_index = row_group_index;
     col_reader->column_index = column_index;
+
+    if (!rg->columns || column_index >= rg->num_columns) {
+        col_reader->chunk = NULL;
+        col_reader->col_meta = NULL;
+        col_reader->values_remaining = 0;
+        return;
+    }
+
     col_reader->chunk = &rg->columns[column_index];
+    if (!col_reader->chunk->has_metadata) {
+        col_reader->col_meta = NULL;
+        col_reader->values_remaining = 0;
+        return;
+    }
     col_reader->col_meta = &col_reader->chunk->metadata;
 
     /* Reset reading state */
@@ -645,7 +658,12 @@ carquet_status_t carquet_batch_reader_next(
      * The prefetch phase triggers page loading (including decompression).
      * For uncompressed mmap data, page loading is trivial (just pointer
      * setup), so the OpenMP barrier cost (~10-50us) exceeds the work.
-     * For compressed data, parallel decompression is critical for throughput. */
+     * For compressed data, parallel decompression is critical for throughput.
+     *
+     * IMPORTANT: Parallel page loading is only safe when using mmap.
+     * The fread path uses fseek+fread on a shared FILE*, which is not
+     * thread-safe. Only parallelize when mmap_data is available. */
+    bool is_mmap = (batch_reader->reader->mmap_data != NULL);
     bool needs_decompression = false;
     for (int32_t pi = 0; pi < batch_reader->num_projected; pi++) {
         carquet_column_reader_t* cr = batch_reader->col_readers[pi];
@@ -667,7 +685,7 @@ carquet_status_t carquet_batch_reader_next(
      * are uncompressed, avoiding ~10-50us of barrier overhead per batch.
      */
     int32_t omp_i;  /* Declared outside for MSVC OpenMP compatibility */
-    #pragma omp parallel for num_threads(num_threads) schedule(dynamic, 1) if(needs_decompression && num_threads > 1)
+    #pragma omp parallel for num_threads(num_threads) schedule(dynamic, 1) if(is_mmap && needs_decompression && num_threads > 1)
     for (omp_i = 0; omp_i < batch_reader->num_projected; omp_i++) {
         carquet_column_reader_t* col_reader = batch_reader->col_readers[omp_i];
         if (col_reader && !col_reader->page_loaded && col_reader->values_remaining > 0) {
@@ -699,7 +717,7 @@ carquet_status_t carquet_batch_reader_next(
 
     int32_t col_i;  /* Declared outside for MSVC OpenMP compatibility */
 #ifdef _OPENMP
-    bool can_parallelize_columns = (num_threads > 1) && (batch_reader->num_projected > 1);
+    bool can_parallelize_columns = is_mmap && (num_threads > 1) && (batch_reader->num_projected > 1);
     if (can_parallelize_columns && !all_zero_copy_ready) {
         #pragma omp parallel for num_threads(num_threads) schedule(dynamic, 1)
         for (col_i = 0; col_i < batch_reader->num_projected; col_i++) {

@@ -194,7 +194,11 @@ def run_benchmark(name, num_rows, compression, compression_name):
 
     table = generate_data(num_rows)
 
-    iters = BENCH_ITERATIONS.get(name, 21)
+    iter_override = os.environ.get("CARQUET_BENCH_ITERATIONS")
+    if iter_override and int(iter_override) > 0:
+        iters = min(int(iter_override), 201)
+    else:
+        iters = BENCH_ITERATIONS.get(name, 21)
 
     # Warmup writes
     for _ in range(WARMUP_ITERATIONS):
