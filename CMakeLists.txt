@@ -263,6 +263,15 @@ set(CARQUET_COMPRESSION_SOURCES
     src/compression/gzip.c
 )
 
+# Snappy uses SSSE3 (pshufb) for pattern extension on x86.
+# SSSE3 is baseline since Core 2 (2006) / x86-64-v2.
+if(CARQUET_ARCH_X86 AND CARQUET_ENABLE_SSE)
+    if(CARQUET_COMPILER_GCC_LIKE)
+        set_source_files_properties(src/compression/snappy.c PROPERTIES
+            COMPILE_FLAGS "-mssse3")
+    endif()
+endif()
+
 set(CARQUET_SIMD_SOURCES
     src/simd/detect.c
     src/simd/dispatch.c
@@ -679,35 +688,37 @@ if(CARQUET_BUILD_FUZZ)
     add_subdirectory(fuzz)
 endif()
 
-# Installation
-include(GNUInstallDirs)
-install(TARGETS carquet
-    EXPORT carquetTargets
-    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
-    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
-    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
-)
+# Installation (skip when used as a subdirectory via FetchContent/add_subdirectory)
+if(CMAKE_CURRENT_SOURCE_DIR STREQUAL CMAKE_SOURCE_DIR)
+    include(GNUInstallDirs)
+    install(TARGETS carquet
+        EXPORT carquetTargets
+        LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+        ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+        RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+    )
 
-install(DIRECTORY include/carquet
-    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
-)
+    install(DIRECTORY include/carquet
+        DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+    )
 
-install(EXPORT carquetTargets
-    FILE carquetTargets.cmake
-    NAMESPACE carquet::
-    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/carquet
-)
+    install(EXPORT carquetTargets
+        FILE carquetTargets.cmake
+        NAMESPACE carquet::
+        DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/carquet
+    )
 
-# Package configuration
-include(CMakePackageConfigHelpers)
-write_basic_package_version_file(
-    "${CMAKE_CURRENT_BINARY_DIR}/carquetConfigVersion.cmake"
-    VERSION ${PROJECT_VERSION}
-    COMPATIBILITY SameMajorVersion
-)
+    # Package configuration
+    include(CMakePackageConfigHelpers)
+    write_basic_package_version_file(
+        "${CMAKE_CURRENT_BINARY_DIR}/carquetConfigVersion.cmake"
+        VERSION ${PROJECT_VERSION}
+        COMPATIBILITY SameMajorVersion
+    )
 
-configure_package_config_file(
-    "${CMAKE_CURRENT_SOURCE_DIR}/cmake/carquetConfig.cmake.in"
-    "${CMAKE_CURRENT_BINARY_DIR}/carquetConfig.cmake"
-    INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/carquet
-)
+    configure_package_config_file(
+        "${CMAKE_CURRENT_SOURCE_DIR}/cmake/carquetConfig.cmake.in"
+        "${CMAKE_CURRENT_BINARY_DIR}/carquetConfig.cmake"
+        INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/carquet
+    )
+endif()
