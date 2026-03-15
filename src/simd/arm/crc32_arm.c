@@ -11,9 +11,7 @@
 #if defined(__aarch64__) && defined(__ARM_FEATURE_CRC32)
 #include <arm_acle.h>
 
-uint32_t carquet_crc32_arm(const uint8_t* data, size_t length) {
-    uint32_t crc = 0xFFFFFFFF;
-
+static uint32_t crc32_arm_impl(uint32_t crc, const uint8_t* data, size_t length) {
     /* Process 8 bytes at a time */
     while (length >= 8) {
         uint64_t val;
@@ -46,7 +44,16 @@ uint32_t carquet_crc32_arm(const uint8_t* data, size_t length) {
         crc = __crc32b(crc, *data);
     }
 
-    return crc ^ 0xFFFFFFFF;
+    return crc;
+}
+
+uint32_t carquet_crc32_arm(const uint8_t* data, size_t length) {
+    return crc32_arm_impl(0xFFFFFFFF, data, length) ^ 0xFFFFFFFF;
+}
+
+uint32_t carquet_crc32_arm_update(uint32_t crc, const uint8_t* data, size_t length) {
+    /* Continue from previous CRC: un-finalize, process, re-finalize */
+    return crc32_arm_impl(crc ^ 0xFFFFFFFF, data, length) ^ 0xFFFFFFFF;
 }
 
 int carquet_has_arm_crc32(void) {
@@ -57,6 +64,13 @@ int carquet_has_arm_crc32(void) {
 
 /* Fallback stubs when CRC32 is not available */
 uint32_t carquet_crc32_arm(const uint8_t* data, size_t length) {
+    (void)data;
+    (void)length;
+    return 0;
+}
+
+uint32_t carquet_crc32_arm_update(uint32_t crc, const uint8_t* data, size_t length) {
+    (void)crc;
     (void)data;
     (void)length;
     return 0;

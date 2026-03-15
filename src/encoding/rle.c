@@ -8,11 +8,8 @@
 #include "core/bitpack.h"
 #include <string.h>
 
-#if defined(__SSE2__)
-#include <emmintrin.h>
-#elif defined(__ARM_NEON) || defined(__ARM_NEON__)
-#include <arm_neon.h>
-#endif
+/* SIMD dispatch for optimized level fill (AVX2/AVX-512/NEON/SVE) */
+extern void carquet_dispatch_fill_def_levels(int16_t* def_levels, int64_t count, int16_t value);
 
 /* ============================================================================
  * Internal Helpers
@@ -288,20 +285,39 @@ static void write_varint(carquet_buffer_t* buf, uint32_t value) {
     carquet_buffer_append(buf, bytes, (size_t)len);
 }
 
+static inline int rle_value_bytes(int bit_width) {
+    return (bit_width + 7) / 8;
+}
+
+static inline void write_value_bytes(uint8_t* dst, uint32_t value, int value_bytes) {
+    /* Unrolled for common cases (1, 2, 4 bytes) */
+    dst[0] = (uint8_t)value;
+    if (value_bytes > 1) dst[1] = (uint8_t)(value >> 8);
+    if (value_bytes > 2) dst[2] = (uint8_t)(value >> 16);
+    if (value_bytes > 3) dst[3] = (uint8_t)(value >> 24);
+}
+
 static void flush_rle(carquet_rle_encoder_t* enc) {
     if (enc->repeat_count == 0) return;
 
-    /* Write RLE header: (count << 1) | 0 */
-    write_varint(enc->buffer, (uint32_t)(enc->repeat_count << 1));
+    /* Write RLE header + value in a single buffer append where possible */
+    int vb = rle_value_bytes(enc->bit_width);
+    uint8_t buf[9]; /* max 5 (varint) + 4 (value) */
+    int len = 0;
 
-    /* Write value (ceil(bit_width/8) bytes) */
-    int value_bytes = (enc->bit_width + 7) / 8;
-    uint8_t bytes[4];
-    for (int i = 0; i < value_bytes; i++) {
-        bytes[i] = (uint8_t)(enc->prev_value >> (i * 8));
+    /* Inline varint encoding */
+    uint32_t header = (uint32_t)(enc->repeat_count << 1);
+    while (header >= 0x80) {
+        buf[len++] = (uint8_t)((header & 0x7F) | 0x80);
+        header >>= 7;
     }
-    carquet_buffer_append(enc->buffer, bytes, (size_t)value_bytes);
+    buf[len++] = (uint8_t)header;
 
+    /* Append value bytes */
+    write_value_bytes(buf + len, enc->prev_value, vb);
+    len += vb;
+
+    carquet_buffer_append(enc->buffer, buf, (size_t)len);
     enc->repeat_count = 0;
 }
 
@@ -309,7 +325,7 @@ static void flush_bitpack_as_rle(carquet_rle_encoder_t* enc) {
     /* Emit remaining buffered values as individual RLE runs.
      * Used when we have a partial group (< 8 values) that can't form
      * a complete bit-packed group per the Parquet spec. */
-    int value_bytes = (enc->bit_width + 7) / 8;
+    int vb = rle_value_bytes(enc->bit_width);
 
     int i = 0;
     while (i < enc->bitpack_count) {
@@ -318,13 +334,18 @@ static void flush_bitpack_as_rle(carquet_rle_encoder_t* enc) {
         while (i + run < enc->bitpack_count && enc->bitpack_buffer[i + run] == val) {
             run++;
         }
-        /* RLE header: (count << 1) | 0 */
-        write_varint(enc->buffer, (uint32_t)(run << 1));
-        uint8_t bytes[4];
-        for (int b = 0; b < value_bytes; b++) {
-            bytes[b] = (uint8_t)(val >> (b * 8));
+        /* Write RLE header + value in single append */
+        uint8_t buf[9];
+        int len = 0;
+        uint32_t header = (uint32_t)(run << 1);
+        while (header >= 0x80) {
+            buf[len++] = (uint8_t)((header & 0x7F) | 0x80);
+            header >>= 7;
         }
-        carquet_buffer_append(enc->buffer, bytes, (size_t)value_bytes);
+        buf[len++] = (uint8_t)header;
+        write_value_bytes(buf + len, val, vb);
+        len += vb;
+        carquet_buffer_append(enc->buffer, buf, (size_t)len);
         i += (int)run;
     }
 
@@ -416,9 +437,26 @@ carquet_status_t carquet_rle_encoder_put_repeat(
     uint32_t value,
     int64_t count) {
 
-    for (int64_t i = 0; i < count; i++) {
+    if (count <= 0 || enc->status != CARQUET_OK) {
+        return enc->status;
+    }
+
+    /* If same value as current run, just extend the count */
+    if (enc->has_prev && value == enc->prev_value) {
+        enc->repeat_count += count;
+        return CARQUET_OK;
+    }
+
+    /* First value or value changed: flush then set up new run */
+    if (enc->has_prev) {
         carquet_status_t status = carquet_rle_encoder_put(enc, value);
         if (status != CARQUET_OK) return status;
+        /* put() set repeat_count=1 for the new value, add remaining */
+        enc->repeat_count += count - 1;
+    } else {
+        enc->prev_value = value;
+        enc->repeat_count = count;
+        enc->has_prev = true;
     }
     return CARQUET_OK;
 }
@@ -517,31 +555,8 @@ int64_t carquet_rle_decode_levels(
                 to_fill = max_values - count;
             }
 
-            /* Use optimized fill for common case of small values */
-            int16_t* dst = output + count;
-            int64_t i = 0;
-
-#if defined(__SSE2__)
-            /* SSE2: fill 8 int16_t at a time */
-            if (to_fill >= 8) {
-                __m128i vval = _mm_set1_epi16(val16);
-                for (; i + 8 <= to_fill; i += 8) {
-                    _mm_storeu_si128((__m128i*)(dst + i), vval);
-                }
-            }
-#elif defined(__ARM_NEON) || defined(__ARM_NEON__)
-            /* NEON: fill 8 int16_t at a time */
-            if (to_fill >= 8) {
-                int16x8_t vval = vdupq_n_s16(val16);
-                for (; i + 8 <= to_fill; i += 8) {
-                    vst1q_s16(dst + i, vval);
-                }
-            }
-#endif
-            /* Scalar remainder */
-            for (; i < to_fill; i++) {
-                dst[i] = val16;
-            }
+            /* Use SIMD-dispatched fill (AVX2/AVX-512/NEON/SVE at runtime) */
+            carquet_dispatch_fill_def_levels(output + count, to_fill, val16);
             count += to_fill;
 
         } else {
@@ -566,29 +581,6 @@ int64_t carquet_rle_decode_levels(
                     to_store = max_values - count;
                 }
 
-#if defined(__SSE2__)
-                if (to_store == 8) {
-                    /* SSE2: load 2x4 int32_t, pack-saturate to 8 int16_t */
-                    __m128i v0 = _mm_loadu_si128((const __m128i*)temp);
-                    __m128i v1 = _mm_loadu_si128((const __m128i*)(temp + 4));
-                    __m128i packed = _mm_packs_epi32(v0, v1);
-                    _mm_storeu_si128((__m128i*)(output + count), packed);
-                    count += 8;
-                    continue;
-                }
-#elif defined(__ARM_NEON) || defined(__ARM_NEON__)
-                if (to_store == 8) {
-                    /* NEON: load 8 uint32_t, narrow to int16_t */
-                    uint32x4_t v0 = vld1q_u32(temp);
-                    uint32x4_t v1 = vld1q_u32(temp + 4);
-                    int16x4_t n0 = vmovn_s32(vreinterpretq_s32_u32(v0));
-                    int16x4_t n1 = vmovn_s32(vreinterpretq_s32_u32(v1));
-                    int16x8_t result = vcombine_s16(n0, n1);
-                    vst1q_s16(output + count, result);
-                    count += 8;
-                    continue;
-                }
-#endif
                 for (int64_t i = 0; i < to_store; i++) {
                     output[count++] = (int16_t)temp[i];
                 }
@@ -596,6 +588,101 @@ int64_t carquet_rle_decode_levels(
         }
     }
 
+    return count;
+}
+
+int64_t carquet_rle_decode_to_bitmap(
+    const uint8_t* input,
+    size_t input_size,
+    uint8_t* bitmap,
+    int64_t max_values,
+    int64_t* non_null_count) {
+
+    if (max_values <= 0 || input_size == 0) {
+        if (non_null_count) *non_null_count = 0;
+        return 0;
+    }
+
+    /* Pre-clear the bitmap */
+    size_t bitmap_bytes = ((size_t)max_values + 7) / 8;
+    memset(bitmap, 0, bitmap_bytes);
+
+    size_t pos = 0;
+    int64_t count = 0;
+    int64_t nn_count = 0;
+
+    /* For max_def_level == 1: bit_width is 1, value is 1 byte */
+    const int value_bytes = 1;
+
+    while (count < max_values && pos < input_size) {
+        /* Read varint header inline */
+        uint32_t header = 0;
+        int shift = 0;
+        while (pos < input_size && shift < 32) {
+            uint8_t byte = input[pos++];
+            header |= (uint32_t)(byte & 0x7F) << shift;
+            if ((byte & 0x80) == 0) break;
+            shift += 7;
+        }
+
+        if ((header & 1) == 0) {
+            /* RLE run */
+            int64_t run_length = (int64_t)(header >> 1);
+            if (run_length == 0) continue;
+
+            if (pos + (size_t)value_bytes > input_size) break;
+
+            uint32_t rle_value = input[pos++] & 1;
+
+            int64_t to_fill = run_length;
+            if (count + to_fill > max_values) {
+                to_fill = max_values - count;
+            }
+
+            if (rle_value == 0) {
+                /* Null: set bits in bitmap (convention: bit set = null) */
+                for (int64_t i = 0; i < to_fill; i++) {
+                    int64_t idx = count + i;
+                    bitmap[idx / 8] |= (uint8_t)(1 << (idx % 8));
+                }
+            } else {
+                /* Non-null: bits stay clear (already memset to 0) */
+                nn_count += to_fill;
+            }
+
+            count += to_fill;
+
+        } else {
+            /* Bit-packed run: 8 values per group, 1 bit each = 1 byte per group */
+            int num_groups = (int)(header >> 1);
+            if (num_groups == 0) continue;
+
+            for (int g = 0; g < num_groups && count < max_values; g++) {
+                if (pos >= input_size) break;
+
+                uint8_t packed_byte = input[pos++];
+
+                /* Each bit in the byte is one def_level value (0 or 1) */
+                int64_t to_store = 8;
+                if (count + to_store > max_values) {
+                    to_store = max_values - count;
+                }
+
+                for (int64_t i = 0; i < to_store; i++) {
+                    uint8_t bit = (packed_byte >> i) & 1;
+                    if (bit == 0) {
+                        /* Null: set bit (convention: bit set = null) */
+                        bitmap[(count + i) / 8] |= (uint8_t)(1 << ((count + i) % 8));
+                    } else {
+                        nn_count++;
+                    }
+                }
+                count += to_store;
+            }
+        }
+    }
+
+    if (non_null_count) *non_null_count = nn_count;
     return count;
 }
 

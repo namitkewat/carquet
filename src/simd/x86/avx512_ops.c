@@ -44,6 +44,21 @@ static inline int portable_ctz(unsigned int v) {
 #endif
 }
 
+static inline int portable_popcount(unsigned int v) {
+#if defined(__GNUC__) || defined(__clang__)
+    return __builtin_popcount(v);
+#elif defined(_MSC_VER)
+    return (int)__popcnt(v);
+#else
+    int count = 0;
+    while (v) {
+        v &= v - 1;
+        count++;
+    }
+    return count;
+#endif
+}
+
 /* Portable 64-bit count trailing zeros (needed for 64-byte mask operations) */
 static inline int portable_ctz64(uint64_t v) {
 #if defined(__GNUC__) || defined(__clang__)
@@ -991,7 +1006,7 @@ int64_t carquet_avx512_count_non_nulls(const int16_t* def_levels, int64_t count,
     for (; i + 32 <= count; i += 32) {
         __m512i levels = _mm512_loadu_si512((const void*)(def_levels + i));
         __mmask32 mask = _mm512_cmpeq_epi16_mask(levels, max_vec);
-        non_null_count += _mm_popcnt_u32((unsigned int)mask);
+        non_null_count += portable_popcount((unsigned int)mask);
     }
 
     for (; i < count; i++) {

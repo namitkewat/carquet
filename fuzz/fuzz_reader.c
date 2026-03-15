@@ -106,6 +106,67 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     (void)carquet_status_string(CARQUET_OK);
     (void)carquet_status_string(CARQUET_ERROR_DECODE);
 
+    /* Exercise v0.4.0 APIs: bloom filter, page index, kv metadata,
+     * column chunk metadata.  These parse Thrift from untrusted file
+     * offsets, so they are important fuzzing targets. */
+    for (int32_t rg = 0; rg < num_row_groups && rg < 3; rg++) {
+        for (int32_t col = 0; col < num_cols && col < 10; col++) {
+            /* Bloom filter — parses Thrift BloomFilterHeader */
+            carquet_bloom_filter_t* bf =
+                carquet_reader_get_bloom_filter(reader, rg, col, NULL);
+            if (bf) {
+                (void)carquet_bloom_filter_size(bf);
+                (void)carquet_bloom_filter_check_i64(bf, 42);
+                (void)carquet_bloom_filter_check_i32(bf, 0);
+                (void)carquet_bloom_filter_check_double(bf, 3.14);
+                (void)carquet_bloom_filter_check_bytes(bf,
+                    (const uint8_t*)"test", 4);
+                carquet_bloom_filter_destroy(bf);
+            }
+
+            /* Column index — parses Thrift ColumnIndex */
+            carquet_column_index_t* ci =
+                carquet_reader_get_column_index(reader, rg, col, NULL);
+            if (ci) {
+                int32_t np = carquet_column_index_num_pages(ci);
+                (void)carquet_column_index_boundary_order(ci);
+                for (int32_t p = 0; p < np && p < 5; p++) {
+                    carquet_page_stats_t ps;
+                    carquet_column_index_get_page_stats(ci, p, &ps);
+                    (void)ps.min_value;
+                    (void)ps.null_count;
+                }
+                carquet_column_index_free(ci);
+            }
+
+            /* Offset index — parses Thrift OffsetIndex */
+            carquet_offset_index_t* oi =
+                carquet_reader_get_offset_index(reader, rg, col, NULL);
+            if (oi) {
+                int32_t np = carquet_offset_index_num_pages(oi);
+                for (int32_t p = 0; p < np && p < 5; p++) {
+                    carquet_page_location_t loc;
+                    carquet_offset_index_get_page_location(oi, p, &loc);
+                    (void)loc.offset;
+                }
+                carquet_offset_index_free(oi);
+            }
+
+            /* Column chunk metadata */
+            carquet_column_chunk_metadata_t ccm;
+            (void)carquet_reader_column_chunk_metadata(reader, rg, col, &ccm);
+        }
+    }
+
+    /* Key-value metadata accessors */
+    int32_t nkv = carquet_reader_num_metadata(reader);
+    for (int32_t i = 0; i < nkv && i < 50; i++) {
+        const char *k, *v;
+        (void)carquet_reader_get_metadata(reader, i, &k, &v);
+    }
+    (void)carquet_reader_find_metadata(reader, "pandas");
+    (void)carquet_reader_find_metadata(reader, "ARROW:schema");
+
     carquet_reader_close(reader);
     return 0;
 }

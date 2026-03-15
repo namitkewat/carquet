@@ -9,6 +9,7 @@
 #include <carquet/carquet.h>
 #include <carquet/error.h>
 #include "core/buffer.h"
+#include "core/compat.h"
 #include "thrift/thrift_encode.h"
 #include "thrift/parquet_types.h"
 #include <stdlib.h>
@@ -316,7 +317,12 @@ carquet_status_t carquet_row_group_writer_add_column(
     writer->column_infos[writer->num_columns].encoding = encoding;
     writer->column_infos[writer->num_columns].compression = writer->compression;
     writer->column_infos[writer->num_columns].type_length = type_length;
-    writer->column_infos[writer->num_columns].path = strdup(name);
+    writer->column_infos[writer->num_columns].path = carquet_heap_strdup(name);
+    if (!writer->column_infos[writer->num_columns].path) {
+        carquet_column_writer_destroy(col_writer);
+        writer->column_writers[writer->num_columns] = NULL;
+        return CARQUET_ERROR_OUT_OF_MEMORY;
+    }
 
     writer->num_columns = new_count;
     return CARQUET_OK;

@@ -82,7 +82,8 @@ void carquet_sve_bitunpack_16to32(const uint16_t* input, uint32_t* output, int64
 
 /**
  * Encode floats using byte stream split with SVE.
- * Scalable transpose operation.
+ * Uses SVE 4-way structure load to deinterleave bytes efficiently.
+ * svld4_u8 naturally separates the 4 byte lanes of each float.
  */
 void carquet_sve_byte_stream_split_encode_float(
     const float* values,
@@ -92,30 +93,33 @@ void carquet_sve_byte_stream_split_encode_float(
     const uint8_t* src = (const uint8_t*)values;
     int64_t i = 0;
 
-    /* Get vector length in 32-bit elements */
-    uint64_t vl = svcntw();
+    /* svcntb() floats per iteration: svld4 produces svcntb()-element vectors */
+    uint64_t vl = svcntb();
 
-    /* Process vector-length floats at a time */
     while (i + (int64_t)vl <= count) {
-        /* Load floats as bytes and deinterleave */
-        for (uint64_t j = 0; j < vl; j++) {
-            for (int b = 0; b < 4; b++) {
-                output[b * count + i + j] = src[(i + j) * 4 + b];
-            }
-        }
-        i += vl;
+        svbool_t pg = svptrue_b8();
+        svuint8x4_t loaded = svld4_u8(pg, src + i * 4);
+        svst1_u8(pg, output + 0 * count + i, svget4_u8(loaded, 0));
+        svst1_u8(pg, output + 1 * count + i, svget4_u8(loaded, 1));
+        svst1_u8(pg, output + 2 * count + i, svget4_u8(loaded, 2));
+        svst1_u8(pg, output + 3 * count + i, svget4_u8(loaded, 3));
+        i += (int64_t)vl;
     }
 
-    /* Handle remaining values */
-    for (; i < count; i++) {
-        for (int b = 0; b < 4; b++) {
-            output[b * count + i] = src[i * 4 + b];
-        }
+    /* Predicated tail */
+    if (i < count) {
+        svbool_t pg = svwhilelt_b8(i, count);
+        svuint8x4_t loaded = svld4_u8(pg, src + i * 4);
+        svst1_u8(pg, output + 0 * count + i, svget4_u8(loaded, 0));
+        svst1_u8(pg, output + 1 * count + i, svget4_u8(loaded, 1));
+        svst1_u8(pg, output + 2 * count + i, svget4_u8(loaded, 2));
+        svst1_u8(pg, output + 3 * count + i, svget4_u8(loaded, 3));
     }
 }
 
 /**
  * Decode byte stream split floats using SVE.
+ * Uses SVE 4-way structure store to interleave bytes efficiently.
  */
 void carquet_sve_byte_stream_split_decode_float(
     const uint8_t* data,
@@ -125,29 +129,35 @@ void carquet_sve_byte_stream_split_decode_float(
     uint8_t* dst = (uint8_t*)values;
     int64_t i = 0;
 
-    uint64_t vl = svcntw();
+    uint64_t vl = svcntb();
 
-    /* Process vector-length floats at a time */
     while (i + (int64_t)vl <= count) {
-        /* Interleave bytes from 4 streams */
-        for (uint64_t j = 0; j < vl; j++) {
-            for (int b = 0; b < 4; b++) {
-                dst[(i + j) * 4 + b] = data[b * count + i + j];
-            }
-        }
-        i += vl;
+        svbool_t pg = svptrue_b8();
+        svuint8_t s0 = svld1_u8(pg, data + 0 * count + i);
+        svuint8_t s1 = svld1_u8(pg, data + 1 * count + i);
+        svuint8_t s2 = svld1_u8(pg, data + 2 * count + i);
+        svuint8_t s3 = svld1_u8(pg, data + 3 * count + i);
+        svuint8x4_t tuple = svcreate4_u8(s0, s1, s2, s3);
+        svst4_u8(pg, dst + i * 4, tuple);
+        i += (int64_t)vl;
     }
 
-    /* Handle remaining values */
-    for (; i < count; i++) {
-        for (int b = 0; b < 4; b++) {
-            dst[i * 4 + b] = data[b * count + i];
-        }
+    if (i < count) {
+        svbool_t pg = svwhilelt_b8(i, count);
+        svuint8_t s0 = svld1_u8(pg, data + 0 * count + i);
+        svuint8_t s1 = svld1_u8(pg, data + 1 * count + i);
+        svuint8_t s2 = svld1_u8(pg, data + 2 * count + i);
+        svuint8_t s3 = svld1_u8(pg, data + 3 * count + i);
+        svuint8x4_t tuple = svcreate4_u8(s0, s1, s2, s3);
+        svst4_u8(pg, dst + i * 4, tuple);
     }
 }
 
 /**
  * Encode doubles using byte stream split with SVE.
+ * Uses svld4_u16 to deinterleave at 16-bit level (4 words per double),
+ * then svuzp1/svuzp2 to split each uint16 into its two byte streams.
+ * Processes svcnth() doubles per iteration.
  */
 void carquet_sve_byte_stream_split_encode_double(
     const double* values,
@@ -156,18 +166,35 @@ void carquet_sve_byte_stream_split_encode_double(
 
     const uint8_t* src = (const uint8_t*)values;
     int64_t i = 0;
+    uint64_t vl16 = svcnth(); /* doubles per iteration */
 
-    uint64_t vl = svcntd();
+    while (i + (int64_t)vl16 <= count) {
+        svbool_t pg16 = svptrue_b16();
+        svuint16x4_t loaded = svld4_u16(pg16, (const uint16_t*)(src + i * 8));
 
-    while (i + (int64_t)vl <= count) {
-        for (uint64_t j = 0; j < vl; j++) {
-            for (int b = 0; b < 8; b++) {
-                output[b * count + i + j] = src[(i + j) * 8 + b];
-            }
-        }
-        i += vl;
+        /* Each u16 vector holds one word-position from each double.
+         * Reinterpret as bytes and deinterleave low/high bytes with uzp. */
+        svuint8_t v0 = svreinterpret_u8_u16(svget4_u16(loaded, 0));
+        svuint8_t v1 = svreinterpret_u8_u16(svget4_u16(loaded, 1));
+        svuint8_t v2 = svreinterpret_u8_u16(svget4_u16(loaded, 2));
+        svuint8_t v3 = svreinterpret_u8_u16(svget4_u16(loaded, 3));
+
+        svuint8_t zeros = svdup_n_u8(0);
+        svbool_t pg_half = svwhilelt_b8((int64_t)0, (int64_t)vl16);
+
+        svst1_u8(pg_half, output + 0 * count + i, svuzp1_u8(v0, zeros));
+        svst1_u8(pg_half, output + 1 * count + i, svuzp2_u8(v0, zeros));
+        svst1_u8(pg_half, output + 2 * count + i, svuzp1_u8(v1, zeros));
+        svst1_u8(pg_half, output + 3 * count + i, svuzp2_u8(v1, zeros));
+        svst1_u8(pg_half, output + 4 * count + i, svuzp1_u8(v2, zeros));
+        svst1_u8(pg_half, output + 5 * count + i, svuzp2_u8(v2, zeros));
+        svst1_u8(pg_half, output + 6 * count + i, svuzp1_u8(v3, zeros));
+        svst1_u8(pg_half, output + 7 * count + i, svuzp2_u8(v3, zeros));
+
+        i += (int64_t)vl16;
     }
 
+    /* Scalar tail */
     for (; i < count; i++) {
         for (int b = 0; b < 8; b++) {
             output[b * count + i] = src[i * 8 + b];
@@ -177,6 +204,8 @@ void carquet_sve_byte_stream_split_encode_double(
 
 /**
  * Decode byte stream split doubles using SVE.
+ * Reverses the encode: loads from 8 byte streams, zips pairs into uint16
+ * vectors, then uses svst4_u16 to interleave back into doubles.
  */
 void carquet_sve_byte_stream_split_decode_double(
     const uint8_t* data,
@@ -185,18 +214,36 @@ void carquet_sve_byte_stream_split_decode_double(
 
     uint8_t* dst = (uint8_t*)values;
     int64_t i = 0;
+    uint64_t vl16 = svcnth();
 
-    uint64_t vl = svcntd();
+    while (i + (int64_t)vl16 <= count) {
+        svbool_t pg_half = svwhilelt_b8((int64_t)0, (int64_t)vl16);
 
-    while (i + (int64_t)vl <= count) {
-        for (uint64_t j = 0; j < vl; j++) {
-            for (int b = 0; b < 8; b++) {
-                dst[(i + j) * 8 + b] = data[b * count + i + j];
-            }
-        }
-        i += vl;
+        /* Load from 8 byte streams */
+        svuint8_t s0 = svld1_u8(pg_half, data + 0 * count + i);
+        svuint8_t s1 = svld1_u8(pg_half, data + 1 * count + i);
+        svuint8_t s2 = svld1_u8(pg_half, data + 2 * count + i);
+        svuint8_t s3 = svld1_u8(pg_half, data + 3 * count + i);
+        svuint8_t s4 = svld1_u8(pg_half, data + 4 * count + i);
+        svuint8_t s5 = svld1_u8(pg_half, data + 5 * count + i);
+        svuint8_t s6 = svld1_u8(pg_half, data + 6 * count + i);
+        svuint8_t s7 = svld1_u8(pg_half, data + 7 * count + i);
+
+        /* Zip pairs of byte streams into uint16 vectors */
+        svuint16_t w0 = svreinterpret_u16_u8(svzip1_u8(s0, s1));
+        svuint16_t w1 = svreinterpret_u16_u8(svzip1_u8(s2, s3));
+        svuint16_t w2 = svreinterpret_u16_u8(svzip1_u8(s4, s5));
+        svuint16_t w3 = svreinterpret_u16_u8(svzip1_u8(s6, s7));
+
+        /* Interleave 4 uint16 vectors back into doubles */
+        svbool_t pg16 = svptrue_b16();
+        svuint16x4_t tuple = svcreate4_u16(w0, w1, w2, w3);
+        svst4_u16(pg16, (uint16_t*)(dst + i * 8), tuple);
+
+        i += (int64_t)vl16;
     }
 
+    /* Scalar tail */
     for (; i < count; i++) {
         for (int b = 0; b < 8; b++) {
             dst[i * 8 + b] = data[b * count + i];
@@ -368,24 +415,55 @@ void carquet_sve_gather_double(const double* dict, const uint32_t* indices,
 bool carquet_sve_checked_gather_i32(const int32_t* dict, int32_t dict_count,
                                      const uint32_t* indices, int64_t count,
                                      int32_t* output) {
-    for (int64_t i = 0; i < count; i++) {
-        if (indices[i] >= (uint32_t)dict_count) {
+    svuint32_t limit = svdup_n_u32((uint32_t)dict_count);
+    int64_t i = 0;
+
+    while (i < count) {
+        svbool_t pg = svwhilelt_b32(i, count);
+        svuint32_t idx = svld1_u32(pg, indices + i);
+
+        /* Bounds check: any index >= dict_count? */
+        svbool_t bad = svcmpge_u32(pg, idx, limit);
+        if (svptest_any(pg, bad)) {
             return false;
         }
+
+        /* Gather in the same pass */
+        svuint32_t offsets = svlsl_n_u32_x(pg, idx, 2);
+        svint32_t result = svld1_gather_u32offset_s32(pg, dict, offsets);
+        svst1_s32(pg, output + i, result);
+
+        i += svcntw();
     }
-    carquet_sve_gather_i32(dict, indices, count, output);
     return true;
 }
 
 bool carquet_sve_checked_gather_i64(const int64_t* dict, int32_t dict_count,
                                      const uint32_t* indices, int64_t count,
                                      int64_t* output) {
-    for (int64_t i = 0; i < count; i++) {
-        if (indices[i] >= (uint32_t)dict_count) {
+    svuint32_t limit = svdup_n_u32((uint32_t)dict_count);
+    int64_t i = 0;
+
+    while (i < count) {
+        svbool_t pg64 = svwhilelt_b64(i, count);
+        int64_t active = svcntp_b64(pg64, pg64);
+        svbool_t pg32 = svwhilelt_b32((int64_t)0, active);
+
+        svuint32_t idx32 = svld1_u32(pg32, indices + i);
+
+        /* Bounds check only the lanes we will actually use */
+        svbool_t bad = svcmpge_u32(pg32, idx32, limit);
+        if (svptest_any(pg32, bad)) {
             return false;
         }
+
+        svuint64_t idx = svunpklo_u64(idx32);
+        svuint64_t offsets = svlsl_n_u64_x(pg64, idx, 3);
+        svint64_t result = svld1_gather_u64offset_s64(pg64, dict, offsets);
+        svst1_s64(pg64, output + i, result);
+
+        i += svcntd();
     }
-    carquet_sve_gather_i64(dict, indices, count, output);
     return true;
 }
 
@@ -414,10 +492,11 @@ bool carquet_sve_checked_gather_double(const double* dict, int32_t dict_count,
 void carquet_sve_memset(void* dest, uint8_t value, size_t n) {
     uint8_t* d = (uint8_t*)dest;
     svuint8_t v = svdup_n_u8(value);
-    size_t i = 0;
+    uint64_t i = 0;
+    uint64_t len = (uint64_t)n;
 
-    while (i < n) {
-        svbool_t pg = svwhilelt_b8(i, n);
+    while (i < len) {
+        svbool_t pg = svwhilelt_b8(i, len);
         svst1_u8(pg, d + i, v);
         i += svcntb();
     }
@@ -429,10 +508,11 @@ void carquet_sve_memset(void* dest, uint8_t value, size_t n) {
 void carquet_sve_memcpy(void* dest, const void* src, size_t n) {
     uint8_t* d = (uint8_t*)dest;
     const uint8_t* s = (const uint8_t*)src;
-    size_t i = 0;
+    uint64_t i = 0;
+    uint64_t len = (uint64_t)n;
 
-    while (i < n) {
-        svbool_t pg = svwhilelt_b8(i, n);
+    while (i < len) {
+        svbool_t pg = svwhilelt_b8(i, len);
         svuint8_t v = svld1_u8(pg, s + i);
         svst1_u8(pg, d + i, v);
         i += svcntb();
@@ -695,11 +775,58 @@ void carquet_sve_copy_minmax_double(const double* values, int64_t count, double*
     *max_value = max_v;
 }
 
+void carquet_sve_bitunpack8_1bit(const uint8_t* input, uint32_t* values) {
+    uint8_t byte_val = input[0];
+    for (int i = 0; i < 8; i++) {
+        values[i] = (byte_val >> i) & 1;
+    }
+}
+
+void carquet_sve_bitunpack8_2bit(const uint8_t* input, uint32_t* values) {
+    uint16_t v;
+    memcpy(&v, input, 2);
+    for (int i = 0; i < 8; i++) {
+        values[i] = (v >> (i * 2)) & 0x3;
+    }
+}
+
+void carquet_sve_bitunpack8_3bit(const uint8_t* input, uint32_t* values) {
+    uint32_t v = 0;
+    memcpy(&v, input, 3);
+    for (int i = 0; i < 8; i++) {
+        values[i] = (v >> (i * 3)) & 0x7;
+    }
+}
+
 void carquet_sve_bitunpack8_4bit(const uint8_t* input, uint32_t* values) {
     uint32_t v = (uint32_t)input[0] | ((uint32_t)input[1] << 8) |
                  ((uint32_t)input[2] << 16) | ((uint32_t)input[3] << 24);
     for (int i = 0; i < 8; i++) {
         values[i] = (v >> (i * 4)) & 0xF;
+    }
+}
+
+void carquet_sve_bitunpack8_5bit(const uint8_t* input, uint32_t* values) {
+    uint64_t v = 0;
+    memcpy(&v, input, 5);
+    for (int i = 0; i < 8; i++) {
+        values[i] = (uint32_t)((v >> (i * 5)) & 0x1F);
+    }
+}
+
+void carquet_sve_bitunpack8_6bit(const uint8_t* input, uint32_t* values) {
+    uint64_t v = 0;
+    memcpy(&v, input, 6);
+    for (int i = 0; i < 8; i++) {
+        values[i] = (uint32_t)((v >> (i * 6)) & 0x3F);
+    }
+}
+
+void carquet_sve_bitunpack8_7bit(const uint8_t* input, uint32_t* values) {
+    uint64_t v = 0;
+    memcpy(&v, input, 7);
+    for (int i = 0; i < 8; i++) {
+        values[i] = (uint32_t)((v >> (i * 7)) & 0x7F);
     }
 }
 

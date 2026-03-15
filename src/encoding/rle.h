@@ -264,6 +264,31 @@ int64_t carquet_rle_decode_levels_prefixed(
     int64_t max_values,
     size_t* bytes_consumed);
 
+/**
+ * Decode RLE-encoded 1-bit def levels directly into a null bitmap.
+ *
+ * Optimized for max_def_level == 1 (flat nullable columns). Decodes
+ * RLE/bitpacked values directly into bitmap bits, skipping the
+ * intermediate int16_t[] buffer and subsequent build_null_bitmap pass.
+ *
+ * Bitmap convention (matches build_null_bitmap):
+ * bit set (1) = value IS null (def_level == 0),
+ * bit clear (0) = value is NOT null (def_level == 1).
+ *
+ * @param input Input RLE data (no length prefix)
+ * @param input_size Size of input data
+ * @param bitmap Output bitmap (must be pre-allocated, (max_values+7)/8 bytes)
+ * @param max_values Maximum values to decode
+ * @param non_null_count Output: number of non-null values decoded
+ * @return Number of values decoded, or -1 on error
+ */
+int64_t carquet_rle_decode_to_bitmap(
+    const uint8_t* input,
+    size_t input_size,
+    uint8_t* bitmap,
+    int64_t max_values,
+    int64_t* non_null_count);
+
 #ifdef __cplusplus
 }
 #endif

@@ -43,10 +43,7 @@ int64_t carquet_column_read_batch(
         /* Load page if needed, but don't read any values */
         if (reader->values_remaining > 0 && !reader->page_loaded) {
             carquet_error_t error = CARQUET_ERROR_INIT;
-            int64_t values_read = 0;
-            uint8_t dummy[16];
-            carquet_status_t status = carquet_read_next_page(
-                reader, dummy, 0, NULL, NULL, &values_read, &error);
+            carquet_status_t status = carquet_column_ensure_page_loaded(reader, &error);
             (void)status;
         }
         return 0;

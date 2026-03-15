@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(carquet VERSION 0.3.1 LANGUAGES C)
+project(carquet VERSION 0.4.0 LANGUAGES C)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -37,6 +37,7 @@ option(CARQUET_BUILD_EXAMPLES "Build example programs" ${CARQUET_BUILD_DEV})
 option(CARQUET_BUILD_BENCHMARKS "Build benchmark and profiling programs" ${CARQUET_BUILD_DEV})
 option(CARQUET_BUILD_ARROW_CPP_BENCHMARK "Build the optional Arrow C++ comparison benchmark" OFF)
 option(CARQUET_BUILD_INTEROP "Build interoperability test programs" ${CARQUET_BUILD_DEV})
+option(CARQUET_BUILD_CLI "Build carquet CLI tool" ON)
 option(CARQUET_BUILD_SHARED "Build shared library" OFF)
 option(CARQUET_ENABLE_SSE "Enable SSE optimizations" ON)
 option(CARQUET_ENABLE_AVX "Enable AVX optimizations" ON)
@@ -291,6 +292,7 @@ set(CARQUET_READER_SOURCES
     src/reader/batch_reader.c
     src/reader/statistics.c
     src/reader/mmap_reader.c
+    src/reader/worker_pool.c
 )
 
 set(CARQUET_WRITER_SOURCES
@@ -467,6 +469,12 @@ if(UNIX)
     target_link_libraries(carquet PUBLIC m)
 endif()
 
+# Link pthreads for worker pool (POSIX)
+if(UNIX)
+    find_package(Threads REQUIRED)
+    target_link_libraries(carquet PRIVATE Threads::Threads)
+endif()
+
 # Link OpenMP for parallel column reading
 if(OpenMP_C_FOUND)
     target_link_libraries(carquet PRIVATE OpenMP::OpenMP_C)
@@ -546,6 +554,9 @@ if(CARQUET_BUILD_TESTS)
 
     # Memory mapping tests
     add_carquet_test(test_mmap tests/test_mmap.c)
+
+    # Advanced API tests (bloom filter, page index, kv metadata, etc.)
+    add_carquet_test(test_advanced_api tests/test_advanced_api.c)
 endif()
 
 # Examples
@@ -563,6 +574,7 @@ if(CARQUET_BUILD_EXAMPLES)
     add_carquet_example(example_data_types examples/data_types.c)
     add_carquet_example(example_compression examples/compression_codecs.c)
     add_carquet_example(example_nullable examples/nullable_columns.c)
+    add_carquet_example(example_advanced examples/advanced_features.c)
 endif()
 
 # Benchmarks
@@ -648,11 +660,17 @@ if(CARQUET_BUILD_BENCHMARKS)
             target_link_libraries(profile_core PRIVATE m)
         endif()
 
-        # Profiling binaries (used by profiling/run_profile.sh)
+        # Profiling binaries (used by profiling/run_profiler.py)
         add_executable(profile_read profiling/profile_read.c)
         target_link_libraries(profile_read PRIVATE carquet)
         if(NOT APPLE)
             target_link_libraries(profile_read PRIVATE m)
+        endif()
+
+        add_executable(profile_write profiling/profile_write.c)
+        target_link_libraries(profile_write PRIVATE carquet)
+        if(NOT APPLE)
+            target_link_libraries(profile_write PRIVATE m)
         endif()
 
         add_executable(profile_micro profiling/profile_micro.c)
@@ -688,6 +706,23 @@ if(CARQUET_BUILD_FUZZ)
     add_subdirectory(fuzz)
 endif()
 
+# CLI tool
+if(CARQUET_BUILD_CLI)
+    add_executable(carquet_cli
+        src/cli/main.c
+        src/cli/commands.c
+        src/cli/codegen.c
+        src/cli/codegen_read.c
+        src/cli/codegen_write.c
+    )
+    set_target_properties(carquet_cli PROPERTIES OUTPUT_NAME carquet)
+    target_link_libraries(carquet_cli PRIVATE carquet)
+    target_include_directories(carquet_cli PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    if(CARQUET_COMPILER_GCC_LIKE)
+        target_compile_options(carquet_cli PRIVATE -Wno-unused-result)
+    endif()
+endif()
+
 # Installation (skip when used as a subdirectory via FetchContent/add_subdirectory)
 if(CMAKE_CURRENT_SOURCE_DIR STREQUAL CMAKE_SOURCE_DIR)
     include(GNUInstallDirs)
@@ -697,6 +732,10 @@ if(CMAKE_CURRENT_SOURCE_DIR STREQUAL CMAKE_SOURCE_DIR)
         ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
         RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
     )
+
+    if(CARQUET_BUILD_CLI)
+        install(TARGETS carquet_cli RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+    endif()
 
     install(DIRECTORY include/carquet
         DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}

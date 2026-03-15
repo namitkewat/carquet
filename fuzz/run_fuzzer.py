@@ -303,6 +303,17 @@ def corpus_stats(corpus_dir):
     return count, total
 
 
+def clean_artifacts(build_dir, targets):
+    """Remove saved crash artifacts for the selected targets."""
+    removed = 0
+    for target in targets:
+        artifact_dir = os.path.join(build_dir, "fuzz", f"artifacts_{target}")
+        if os.path.isdir(artifact_dir):
+            shutil.rmtree(artifact_dir)
+            removed += 1
+    return removed
+
+
 # ── Fuzzer runner ────────────────────────────────────────────────────────────
 
 def setup_lib_paths():
@@ -978,6 +989,8 @@ commands:
                         help="Disable ASan/UBSan")
     parser.add_argument("--build-dir",
                         help="Build directory (default: <project>/build-fuzz)")
+    parser.add_argument("--clean-artifacts", action="store_true",
+                        help="Delete saved crash artifacts for selected targets before fuzzing")
     parser.add_argument("extra", nargs="*",
                         help="Extra libFuzzer arguments (e.g. -max_len=4096)")
 
@@ -1088,10 +1101,19 @@ commands:
     print(f"  {DIM}time:{RST}      {args.time}s per target")
     if args.jobs > 1:
         print(f"  {DIM}jobs:{RST}      {args.jobs}")
+    if args.clean_artifacts:
+        print(f"  {DIM}artifacts:{RST} clean before run")
     san_label = "disabled" if args.no_sanitizers else "ASan + UBSan"
     print(f"  {DIM}sanitizers:{RST} {san_label}")
     print(f"  {_bar()}")
     print()
+
+    if args.clean_artifacts:
+        removed = clean_artifacts(build_dir, targets_to_run)
+        if removed > 0:
+            noun = "directory" if removed == 1 else "directories"
+            print(f"  {DIM}removed:{RST}   {removed} artifact {noun}")
+            print()
 
     # ── Run ──
     results = {}

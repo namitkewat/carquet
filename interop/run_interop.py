@@ -271,7 +271,7 @@ def verify_pyarrow(path, expected, file_info):
     return errors
 
 
-def verify_duckdb(path, expected):
+def verify_duckdb(path, expected, file_info):
     """Verify a carquet-written file with DuckDB."""
     try:
         import duckdb
@@ -279,20 +279,75 @@ def verify_duckdb(path, expected):
         return ["duckdb not available"]
 
     errors = []
+    conn = None
     try:
         conn = duckdb.connect()
-        df = conn.execute(f"SELECT * FROM read_parquet('{path}')").fetchdf()
-        conn.close()
+        result = conn.execute("SELECT * FROM read_parquet(?)", [path])
+        rows = result.fetchall()
+        col_names = [desc[0] for desc in result.description]
     except Exception as e:
         return [f"Failed to read: {e}"]
+    finally:
+        if conn is not None:
+            conn.close()
 
-    if len(df) != expected["num_rows"]:
-        errors.append(f"Row count: {len(df)} != {expected['num_rows']}")
+    if len(rows) != expected["num_rows"]:
+        errors.append(f"Row count: {len(rows)} != {expected['num_rows']}")
+
+    cols = file_info["columns"]
+
+    # Check first values for each column without requiring pandas.
+    for col_name, col_info in cols.items():
+        try:
+            idx = col_names.index(col_name)
+            actual = [row[idx] for row in rows[:5]]
+            exp = col_info["first"]
+            col_type = col_info.get("type", "")
+
+            if col_type == "float":
+                for i, (a, b) in enumerate(zip(actual, exp)):
+                    if a is None and b is None:
+                        continue
+                    if a is None or b is None or abs(a - b) > 1e-4:
+                        errors.append(f"{col_name}[{i}]: {a} != {b}")
+                        break
+            elif col_type == "double":
+                for i, (a, b) in enumerate(zip(actual, exp)):
+                    if a is None and b is None:
+                        continue
+                    if a is None or b is None or abs(a - b) > 1e-10:
+                        errors.append(f"{col_name}[{i}]: {a} != {b}")
+                        break
+            elif col_type == "string":
+                decoded = [
+                    s.decode("utf-8") if isinstance(s, bytes) else s
+                    for s in actual
+                ]
+                if decoded != exp:
+                    errors.append(f"{col_name}: {decoded} != {exp}")
+            else:
+                if actual != exp:
+                    errors.append(f"{col_name}: {actual} != {exp}")
+        except Exception as e:
+            errors.append(f"{col_name}: {e}")
 
     verification = expected.get("verification", {})
+    for key in ["null_count_string_col", "null_count_nullable_int"]:
+        if key not in verification:
+            continue
+        col_name = key.replace("null_count_", "")
+        try:
+            idx = col_names.index(col_name)
+            actual_nulls = sum(1 for row in rows if row[idx] is None)
+            if actual_nulls != verification[key]:
+                errors.append(f"{col_name} nulls: {actual_nulls} != {verification[key]}")
+        except Exception:
+            pass
+
     if "int32_sum" in verification:
         try:
-            actual_sum = int(df["int32_col"].sum())
+            idx = col_names.index("int32_col")
+            actual_sum = sum(row[idx] for row in rows if row[idx] is not None)
             if actual_sum != verification["int32_sum"]:
                 errors.append(f"int32 sum: {actual_sum} != {verification['int32_sum']}")
         except Exception:
@@ -300,7 +355,8 @@ def verify_duckdb(path, expected):
 
     if "last_int32" in verification:
         try:
-            actual_last = int(df["int32_col"].iloc[-1])
+            idx = col_names.index("int32_col")
+            actual_last = rows[-1][idx] if rows else None
             if actual_last != verification["last_int32"]:
                 errors.append(f"last int32: {actual_last} != {verification['last_int32']}")
         except Exception:
@@ -350,7 +406,7 @@ def run_write_tests(roundtrip_bin, verbose):
                 pa_status = f"{GRN}OK{RST}"
 
             # DuckDB verification
-            db_errors = verify_duckdb(path, expected)
+            db_errors = verify_duckdb(path, expected, file_info)
             if db_errors and db_errors != ["duckdb not available"]:
                 entry["duckdb"] = "FAIL"
                 db_status = f"{RED}FAIL{RST}"
@@ -547,9 +603,9 @@ def main():
         print()
 
     # ── Summary ──
-    print(f"  {_bar('\u2550')}")
+    print("  " + _bar("\u2550"))
     print(f"  {BOLD}Summary{RST}")
-    print(f"  {_bar('\u2550')}")
+    print("  " + _bar("\u2550"))
     print()
 
     if read_results:

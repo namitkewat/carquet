@@ -13,6 +13,7 @@
 /* ARM hardware CRC32 (when available) */
 #if defined(__aarch64__) || defined(__arm__) || defined(_M_ARM64) || defined(_M_ARM)
 extern uint32_t carquet_crc32_arm(const uint8_t* data, size_t length);
+extern uint32_t carquet_crc32_arm_update(uint32_t crc, const uint8_t* data, size_t length);
 extern int carquet_has_arm_crc32(void);
 
 /* Runtime check for ARM CRC32 support */
@@ -110,8 +111,9 @@ uint32_t carquet_crc32(const uint8_t* data, size_t length) {
 
 uint32_t carquet_crc32_update(uint32_t crc, const uint8_t* data, size_t length) {
 #if defined(__aarch64__) || defined(__arm__) || defined(_M_ARM64) || defined(_M_ARM)
-    /* ARM hardware path doesn't support incremental updates in the current
-     * implementation, fall through to software slicing-by-8 */
+    if (check_arm_crc32()) {
+        return carquet_crc32_arm_update(crc, data, length);
+    }
 #endif
     return crc32_slicing_by_8(crc, data, length);
 }

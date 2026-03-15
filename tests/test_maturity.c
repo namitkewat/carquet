@@ -776,6 +776,69 @@ static int test_edge_many_row_groups(void) {
     return 0;
 }
 
+static int test_auto_row_group_flush_aligned_batches(void) {
+    char test_file[512];
+    make_temp_path(test_file, sizeof(test_file), "test_maturity_auto_row_group_flush");
+    carquet_error_t err = CARQUET_ERROR_INIT;
+
+    carquet_schema_t* schema = carquet_schema_create(&err);
+    if (!schema) TEST_FAIL("auto_row_group_flush_aligned_batches", "schema creation failed");
+
+(void)carquet_schema_add_column(schema, "id", CARQUET_PHYSICAL_INT32, NULL,
+        CARQUET_REPETITION_REQUIRED, 0, 0);
+(void)carquet_schema_add_column(schema, "value", CARQUET_PHYSICAL_DOUBLE, NULL,
+        CARQUET_REPETITION_REQUIRED, 0, 0);
+
+    carquet_writer_options_t opts;
+    carquet_writer_options_init(&opts);
+    opts.row_group_size = 10 * (int64_t)(sizeof(int32_t) + sizeof(double)) - 1;
+
+    carquet_writer_t* writer = carquet_writer_create(test_file, schema, &opts, &err);
+    if (!writer) {
+        carquet_schema_free(schema);
+        TEST_FAIL("auto_row_group_flush_aligned_batches", "writer creation failed");
+    }
+
+    const int NUM_ROW_GROUPS = 3;
+    const int ROWS_PER_GROUP = 10;
+    int32_t ids[ROWS_PER_GROUP];
+    double values[ROWS_PER_GROUP];
+
+    for (int rg = 0; rg < NUM_ROW_GROUPS; rg++) {
+        for (int i = 0; i < ROWS_PER_GROUP; i++) {
+            ids[i] = rg * ROWS_PER_GROUP + i;
+            values[i] = (double)ids[i] * 0.5;
+        }
+
+        ASSERT_OK(carquet_writer_write_batch(writer, 0, ids, ROWS_PER_GROUP, NULL, NULL),
+                  "auto_row_group_flush_aligned_batches", "id write failed");
+        ASSERT_OK(carquet_writer_write_batch(writer, 1, values, ROWS_PER_GROUP, NULL, NULL),
+                  "auto_row_group_flush_aligned_batches", "value write failed");
+    }
+
+    ASSERT_OK(carquet_writer_close(writer),
+              "auto_row_group_flush_aligned_batches", "writer close failed");
+
+    carquet_reader_t* reader = carquet_reader_open(test_file, NULL, &err);
+    if (!reader) {
+        carquet_schema_free(schema);
+        remove(test_file);
+        TEST_FAIL("auto_row_group_flush_aligned_batches", "reader open failed");
+    }
+
+    ASSERT_TRUE(carquet_reader_num_row_groups(reader) == NUM_ROW_GROUPS,
+                "auto_row_group_flush_aligned_batches", "row group count mismatch");
+    ASSERT_TRUE(carquet_reader_num_rows(reader) == NUM_ROW_GROUPS * ROWS_PER_GROUP,
+                "auto_row_group_flush_aligned_batches", "row count mismatch");
+
+    carquet_reader_close(reader);
+    carquet_schema_free(schema);
+    remove(test_file);
+
+    TEST_PASS("auto_row_group_flush_aligned_batches");
+    return 0;
+}
+
 /* ============================================================================
  * Section 3: Nullable Column Tests
  * ============================================================================ */
@@ -1591,6 +1654,7 @@ int main(void) {
     test_edge_single_row();
     test_edge_many_columns();
     test_edge_many_row_groups();
+    test_auto_row_group_flush_aligned_batches();
 
     /* Section 3: Nullable Columns */
     printf("\n--- Nullable Column Tests ---\n");

@@ -14,6 +14,7 @@
 #include "core/arena.h"
 #include "core/buffer.h"
 #include "thrift/thrift_encode.h"
+#include "thrift/thrift_decode.h"
 #include "thrift/parquet_types.h"
 #include <stdlib.h>
 #include <string.h>
@@ -23,44 +24,38 @@
  * ============================================================================
  */
 
-typedef struct carquet_column_index {
+struct carquet_column_index {
     int32_t num_pages;
 
     /* Per-page null counts */
     int64_t* null_counts;
+    int32_t num_null_counts;
 
     /* Per-page min/max values (packed binary) */
     uint8_t** min_values;
     int32_t* min_value_lens;
+    int32_t num_min_values;
     uint8_t** max_values;
     int32_t* max_value_lens;
+    int32_t num_max_values;
 
     /* Per-page null page flags */
     bool* null_pages;
+    int32_t num_null_pages;
 
     /* Boundary order for efficient range queries */
     int32_t boundary_order;  /* 0=UNORDERED, 1=ASCENDING, 2=DESCENDING */
-} carquet_column_index_t;
+};
 
 /* ============================================================================
  * OffsetIndex Structure
  * ============================================================================
  */
 
-typedef struct carquet_page_location {
-    int64_t offset;             /* File offset of page */
-    int32_t compressed_size;    /* Compressed page size */
-    int64_t first_row_index;    /* Index of first row in page */
-} carquet_page_location_t;
-
-typedef struct carquet_offset_index {
+struct carquet_offset_index {
     int32_t num_pages;
     carquet_page_location_t* page_locations;
-
-    /* Optional: uncompressed page sizes */
-    bool has_uncompressed_sizes;
-    int32_t* uncompressed_page_sizes;
-} carquet_offset_index_t;
+};
 
 /* ============================================================================
  * Forward Declarations
@@ -555,4 +550,346 @@ carquet_status_t carquet_column_index_page_might_match(
     }
 
     return CARQUET_OK;
+}
+
+/* ============================================================================
+ * Deserialization from Thrift
+ * ============================================================================
+ */
+
+/**
+ * Free a parsed column index.
+ */
+void carquet_column_index_free(carquet_column_index_t* index) {
+    if (!index) return;
+    if (index->min_values) {
+        for (int32_t i = 0; i < index->num_min_values; i++) free(index->min_values[i]);
+        free(index->min_values);
+    }
+    if (index->max_values) {
+        for (int32_t i = 0; i < index->num_max_values; i++) free(index->max_values[i]);
+        free(index->max_values);
+    }
+    free(index->min_value_lens);
+    free(index->max_value_lens);
+    free(index->null_counts);
+    free(index->null_pages);
+    free(index);
+}
+
+/**
+ * Parse a Thrift-encoded ColumnIndex.
+ *
+ * Thrift schema:
+ *   struct ColumnIndex {
+ *     1: required list<bool> null_pages
+ *     2: required list<binary> min_values
+ *     3: required list<binary> max_values
+ *     4: required BoundaryOrder boundary_order (i32 enum)
+ *     5: optional list<i64> null_counts
+ *   }
+ *
+ * @param data  Pointer to the Thrift-encoded data
+ * @param size  Size of the data in bytes
+ * @return Parsed column index, or NULL on failure. Caller must free with
+ *         carquet_column_index_free().
+ */
+carquet_column_index_t* carquet_column_index_parse(const uint8_t* data, size_t size) {
+    if (!data || size == 0) return NULL;
+
+    thrift_decoder_t dec;
+    thrift_decoder_init(&dec, data, size);
+
+    struct carquet_column_index* ci = calloc(1, sizeof(*ci));
+    if (!ci) return NULL;
+
+    thrift_read_struct_begin(&dec);
+
+    thrift_type_t type;
+    int16_t field_id;
+
+    while (thrift_read_field_begin(&dec, &type, &field_id)) {
+        switch (field_id) {
+            case 1: { /* null_pages: list<bool> */
+                thrift_type_t elem_type;
+                int32_t count;
+                thrift_read_list_begin(&dec, &elem_type, &count);
+                if (count < 0 || count > 1000000) { carquet_column_index_free(ci); return NULL; }
+                ci->num_pages = count;
+                ci->null_pages = calloc(count, sizeof(bool));
+                if (!ci->null_pages) { carquet_column_index_free(ci); return NULL; }
+                ci->num_null_pages = count;
+                for (int32_t i = 0; i < count; i++) {
+                    ci->null_pages[i] = thrift_read_bool(&dec);
+                }
+                break;
+            }
+            case 2: { /* min_values: list<binary> */
+                thrift_type_t elem_type;
+                int32_t count;
+                thrift_read_list_begin(&dec, &elem_type, &count);
+                if (count < 0 || count > 1000000) { carquet_column_index_free(ci); return NULL; }
+                ci->min_values = calloc(count, sizeof(uint8_t*));
+                ci->min_value_lens = calloc(count, sizeof(int32_t));
+                if (!ci->min_values || !ci->min_value_lens) {
+                    carquet_column_index_free(ci);
+                    return NULL;
+                }
+                ci->num_min_values = count;
+                for (int32_t i = 0; i < count; i++) {
+                    int32_t len;
+                    const uint8_t* bin = thrift_read_binary(&dec, &len);
+                    if (bin && len > 0) {
+                        ci->min_values[i] = malloc(len);
+                        if (!ci->min_values[i]) {
+                            carquet_column_index_free(ci);
+                            return NULL;
+                        }
+                        memcpy(ci->min_values[i], bin, len);
+                        ci->min_value_lens[i] = len;
+                    }
+                }
+                break;
+            }
+            case 3: { /* max_values: list<binary> */
+                thrift_type_t elem_type;
+                int32_t count;
+                thrift_read_list_begin(&dec, &elem_type, &count);
+                if (count < 0 || count > 1000000) { carquet_column_index_free(ci); return NULL; }
+                ci->max_values = calloc(count, sizeof(uint8_t*));
+                ci->max_value_lens = calloc(count, sizeof(int32_t));
+                if (!ci->max_values || !ci->max_value_lens) {
+                    carquet_column_index_free(ci);
+                    return NULL;
+                }
+                ci->num_max_values = count;
+                for (int32_t i = 0; i < count; i++) {
+                    int32_t len;
+                    const uint8_t* bin = thrift_read_binary(&dec, &len);
+                    if (bin && len > 0) {
+                        ci->max_values[i] = malloc(len);
+                        if (!ci->max_values[i]) {
+                            carquet_column_index_free(ci);
+                            return NULL;
+                        }
+                        memcpy(ci->max_values[i], bin, len);
+                        ci->max_value_lens[i] = len;
+                    }
+                }
+                break;
+            }
+            case 4: { /* boundary_order: i32 */
+                ci->boundary_order = thrift_read_i32(&dec);
+                break;
+            }
+            case 5: { /* null_counts: list<i64> */
+                thrift_type_t elem_type;
+                int32_t count;
+                thrift_read_list_begin(&dec, &elem_type, &count);
+                if (count < 0 || count > 1000000) { carquet_column_index_free(ci); return NULL; }
+                ci->null_counts = calloc(count, sizeof(int64_t));
+                if (!ci->null_counts) { carquet_column_index_free(ci); return NULL; }
+                ci->num_null_counts = count;
+                for (int32_t i = 0; i < count; i++) {
+                    ci->null_counts[i] = thrift_read_i64(&dec);
+                }
+                break;
+            }
+            default:
+                thrift_skip_field(&dec, type);
+                break;
+        }
+    }
+
+    thrift_read_struct_end(&dec);
+
+    if (thrift_decoder_has_error(&dec)) {
+        carquet_column_index_free(ci);
+        return NULL;
+    }
+
+    /* Clamp num_pages to the minimum of all parsed array sizes so that
+     * accessors never read past any allocation — even with malformed
+     * Thrift data where list counts disagree. */
+    if (ci->null_pages && ci->num_null_pages < ci->num_pages)
+        ci->num_pages = ci->num_null_pages;
+    if (ci->min_values && ci->num_min_values < ci->num_pages)
+        ci->num_pages = ci->num_min_values;
+    if (ci->max_values && ci->num_max_values < ci->num_pages)
+        ci->num_pages = ci->num_max_values;
+    if (ci->null_counts && ci->num_null_counts < ci->num_pages)
+        ci->num_pages = ci->num_null_counts;
+
+    return ci;
+}
+
+/**
+ * Parse a Thrift-encoded OffsetIndex.
+ *
+ * Thrift schema:
+ *   struct OffsetIndex {
+ *     1: required list<PageLocation> page_locations
+ *   }
+ *   struct PageLocation {
+ *     1: required i64 offset
+ *     2: required i32 compressed_page_size
+ *     3: required i64 first_row_index
+ *   }
+ *
+ * @param data  Pointer to the Thrift-encoded data
+ * @param size  Size of the data in bytes
+ * @return Parsed offset index, or NULL on failure. Caller must free with
+ *         carquet_offset_index_free().
+ */
+carquet_offset_index_t* carquet_offset_index_parse(const uint8_t* data, size_t size) {
+    if (!data || size == 0) return NULL;
+
+    thrift_decoder_t dec;
+    thrift_decoder_init(&dec, data, size);
+
+    struct carquet_offset_index* oi = calloc(1, sizeof(*oi));
+    if (!oi) return NULL;
+
+    thrift_read_struct_begin(&dec);
+
+    thrift_type_t type;
+    int16_t field_id;
+
+    while (thrift_read_field_begin(&dec, &type, &field_id)) {
+        switch (field_id) {
+            case 1: { /* page_locations: list<PageLocation> */
+                thrift_type_t elem_type;
+                int32_t count;
+                thrift_read_list_begin(&dec, &elem_type, &count);
+                if (count < 0 || count > 1000000) { free(oi); return NULL; }
+                oi->num_pages = count;
+                oi->page_locations = calloc(count, sizeof(carquet_page_location_t));
+                if (!oi->page_locations) {
+                    free(oi);
+                    return NULL;
+                }
+                for (int32_t i = 0; i < count; i++) {
+                    thrift_read_struct_begin(&dec);
+
+                    thrift_type_t ft;
+                    int16_t fid;
+                    while (thrift_read_field_begin(&dec, &ft, &fid)) {
+                        switch (fid) {
+                            case 1: /* offset: i64 */
+                                oi->page_locations[i].offset = thrift_read_i64(&dec);
+                                break;
+                            case 2: /* compressed_page_size: i32 */
+                                oi->page_locations[i].compressed_size = thrift_read_i32(&dec);
+                                break;
+                            case 3: /* first_row_index: i64 */
+                                oi->page_locations[i].first_row_index = thrift_read_i64(&dec);
+                                break;
+                            default:
+                                thrift_skip_field(&dec, ft);
+                                break;
+                        }
+                    }
+
+                    thrift_read_struct_end(&dec);
+                }
+                break;
+            }
+            default:
+                thrift_skip_field(&dec, type);
+                break;
+        }
+    }
+
+    thrift_read_struct_end(&dec);
+
+    if (thrift_decoder_has_error(&dec)) {
+        carquet_offset_index_free(oi);
+        return NULL;
+    }
+
+    return oi;
+}
+
+/* ============================================================================
+ * Accessor Functions
+ * ============================================================================
+ */
+
+/**
+ * Get the number of pages in a column index.
+ */
+int32_t carquet_column_index_num_pages(const carquet_column_index_t* index) {
+    /* index is nonnull per API contract */
+    return index->num_pages;
+}
+
+/**
+ * Get per-page statistics from a column index.
+ */
+carquet_status_t carquet_column_index_get_page_stats(
+    const carquet_column_index_t* index,
+    int32_t page_index,
+    carquet_page_stats_t* stats) {
+
+    /* index and stats are nonnull per API contract */
+    if (page_index < 0 || page_index >= index->num_pages) {
+        return CARQUET_ERROR_INVALID_ARGUMENT;
+    }
+
+    stats->null_count = (index->null_counts && page_index < index->num_null_counts)
+        ? index->null_counts[page_index] : 0;
+    stats->min_value = (index->min_values && page_index < index->num_min_values)
+        ? index->min_values[page_index] : NULL;
+    stats->min_value_size = (index->min_value_lens && page_index < index->num_min_values)
+        ? index->min_value_lens[page_index] : 0;
+    stats->max_value = (index->max_values && page_index < index->num_max_values)
+        ? index->max_values[page_index] : NULL;
+    stats->max_value_size = (index->max_value_lens && page_index < index->num_max_values)
+        ? index->max_value_lens[page_index] : 0;
+    stats->is_null_page = (index->null_pages && page_index < index->num_null_pages)
+        ? index->null_pages[page_index] : false;
+    return CARQUET_OK;
+}
+
+/**
+ * Get boundary order of a column index.
+ * @return 0=UNORDERED, 1=ASCENDING, 2=DESCENDING
+ */
+int32_t carquet_column_index_boundary_order(const carquet_column_index_t* index) {
+    /* index is nonnull per API contract */
+    return index->boundary_order;
+}
+
+/**
+ * Get the number of pages in an offset index.
+ */
+int32_t carquet_offset_index_num_pages(const carquet_offset_index_t* index) {
+    /* index is nonnull per API contract */
+    return index->num_pages;
+}
+
+/**
+ * Get page location from an offset index.
+ */
+carquet_status_t carquet_offset_index_get_page_location(
+    const carquet_offset_index_t* index,
+    int32_t page_index,
+    carquet_page_location_t* location) {
+
+    /* index and location are nonnull per API contract */
+    if (page_index < 0 || page_index >= index->num_pages) {
+        return CARQUET_ERROR_INVALID_ARGUMENT;
+    }
+
+    *location = index->page_locations[page_index];
+    return CARQUET_OK;
+}
+
+/**
+ * Free a parsed offset index.
+ */
+void carquet_offset_index_free(carquet_offset_index_t* index) {
+    if (!index) return;
+    free(index->page_locations);
+    free(index);
 }

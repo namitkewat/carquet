@@ -23,22 +23,19 @@
  * thread pool is torn down.
  *
  * Strategy:
- *   POSIX + OpenMP  → pthread_key_create with destructors.  The pthread
- *                      runtime calls the destructor when each thread exits,
- *                      including OMP worker threads joined by libgomp's
- *                      atexit handler.
- *   MSVC + OpenMP   → __declspec(thread) with explicit carquet_zstd_cleanup.
- *   No OpenMP       → plain global statics with explicit carquet_zstd_cleanup.
+ *   POSIX (any)      -> pthread_key_create with destructors.  Works for both
+ *                        OpenMP threads and worker pool pthreads.  The pthread
+ *                        runtime calls the destructor when each thread exits.
+ *   Windows + OpenMP -> __declspec(thread) with explicit carquet_zstd_cleanup.
+ *   Windows no OMP   -> plain global statics with explicit carquet_zstd_cleanup.
  *
  * carquet_cleanup() (public API) calls carquet_zstd_cleanup() for the
- * calling thread.  On POSIX+OMP the worker-thread contexts are freed
- * automatically; on MSVC+OMP callers must arrange per-thread cleanup.
+ * calling thread.  On POSIX the worker-thread contexts are freed
+ * automatically; on Windows callers must arrange per-thread cleanup.
  * ============================================================================ */
 
-#ifdef _OPENMP
-
-#if !defined(_MSC_VER)
-/* ---- POSIX + OpenMP: pthread_key with destructors ---- */
+#if !defined(_WIN32)
+/* ---- POSIX: pthread_key with destructors (works for OMP + worker pool) ---- */
 #include <pthread.h>
 
 static pthread_key_t tls_dctx_key;
@@ -92,8 +89,8 @@ void carquet_zstd_cleanup(void) {
     }
 }
 
-#else
-/* ---- MSVC + OpenMP: __declspec(thread) with explicit cleanup ---- */
+#elif defined(_OPENMP)
+/* ---- Windows + OpenMP: __declspec(thread) with explicit cleanup ---- */
 static __declspec(thread) ZSTD_DCtx* tls_dctx = NULL;
 static __declspec(thread) ZSTD_CCtx* tls_cctx = NULL;
 
@@ -111,10 +108,9 @@ void carquet_zstd_cleanup(void) {
     if (tls_dctx) { ZSTD_freeDCtx(tls_dctx); tls_dctx = NULL; }
     if (tls_cctx) { ZSTD_freeCCtx(tls_cctx); tls_cctx = NULL; }
 }
-#endif /* !_MSC_VER */
 
 #else
-/* ---- No OpenMP: global contexts ---- */
+/* ---- Windows no OpenMP: global contexts ---- */
 static ZSTD_DCtx* global_dctx = NULL;
 static ZSTD_CCtx* global_cctx = NULL;
 
@@ -132,7 +128,7 @@ void carquet_zstd_cleanup(void) {
     if (global_dctx) { ZSTD_freeDCtx(global_dctx); global_dctx = NULL; }
     if (global_cctx) { ZSTD_freeCCtx(global_cctx); global_cctx = NULL; }
 }
-#endif /* _OPENMP */
+#endif
 
 int carquet_zstd_decompress(
     const uint8_t* src,

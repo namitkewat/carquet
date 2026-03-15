@@ -291,7 +291,8 @@ const uint8_t* carquet_bloom_filter_data(const carquet_bloom_filter_t* filter) {
 }
 
 size_t carquet_bloom_filter_size(const carquet_bloom_filter_t* filter) {
-    return filter ? filter->num_bytes : 0;
+    /* filter is nonnull per API contract */
+    return filter->num_bytes;
 }
 
 size_t carquet_bloom_filter_num_blocks(const carquet_bloom_filter_t* filter) {

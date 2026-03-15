@@ -19,6 +19,9 @@ python3 fuzz/run_fuzzer.py build
 
 # List targets and corpus status
 python3 fuzz/run_fuzzer.py list
+
+# Drop old crash artifacts before a fresh run
+python3 fuzz/run_fuzzer.py reader --clean-artifacts
 ```
 
 ## Requirements
@@ -31,11 +34,11 @@ python3 fuzz/run_fuzzer.py list
 
 | Target | Modes | Coverage |
 |--------|-------|----------|
-| `fuzz_reader` | 1 | Full file reader: buffer open, schema, batch reader, column reader, type names |
+| `fuzz_reader` | 1 | Full file reader: buffer open, schema, batch reader, column reader, type names, bloom filter query, column/offset index parsing, key-value metadata, column chunk metadata |
 | `fuzz_writer` | 1 | Schema creation, all physical types (incl. BYTE_ARRAY), all codecs, config variants, write-read roundtrip |
 | `fuzz_compression` | 3 | Snappy/LZ4/GZIP/ZSTD: decompress malformed, compress-decompress roundtrip, undersized buffer |
 | `fuzz_encodings` | 17 | RLE, Delta INT32/INT64, Plain (bool/int32/int64/float/double), Dictionary (int32/int64/float/double), BSS (float/double/generic), Delta Length Byte Array, RLE levels |
-| `fuzz_thrift` | 6 | Primitives, struct parsing, containers (list/map), file metadata, page headers, encoder-decoder roundtrip |
+| `fuzz_thrift` | 8 | Primitives, struct parsing, containers (list/map), file metadata, page headers, encoder-decoder roundtrip, ColumnIndex parsing, OffsetIndex parsing |
 | `fuzz_roundtrip` | 11 | Delta INT32/INT64, LZ4/Snappy/GZIP/ZSTD, BSS float/double, RLE, Dictionary INT32, Plain INT32 |
 
 ## Commands
@@ -49,6 +52,9 @@ python3 fuzz/run_fuzzer.py all [--time N] [--jobs N]
 
 # Build only
 python3 fuzz/run_fuzzer.py build [--no-sanitizers]
+
+# Clean old crash artifacts before fuzzing
+python3 fuzz/run_fuzzer.py <target> --clean-artifacts
 
 # List targets and corpus info
 python3 fuzz/run_fuzzer.py list
@@ -68,6 +74,7 @@ python3 fuzz/run_fuzzer.py coverage <target>
 | `--jobs N` | 1 | Parallel fuzzing jobs |
 | `--no-sanitizers` | off | Disable ASan/UBSan |
 | `--build-dir DIR` | `build-fuzz` | Build directory |
+| `--clean-artifacts` | off | Delete saved `artifacts_<target>/` directories before fuzzing |
 
 Extra libFuzzer flags can be passed after `--`:
 ```bash

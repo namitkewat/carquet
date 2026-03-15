@@ -74,6 +74,16 @@ struct carquet_schema {
  * ============================================================================
  */
 
+/**
+ * Pre-buffered I/O cache for coalesced reads.
+ */
+typedef struct carquet_prebuffer {
+    uint8_t* data;          /* Coalesced read buffer */
+    int64_t file_offset;    /* Start offset in file */
+    size_t size;            /* Size of buffer */
+    int32_t row_group;      /* Row group this cache is for (-1 = none) */
+} carquet_prebuffer_t;
+
 struct carquet_reader {
     FILE* file;
     bool owns_file;
@@ -90,6 +100,9 @@ struct carquet_reader {
 
     /* Options */
     carquet_reader_options_t options;
+
+    /* Pre-buffered I/O cache */
+    carquet_prebuffer_t prebuffer;
 
     /* State */
     bool is_open;
@@ -153,6 +166,9 @@ struct carquet_column_reader {
     size_t indices_capacity;    /* Capacity of indices buffer */
     uint8_t* decompress_buffer; /* Reusable decompression buffer */
     size_t decompress_capacity; /* Capacity of decompression buffer */
+
+    /* Dictionary preservation mode */
+    bool preserve_dictionary;   /* If true, skip materialization, keep indices */
 };
 
 /* ============================================================================
@@ -187,6 +203,14 @@ bool carquet_page_is_zero_copy_eligible(
     carquet_compression_t codec,
     carquet_encoding_t encoding,
     carquet_physical_type_t type);
+
+/**
+ * Ensure the current page is loaded and ready for reading.
+ * Advances to the next page when the current one has been fully consumed.
+ */
+carquet_status_t carquet_column_ensure_page_loaded(
+    carquet_column_reader_t* reader,
+    carquet_error_t* error);
 
 #ifdef __cplusplus
 }

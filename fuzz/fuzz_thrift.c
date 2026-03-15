@@ -224,11 +224,55 @@ static void fuzz_thrift_roundtrip(const uint8_t* data, size_t size) {
     carquet_buffer_destroy(&buf);
 }
 
+/**
+ * Mode 6: ColumnIndex Thrift deserialization (page-level statistics)
+ */
+extern carquet_column_index_t* carquet_column_index_parse(const uint8_t* data, size_t size);
+extern void carquet_column_index_free(carquet_column_index_t* index);
+
+static void fuzz_column_index(const uint8_t* data, size_t size) {
+    carquet_column_index_t* ci = carquet_column_index_parse(data, size);
+    if (ci) {
+        int32_t np = carquet_column_index_num_pages(ci);
+        (void)carquet_column_index_boundary_order(ci);
+        for (int32_t i = 0; i < np && i < 20; i++) {
+            carquet_page_stats_t ps;
+            carquet_column_index_get_page_stats(ci, i, &ps);
+            (void)ps.null_count;
+            (void)ps.min_value;
+            (void)ps.max_value;
+            (void)ps.is_null_page;
+        }
+        carquet_column_index_free(ci);
+    }
+}
+
+/**
+ * Mode 7: OffsetIndex Thrift deserialization (page locations)
+ */
+extern carquet_offset_index_t* carquet_offset_index_parse(const uint8_t* data, size_t size);
+extern void carquet_offset_index_free(carquet_offset_index_t* index);
+
+static void fuzz_offset_index(const uint8_t* data, size_t size) {
+    carquet_offset_index_t* oi = carquet_offset_index_parse(data, size);
+    if (oi) {
+        int32_t np = carquet_offset_index_num_pages(oi);
+        for (int32_t i = 0; i < np && i < 20; i++) {
+            carquet_page_location_t loc;
+            carquet_offset_index_get_page_location(oi, i, &loc);
+            (void)loc.offset;
+            (void)loc.compressed_size;
+            (void)loc.first_row_index;
+        }
+        carquet_offset_index_free(oi);
+    }
+}
+
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     if (size < 2) return 0;
     (void)carquet_init();
 
-    uint8_t mode = data[0] % 6;
+    uint8_t mode = data[0] % 8;
     const uint8_t* payload = data + 1;
     size_t payload_size = size - 1;
 
@@ -239,6 +283,8 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         case 3: fuzz_parquet_metadata(payload, payload_size); break;
         case 4: fuzz_parquet_page_header(payload, payload_size); break;
         case 5: fuzz_thrift_roundtrip(payload, payload_size); break;
+        case 6: fuzz_column_index(payload, payload_size); break;
+        case 7: fuzz_offset_index(payload, payload_size); break;
     }
     return 0;
 }

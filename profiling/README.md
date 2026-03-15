@@ -1,27 +1,40 @@
 # Carquet Profiling Suite
 
-Comprehensive profiling tools for identifying performance bottlenecks in Carquet read/write paths.
+Cross-platform profiling tools for identifying performance bottlenecks in Carquet read/write paths. Supports macOS (sample, Instruments) and Linux (perf).
 
 ## Quick Start
 
 ```bash
 # Build and run full profiling
-./run_profile.sh full
+python3 profiling/run_profiler.py full
 
-# Quick statistics only
-./run_profile.sh stat
+# Quick timing statistics
+python3 profiling/run_profiler.py stat
+
+# Write path profiling
+python3 profiling/run_profiler.py write
 
 # Generate flamegraph
-./run_profile.sh flamegraph
+python3 profiling/run_profiler.py flamegraph
 
 # Run micro-benchmarks
-./run_profile.sh micro
+python3 profiling/run_profiler.py micro
+
+# Compare scalar vs SIMD
+python3 profiling/run_profiler.py compare
+
+# Just build profiling binaries
+python3 profiling/run_profiler.py build
 ```
 
 ## Prerequisites
 
-### Required
-- `perf` - Linux performance profiler
+### macOS
+- Xcode Command Line Tools (provides `sample` and `xctrace`)
+- No special setup required — `sample` works out of the box
+
+### Linux
+- `perf` — Linux performance profiler
   ```bash
   sudo apt install linux-tools-generic linux-tools-$(uname -r)
   ```
@@ -30,6 +43,10 @@ Comprehensive profiling tools for identifying performance bottlenecks in Carquet
 - [FlameGraph](https://github.com/brendangregg/FlameGraph)
   ```bash
   git clone https://github.com/brendangregg/FlameGraph ~/FlameGraph
+  ```
+- Or [inferno](https://github.com/jonhoo/inferno) (Rust alternative)
+  ```bash
+  cargo install inferno
   ```
 
 ## Profiling Binaries
@@ -45,17 +62,13 @@ Full read path profiler that exercises:
 
 ```bash
 # Basic usage
-./profile_read -r 5000000 -i 10
+./build/profile_read -r 5000000 -i 10
 
 # With dictionary encoding and 10% nulls
-./profile_read -r 10000000 -d -n 1
+./build/profile_read -r 10000000 -d -n 1
 
 # With ZSTD compression
-./profile_read -r 5000000 -c 2
-
-# Profile with perf
-perf record -g ./profile_read -r 5000000 -i 5
-perf report --hierarchy
+./build/profile_read -r 5000000 -c 2
 ```
 
 Options:
@@ -69,123 +82,176 @@ Options:
 | `-c, --compression N` | 0=none, 1=snappy, 2=zstd, 3=lz4 | 0 |
 | `-v, --verbose` | Verbose output | off |
 
+### `profile_write`
+
+Full write path profiler that exercises:
+- Plain, dictionary, delta, byte-stream-split encoding
+- RLE level encoding
+- Statistics computation (SIMD minmax)
+- Compression codecs (including GZIP)
+- Bloom filter insertion
+- CRC32 computation
+- Page index building
+
+```bash
+# Basic usage
+./build/profile_write -r 5000000 -i 5
+
+# With dictionary encoding, bloom filters, and ZSTD
+./build/profile_write -r 5000000 -d -B -c 2
+
+# Measure feature overhead (statistics, CRC, bloom, page index)
+./build/profile_write -r 5000000 --overhead
+
+# Compare compression codecs
+./build/profile_write -r 5000000 --codecs
+
+# Compare plain vs dictionary encoding
+./build/profile_write -r 5000000 --encoding
+
+# Measure column count scaling
+./build/profile_write -r 5000000 --scaling
+
+# Many columns with all features
+./build/profile_write -r 1000000 -C 50 -B -P -d -c 2
+```
+
+Options:
+| Flag | Description | Default |
+|------|-------------|---------|
+| `-r, --rows N` | Number of rows | 10000000 |
+| `-g, --rowgroup N` | Row group size | 1000000 |
+| `-i, --iterations N` | Test iterations | 5 |
+| `-d, --dictionary` | Enable dictionary encoding | off |
+| `-n, --nulls MODE` | Null ratio: 0=none, 1=10%, 2=30%, 3=50% | 0 |
+| `-c, --compression N` | 0=none, 1=snappy, 2=zstd, 3=lz4, 4=gzip | 0 |
+| `-C, --columns N` | Number of columns | 5 |
+| `-S, --no-stats` | Disable statistics | on |
+| `-B, --bloom` | Enable bloom filters | off |
+| `-P, --page-index` | Enable page index | off |
+| `--no-crc` | Disable CRC32 | on |
+| `--overhead` | Measure feature overhead | off |
+| `--codecs` | Compare compression codecs | off |
+| `--encoding` | Compare plain vs dictionary | off |
+| `--scaling` | Column count scaling | off |
+
 ### `profile_micro`
 
 Micro-benchmarks for isolated component profiling:
 
 ```bash
 # All components
-./profile_micro --component all
+./build/profile_micro --component all
 
-# RLE decoding only
-./profile_micro --component rle --count 2000000 --iterations 500
-
-# Dictionary gather
-./profile_micro --component gather
-
-# Null bitmap operations
-./profile_micro --component null
-
-# Dispatch overhead measurement
-./profile_micro --component dispatch --iterations 1000000
+# Specific components
+./build/profile_micro --component rle --count 2000000 --iterations 500
+./build/profile_micro --component encoding
+./build/profile_micro --component compression
+./build/profile_micro --component minmax
+./build/profile_micro --component bloom
 ```
 
 Components:
-- `rle` - RLE level decoding (single, batch, decode_levels API)
-- `gather` - Dictionary gather operations (scalar vs SIMD)
-- `null` - Null bitmap construction (count_non_nulls, build_bitmap)
-- `compression` - LZ4/Snappy compress/decompress
-- `dispatch` - SIMD dispatch function call overhead
+| Component | What it benchmarks |
+|-----------|-------------------|
+| `rle` | RLE encoding & decoding (single, batch, levels API) |
+| `gather` | Dictionary gather (scalar vs SIMD, L1/L2/L3/memory) |
+| `null` | Null bitmap (count_non_nulls, build_bitmap, scalar vs dispatch) |
+| `compression` | LZ4, Snappy, ZSTD (L1/L3), GZIP — compress & decompress |
+| `dispatch` | SIMD dispatch function call overhead |
+| `minmax` | Min/max statistics (scalar vs dispatch, copy+minmax, all types) |
+| `bss` | Byte-stream-split encode/decode (float & double, dispatch) |
+| `prefix_sum` | Prefix sum / delta decoding (scalar vs dispatch) |
+| `hash` | CRC32 (software), CRC32C (dispatch/HW), XXHash64 |
+| `bloom` | Bloom filter insert & check throughput |
+| `encoding` | Plain, delta, dictionary, BSS encode/decode |
 
-## Profiling Modes
+## Profiling Modes (Python orchestrator)
 
-### `full` - Complete Analysis
-Runs all profiling steps:
-1. CPU statistics (cycles, cache, branches)
-2. Call graph recording
-3. Function-level report
-4. Source annotations for hot functions
-5. Flamegraph generation (if FlameGraph installed)
+### `full` — Complete Analysis
+Runs stat → record → report → flamegraph in sequence.
 
-### `stat` - Quick Statistics
-CPU hardware counter statistics:
-- Instructions per cycle (IPC)
-- Cache hit/miss rates
-- Branch prediction accuracy
+### `stat` — Quick Timing
+Runs the profiling binaries and reports timing results. On Linux with perf, also reports hardware counters.
 
 ```bash
-./run_profile.sh stat --rows 5000000
+python3 profiling/run_profiler.py stat --rows 5000000
+python3 profiling/run_profiler.py stat --component rle
 ```
 
-### `flamegraph` - Visual Call Graph
-Interactive SVG flamegraph for identifying hot paths:
+### `write` — Write Path
+Runs `profile_write` with configurable features and analysis modes.
 
 ```bash
-./run_profile.sh flamegraph --rows 10000000
+python3 profiling/run_profiler.py write --rows 5000000
+python3 profiling/run_profiler.py write --overhead --codecs --encoding-cmp
 ```
 
-Open `output/carquet_*_flamegraph.svg` in a browser.
-
-### `compare` - Implementation Comparison
-Compares scalar vs SIMD implementations:
-- Gather operations (scalar vs dispatch)
-- Null bitmap (scalar vs SIMD)
-- Dispatch overhead measurement
+### `record` — CPU Profile
+Records a CPU profile using the best available tool:
+- **macOS**: `xctrace` (Instruments) or `sample`
+- **Linux**: `perf record`
 
 ```bash
-./run_profile.sh compare
+python3 profiling/run_profiler.py record --rows 10000000
+```
+
+### `flamegraph` — Visual Call Graph
+Generates an interactive SVG flamegraph. Records first if no data exists.
+
+```bash
+python3 profiling/run_profiler.py flamegraph --rows 10000000
+```
+
+### `compare` — Scalar vs SIMD
+Benchmarks gather, null bitmap, and dispatch overhead, showing SIMD speedup ratios.
+
+```bash
+python3 profiling/run_profiler.py compare
+```
+
+### `micro` — Micro-benchmarks
+Runs isolated component benchmarks via `profile_micro`.
+
+```bash
+python3 profiling/run_profiler.py micro
+python3 profiling/run_profiler.py micro --component encoding
 ```
 
 ## Manual Profiling
 
-### Basic perf Commands
+### macOS
+
+```bash
+# CPU sampling (no special permissions needed)
+sample ./build/profile_read -r 5000000 10 -f output.txt
+
+# Instruments (Time Profiler)
+xctrace record --template 'Time Profiler' --launch -- ./build/profile_read -r 5000000
+open *.trace
+
+# Allocations profiling
+xctrace record --template 'Allocations' --launch -- ./build/profile_write -r 1000000
+```
+
+### Linux
 
 ```bash
 # Record with call graph
-perf record -g --call-graph dwarf ./profile_read -r 5000000
+perf record -g --call-graph dwarf ./build/profile_read -r 5000000
 
-# View report interactively
-perf report
-
-# Hierarchical view
+# View report
 perf report --hierarchy
 
-# Source annotation for specific function
+# Source annotation
 perf annotate carquet_rle_decoder_get
 
-# Statistics
-perf stat -e cycles,instructions,cache-misses ./profile_read -r 1000000
-```
-
-### Advanced Analysis
-
-```bash
-# Branch prediction analysis
-perf stat -e branch-misses,branch-instructions ./profile_micro --component rle
+# Hardware counters
+perf stat -e cycles,instructions,cache-misses ./build/profile_read -r 1000000
 
 # Cache analysis
 perf stat -e L1-dcache-loads,L1-dcache-load-misses,LLC-loads,LLC-load-misses \
-    ./profile_read -r 5000000
-
-# Memory bandwidth
-perf stat -e mem_load_retired.l1_hit,mem_load_retired.l2_hit,mem_load_retired.l3_hit \
-    ./profile_read -r 5000000 2>/dev/null || echo "(Requires Intel CPU)"
-
-# Record specific events
-perf record -e cache-misses -g ./profile_read -r 5000000
-```
-
-### Flamegraph Generation
-
-```bash
-# Clone FlameGraph if not installed
-git clone https://github.com/brendangregg/FlameGraph ~/FlameGraph
-
-# Record
-perf record -g --call-graph dwarf -F 999 ./profile_read -r 10000000 -i 5
-
-# Generate
-perf script | ~/FlameGraph/stackcollapse-perf.pl | ~/FlameGraph/flamegraph.pl > flame.svg
+    ./build/profile_read -r 5000000
 ```
 
 ## Interpreting Results
@@ -220,30 +286,16 @@ Profiling output is saved to `profiling/output/`:
 | File | Description |
 |------|-------------|
 | `*_stat.txt` | CPU statistics |
-| `*_perf.data` | Raw perf recording |
-| `*_report.txt` | Hierarchical function report |
-| `*_top_functions.txt` | Flat function list by samples |
+| `*_perf.data` | Raw perf recording (Linux) |
+| `*_sample.txt` | CPU sample data (macOS) |
+| `*.trace` | Instruments trace (macOS) |
+| `*_report.txt` | Function report |
 | `*_flamegraph.svg` | Interactive flamegraph |
 | `*_icicle.svg` | Reversed (icicle) flamegraph |
 | `*_micro.txt` | Micro-benchmark results |
-| `*_annotations/` | Source annotations for hot functions |
-
-## PyArrow Comparison
-
-The profiling tools are designed to produce comparable workloads to PyArrow:
-
-```python
-# Equivalent PyArrow benchmark
-import pyarrow.parquet as pq
-import time
-
-start = time.time()
-table = pq.read_table('/tmp/test.parquet')
-elapsed = time.time() - start
-print(f"{len(table) / elapsed / 1e6:.2f} M rows/sec")
-```
-
-Target: Carquet should achieve at least 50% of PyArrow read performance.
+| `*_write.txt` | Write profiling results |
+| `*_compare.txt` | Scalar vs SIMD comparison |
+| `*_annotations/` | Source annotations (Linux) |
 
 ## Architecture-Specific Notes
 
@@ -252,7 +304,8 @@ Target: Carquet should achieve at least 50% of PyArrow read performance.
 - Prefetching critical for dictionary gather
 - Check dispatch overhead vs inline SIMD
 
-### ARM64
-- NEON paths typically faster than x86
+### ARM64 (Apple Silicon)
+- NEON paths typically faster than x86 SSE
+- Hardware CRC32C acceleration
 - SVE available but experimental
 - Less dispatch overhead due to simpler calling convention

@@ -19,7 +19,7 @@
 
 static const char* TEST_FILE = "test_mmap_data.parquet";
 
-static int create_test_file(int64_t num_rows) {
+static int create_test_file_with_page_size(int64_t num_rows, int64_t page_size) {
     carquet_error_t error = CARQUET_ERROR_INIT;
 
     /* Create schema with REQUIRED INT64 column (eligible for zero-copy) */
@@ -38,7 +38,10 @@ static int create_test_file(int64_t num_rows) {
     carquet_writer_options_t opts;
     carquet_writer_options_init(&opts);
     opts.compression = CARQUET_COMPRESSION_UNCOMPRESSED;
-    opts.row_group_size = num_rows;  /* All rows in one row group */
+    opts.row_group_size = num_rows * 32;  /* Keep test data in a single row group */
+    if (page_size > 0) {
+        opts.page_size = page_size;
+    }
 
     carquet_writer_t* writer = carquet_writer_create(TEST_FILE, schema, &opts, &error);
     if (!writer) {
@@ -64,6 +67,10 @@ static int create_test_file(int64_t num_rows) {
     free(values);
 
     return 0;
+}
+
+static int create_test_file(int64_t num_rows) {
+    return create_test_file_with_page_size(num_rows, 0);
 }
 
 /* ============================================================================
@@ -297,6 +304,118 @@ static int test_mmap_batch_reader(void) {
 }
 
 /* ============================================================================
+ * Test: Oversized mmap batch request stays page-aligned for zero-copy
+ * ============================================================================
+ */
+
+static int test_mmap_batch_reader_page_aligned(void) {
+    const char* name = "mmap_batch_reader_page_aligned";
+    carquet_error_t error = CARQUET_ERROR_INIT;
+    const int64_t page_size = 4096;
+    const int64_t num_rows = 4096;
+
+    if (create_test_file_with_page_size(num_rows, page_size) != 0) {
+        TEST_FAIL(name, "Failed to create test file");
+    }
+
+    carquet_reader_options_t reader_opts;
+    carquet_reader_options_init(&reader_opts);
+    reader_opts.use_mmap = true;
+
+    carquet_reader_t* reader = carquet_reader_open(TEST_FILE, &reader_opts, &error);
+    if (!reader) {
+        TEST_FAIL(name, "Failed to open reader");
+    }
+
+    carquet_batch_reader_config_t config;
+    carquet_batch_reader_config_init(&config);
+    config.batch_size = (int32_t)num_rows;
+
+    carquet_batch_reader_t* batch_reader = carquet_batch_reader_create(reader, &config, &error);
+    if (!batch_reader) {
+        carquet_reader_close(reader);
+        TEST_FAIL(name, "Failed to create batch reader");
+    }
+
+    int64_t total_rows = 0;
+    int64_t expected_row = 0;
+    int batch_count = 0;
+    bool saw_split_batch = false;
+    carquet_row_batch_t* batch = NULL;
+
+    while (carquet_batch_reader_next(batch_reader, &batch) == CARQUET_OK && batch) {
+        const void* data = NULL;
+        const uint8_t* null_bitmap = NULL;
+        int64_t col_num_values = 0;
+        const int64_t* ids;
+        const double* values;
+        int64_t batch_rows = carquet_row_batch_num_rows(batch);
+
+        if (batch_count == 0) {
+            if (batch_rows >= num_rows) {
+                carquet_row_batch_free(batch);
+                carquet_batch_reader_free(batch_reader);
+                carquet_reader_close(reader);
+                TEST_FAIL(name, "Oversized batch request should be split across page boundaries");
+            }
+            saw_split_batch = true;
+        }
+
+        if (batch_rows <= 0) {
+            carquet_row_batch_free(batch);
+            carquet_batch_reader_free(batch_reader);
+            carquet_reader_close(reader);
+            TEST_FAIL(name, "Batch should contain rows");
+        }
+
+        if (carquet_row_batch_column(batch, 0, &data, &null_bitmap, &col_num_values) != CARQUET_OK ||
+            !data || null_bitmap != NULL || col_num_values != batch_rows) {
+            carquet_row_batch_free(batch);
+            carquet_batch_reader_free(batch_reader);
+            carquet_reader_close(reader);
+            TEST_FAIL(name, "Failed to read INT64 batch column");
+        }
+        ids = (const int64_t*)data;
+
+        if (carquet_row_batch_column(batch, 1, &data, &null_bitmap, &col_num_values) != CARQUET_OK ||
+            !data || null_bitmap != NULL || col_num_values != batch_rows) {
+            carquet_row_batch_free(batch);
+            carquet_batch_reader_free(batch_reader);
+            carquet_reader_close(reader);
+            TEST_FAIL(name, "Failed to read DOUBLE batch column");
+        }
+        values = (const double*)data;
+
+        for (int64_t i = 0; i < batch_rows; i++) {
+            if (ids[i] != expected_row * 100 ||
+                fabs(values[i] - ((double)expected_row * 3.14159)) > 1e-9) {
+                carquet_row_batch_free(batch);
+                carquet_batch_reader_free(batch_reader);
+                carquet_reader_close(reader);
+                TEST_FAIL(name, "Batch data mismatch");
+            }
+            expected_row++;
+        }
+
+        total_rows += batch_rows;
+        batch_count++;
+        carquet_row_batch_free(batch);
+        batch = NULL;
+    }
+
+    if (total_rows != num_rows || batch_count < 2 || expected_row != num_rows || !saw_split_batch) {
+        carquet_batch_reader_free(batch_reader);
+        carquet_reader_close(reader);
+        TEST_FAIL(name, "Unexpected batch segmentation");
+    }
+
+    carquet_batch_reader_free(batch_reader);
+    carquet_reader_close(reader);
+    TEST_PASS(name);
+    return 0;
+}
+
+/* ============================================================================
  * Test: Compare mmap vs fread results
  * ============================================================================
  */
@@ -421,6 +540,7 @@ int main(void) {
     failures += test_zero_copy_eligibility();
     failures += test_mmap_read_data();
     failures += test_mmap_batch_reader();
+    failures += test_mmap_batch_reader_page_aligned();
     failures += test_mmap_vs_fread();
     failures += test_fread_fallback();
 

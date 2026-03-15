@@ -1,7 +1,7 @@
 /**
  * @file carquet.h
  * @brief Carquet - High-Performance Pure C Parquet Library
- * @version 0.3.1
+ * @version 0.4.0
  *
  * @copyright Copyright (c) 2025. All rights reserved.
  * @license MIT License
@@ -196,13 +196,13 @@ extern "C" {
 #define CARQUET_VERSION_MAJOR 0
 
 /** @brief Minor version number */
-#define CARQUET_VERSION_MINOR 3
+#define CARQUET_VERSION_MINOR 4
 
 /** @brief Patch version number */
-#define CARQUET_VERSION_PATCH 1
+#define CARQUET_VERSION_PATCH 0
 
 /** @brief Version string in "MAJOR.MINOR.PATCH" format */
-#define CARQUET_VERSION_STRING "0.3.1"
+#define CARQUET_VERSION_STRING "0.4.0"
 
 /** @brief Numeric version for compile-time comparisons: (MAJOR * 10000 + MINOR * 100 + PATCH) */
 #define CARQUET_VERSION_NUMBER (CARQUET_VERSION_MAJOR * 10000 + CARQUET_VERSION_MINOR * 100 + CARQUET_VERSION_PATCH)
@@ -466,6 +466,12 @@ typedef struct carquet_row_group carquet_row_group_t;
 
 /** @brief Bloom filter for membership testing */
 typedef struct carquet_bloom_filter carquet_bloom_filter_t;
+
+/** @brief Column index (per-page min/max statistics) */
+typedef struct carquet_column_index carquet_column_index_t;
+
+/** @brief Offset index (per-page file locations) */
+typedef struct carquet_offset_index carquet_offset_index_t;
 
 /** @brief Row batch for batch reading */
 typedef struct carquet_row_batch carquet_row_batch_t;
@@ -1286,6 +1292,59 @@ carquet_status_t carquet_reader_row_group_metadata(
     carquet_row_group_metadata_t* metadata);
 
 /**
+ * @brief Pre-buffer column data for I/O coalescing.
+ *
+ * For the fread path, pre-reads all requested column chunks from a row group
+ * in a single coalesced I/O operation. Adjacent or nearby column ranges are
+ * merged to reduce the number of fseek/fread calls. Subsequent column reads
+ * from this row group will serve data from the pre-buffered cache instead of
+ * issuing individual reads.
+ *
+ * For mmap readers, this is a no-op (the OS handles page coalescing).
+ *
+ * This is most beneficial for:
+ * - Network/cloud storage (S3, GCS) where each I/O has high latency
+ * - Reading many columns from the same row group
+ * - HDD storage where sequential reads are much faster than random seeks
+ *
+ * @param[in] reader File reader
+ * @param[in] row_group_index Row group to pre-buffer
+ * @param[in] column_indices Array of column indices to pre-buffer
+ * @param[in] num_columns Number of columns (0 = all columns)
+ * @param[out] error Error information (may be NULL)
+ * @return CARQUET_OK on success
+ *
+ * @note Thread-safe: No (modifies internal reader state)
+ *
+ * @code{.c}
+ * // Pre-buffer columns 0, 2, 5 from row group 0
+ * int32_t cols[] = {0, 2, 5};
+ * carquet_reader_prebuffer(reader, 0, cols, 3, &err);
+ *
+ * // Subsequent column reads will use the pre-buffered data
+ * carquet_column_reader_t* c0 = carquet_reader_get_column(reader, 0, 0, &err);
+ * @endcode
+ */
+CARQUET_API CARQUET_WARN_UNUSED_RESULT CARQUET_NONNULL(1)
+carquet_status_t carquet_reader_prebuffer(
+    carquet_reader_t* reader,
+    int32_t row_group_index,
+    const int32_t* column_indices,
+    int32_t num_columns,
+    carquet_error_t* error);
+
+/**
+ * @brief Release pre-buffered data.
+ *
+ * Frees the memory used by carquet_reader_prebuffer(). Called automatically
+ * when the reader is closed.
+ *
+ * @param[in] reader File reader
+ */
+CARQUET_API CARQUET_NONNULL(1)
+void carquet_reader_release_prebuffer(carquet_reader_t* reader);
+
+/**
  * @brief Get a column reader for a specific row group and column.
  *
  * Creates a reader for streaming values from a single column within a
@@ -1418,11 +1477,41 @@ void carquet_column_reader_free(carquet_column_reader_t* reader);
  * Parquet files. It supports:
  *
  * - Column projection (read only needed columns)
+ * - Row group predicate pushdown (skip non-matching row groups)
  * - Automatic batch sizing
  * - Parallel I/O (optional)
  *
  * This is the recommended API for most use cases.
  */
+
+/**
+ * @brief Row group filter callback for predicate pushdown.
+ *
+ * Called for each row group before reading. Return true to read the row group,
+ * false to skip it entirely. Use carquet_reader_row_group_matches() or
+ * carquet_reader_column_statistics() inside this callback to make filtering
+ * decisions based on column statistics.
+ *
+ * @param[in] reader File reader (for querying statistics)
+ * @param[in] row_group_index Row group being considered
+ * @param[in] user_data User-provided context pointer
+ * @return true to read this row group, false to skip it
+ *
+ * @code{.c}
+ * bool filter_large_ids(const carquet_reader_t* reader,
+ *                       int32_t row_group_index, void* ctx) {
+ *     int64_t threshold = *(int64_t*)ctx;
+ *     bool might_match = true;
+ *     carquet_reader_row_group_matches(reader, row_group_index, 0,
+ *         CARQUET_COMPARE_GT, &threshold, sizeof(threshold), &might_match);
+ *     return might_match;
+ * }
+ * @endcode
+ */
+typedef bool (*carquet_row_group_filter_fn)(
+    const carquet_reader_t* reader,
+    int32_t row_group_index,
+    void* user_data);
 
 /**
  * @brief Batch reader configuration.
@@ -1478,6 +1567,36 @@ typedef struct carquet_batch_reader_config {
      * @brief Number of column names.
      */
     int32_t num_column_names;
+
+    /**
+     * @brief Row group filter for predicate pushdown.
+     *
+     * When set, called for each row group before reading. Row groups where
+     * the filter returns false are skipped entirely (no I/O or decompression).
+     * This enables efficient predicate pushdown using column statistics.
+     *
+     * Default: NULL (read all row groups)
+     */
+    carquet_row_group_filter_fn row_group_filter;
+
+    /**
+     * @brief User data passed to row_group_filter callback.
+     *
+     * Default: NULL
+     */
+    void* row_group_filter_ctx;
+
+    /**
+     * @brief Preserve dictionary encoding instead of materializing values.
+     *
+     * When true, dictionary-encoded columns return raw indices (uint32_t*)
+     * instead of materialized values. Use carquet_row_batch_column_dictionary()
+     * to retrieve indices and dictionary data. This avoids the scatter-gather
+     * cost and can yield 10-50x speedups on string-heavy columns.
+     *
+     * Default: false
+     */
+    bool preserve_dictionaries;
 } carquet_batch_reader_config_t;
 
 /**
@@ -1611,6 +1730,42 @@ carquet_status_t carquet_row_batch_column(
     const void** data,
     const uint8_t** null_bitmap,
     int64_t* num_values);
+
+/**
+ * @brief Get dictionary-preserved column data from a batch.
+ *
+ * When preserve_dictionaries is enabled in the batch reader config,
+ * dictionary-encoded columns store raw indices instead of materialized values.
+ * This function retrieves the indices and dictionary data for zero-copy access.
+ *
+ * @param[in] batch Row batch
+ * @param[in] column_index Column index within the batch
+ * @param[out] indices Pointer to uint32_t index array (one per non-null value)
+ * @param[out] null_bitmap Null bitmap or NULL
+ * @param[out] num_values Number of values (rows)
+ * @param[out] dictionary_data Raw dictionary bytes
+ * @param[out] dictionary_count Number of entries in the dictionary
+ * @param[out] dictionary_offsets Offset table for BYTE_ARRAY dictionaries (NULL for fixed-width)
+ * @return CARQUET_OK on success, CARQUET_ERROR_INVALID_ARGUMENT if column is not dictionary-preserved
+ *
+ * @note For BYTE_ARRAY dictionaries, use the offset table for O(1) value lookup:
+ * @code{.c}
+ * uint32_t offset = dictionary_offsets[index];
+ * const uint8_t* entry = dictionary_data + offset;
+ * uint32_t len = *(uint32_t*)entry;  // little-endian length prefix
+ * const uint8_t* value = entry + 4;
+ * @endcode
+ */
+CARQUET_API CARQUET_WARN_UNUSED_RESULT CARQUET_NONNULL(1, 3, 4, 5, 6, 7)
+carquet_status_t carquet_row_batch_column_dictionary(
+    const carquet_row_batch_t* batch,
+    int32_t column_index,
+    const uint32_t** indices,
+    const uint8_t** null_bitmap,
+    int64_t* num_values,
+    const uint8_t** dictionary_data,
+    int32_t* dictionary_count,
+    const uint32_t** dictionary_offsets);
 
 /**
  * @brief Free a row batch.
@@ -2067,6 +2222,428 @@ CARQUET_API CARQUET_WARN_UNUSED_RESULT CARQUET_NONNULL(1)
 carquet_status_t carquet_validate_file(
     const char* path,
     carquet_error_t* error);
+
+/* ============================================================================
+ * Bloom Filter API
+ * ============================================================================
+ *
+ * Read bloom filters from Parquet files and check value membership.
+ * Bloom filters provide probabilistic membership testing: a "might contain"
+ * answer means the value may or may not be present, while "definitely not"
+ * is authoritative. This enables efficient predicate pushdown at the
+ * column-chunk level.
+ */
+
+/**
+ * @brief Read a bloom filter for a column in a row group.
+ *
+ * Reads the bloom filter data from the file at the offset stored in
+ * column chunk metadata. Returns NULL if no bloom filter is available.
+ *
+ * @param[in] reader File reader
+ * @param[in] row_group_index Row group index
+ * @param[in] column_index Column index
+ * @param[out] error Error information (may be NULL)
+ * @return Bloom filter handle, or NULL if unavailable
+ *
+ * @note The caller must free the returned filter with carquet_bloom_filter_destroy().
+ */
+CARQUET_API CARQUET_WARN_UNUSED_RESULT
+carquet_bloom_filter_t* carquet_reader_get_bloom_filter(
+    carquet_reader_t* reader,
+    int32_t row_group_index,
+    int32_t column_index,
+    carquet_error_t* error);
+
+/**
+ * @brief Check if a bloom filter might contain an int32 value.
+ * @return true if value might be present, false if definitely absent
+ */
+CARQUET_API CARQUET_PURE CARQUET_NONNULL(1)
+bool carquet_bloom_filter_check_i32(const carquet_bloom_filter_t* filter, int32_t value);
+
+/**
+ * @brief Check if a bloom filter might contain an int64 value.
+ */
+CARQUET_API CARQUET_PURE CARQUET_NONNULL(1)
+bool carquet_bloom_filter_check_i64(const carquet_bloom_filter_t* filter, int64_t value);
+
+/**
+ * @brief Check if a bloom filter might contain a float value.
+ */
+CARQUET_API CARQUET_PURE CARQUET_NONNULL(1)
+bool carquet_bloom_filter_check_float(const carquet_bloom_filter_t* filter, float value);
+
+/**
+ * @brief Check if a bloom filter might contain a double value.
+ */
+CARQUET_API CARQUET_PURE CARQUET_NONNULL(1)
+bool carquet_bloom_filter_check_double(const carquet_bloom_filter_t* filter, double value);
+
+/**
+ * @brief Check if a bloom filter might contain a byte sequence.
+ */
+CARQUET_API CARQUET_PURE CARQUET_NONNULL(1, 2)
+bool carquet_bloom_filter_check_bytes(const carquet_bloom_filter_t* filter,
+                                       const uint8_t* data, size_t len);
+
+/**
+ * @brief Get bloom filter size in bytes.
+ */
+CARQUET_API CARQUET_PURE CARQUET_NONNULL(1)
+size_t carquet_bloom_filter_size(const carquet_bloom_filter_t* filter);
+
+/**
+ * @brief Free a bloom filter.
+ * @param[in] filter Filter to free (may be NULL)
+ */
+CARQUET_API
+void carquet_bloom_filter_destroy(carquet_bloom_filter_t* filter);
+
+/* ============================================================================
+ * Page Index API (Column Index + Offset Index)
+ * ============================================================================
+ *
+ * Page indexes store per-page statistics (column index) and per-page file
+ * locations (offset index). They enable page-level predicate pushdown —
+ * skipping individual pages within a column chunk, not just entire row groups.
+ *
+ * Column index: min/max values and null counts for each data page.
+ * Offset index: file offset, compressed size, first row for each page.
+ */
+
+/**
+ * @brief Per-page statistics from a column index.
+ */
+typedef struct carquet_page_stats {
+    int64_t null_count;         /**< Number of nulls in this page */
+    const void* min_value;      /**< Minimum value (type depends on column) */
+    int32_t min_value_size;     /**< Size of min_value in bytes */
+    const void* max_value;      /**< Maximum value (type depends on column) */
+    int32_t max_value_size;     /**< Size of max_value in bytes */
+    bool is_null_page;          /**< True if page contains only nulls */
+} carquet_page_stats_t;
+
+/**
+ * @brief Per-page location from an offset index.
+ */
+typedef struct carquet_page_location {
+    int64_t offset;             /**< File offset of the page */
+    int32_t compressed_size;    /**< Compressed page size in bytes */
+    int64_t first_row_index;    /**< Index of first row in this page */
+} carquet_page_location_t;
+
+/**
+ * @brief Read column index (per-page statistics) for a column chunk.
+ *
+ * @param[in] reader File reader
+ * @param[in] row_group_index Row group index
+ * @param[in] column_index Column index
+ * @param[out] error Error information (may be NULL)
+ * @return Column index handle, or NULL if unavailable
+ *
+ * @note Caller must free with carquet_column_index_free().
+ */
+CARQUET_API CARQUET_WARN_UNUSED_RESULT
+carquet_column_index_t* carquet_reader_get_column_index(
+    carquet_reader_t* reader,
+    int32_t row_group_index,
+    int32_t column_index,
+    carquet_error_t* error);
+
+/**
+ * @brief Get the number of pages in a column index.
+ */
+CARQUET_API CARQUET_PURE CARQUET_NONNULL(1)
+int32_t carquet_column_index_num_pages(const carquet_column_index_t* index);
+
+/**
+ * @brief Get per-page statistics from a column index.
+ *
+ * @param[in] index Column index
+ * @param[in] page_index Page number (0 to num_pages - 1)
+ * @param[out] stats Output page statistics
+ * @return CARQUET_OK on success
+ */
+CARQUET_API CARQUET_WARN_UNUSED_RESULT CARQUET_NONNULL(1, 3)
+carquet_status_t carquet_column_index_get_page_stats(
+    const carquet_column_index_t* index,
+    int32_t page_index,
+    carquet_page_stats_t* stats);
+
+/**
+ * @brief Get boundary order of a column index.
+ * @return 0=UNORDERED, 1=ASCENDING, 2=DESCENDING
+ */
+CARQUET_API CARQUET_PURE CARQUET_NONNULL(1)
+int32_t carquet_column_index_boundary_order(const carquet_column_index_t* index);
+
+/**
+ * @brief Free a column index.
+ */
+CARQUET_API
+void carquet_column_index_free(carquet_column_index_t* index);
+
+/**
+ * @brief Read offset index (per-page locations) for a column chunk.
+ *
+ * @param[in] reader File reader
+ * @param[in] row_group_index Row group index
+ * @param[in] column_index Column index
+ * @param[out] error Error information (may be NULL)
+ * @return Offset index handle, or NULL if unavailable
+ *
+ * @note Caller must free with carquet_offset_index_free().
+ */
+CARQUET_API CARQUET_WARN_UNUSED_RESULT
+carquet_offset_index_t* carquet_reader_get_offset_index(
+    carquet_reader_t* reader,
+    int32_t row_group_index,
+    int32_t column_index,
+    carquet_error_t* error);
+
+/**
+ * @brief Get the number of pages in an offset index.
+ */
+CARQUET_API CARQUET_PURE CARQUET_NONNULL(1)
+int32_t carquet_offset_index_num_pages(const carquet_offset_index_t* index);
+
+/**
+ * @brief Get page location from an offset index.
+ *
+ * @param[in] index Offset index
+ * @param[in] page_index Page number (0 to num_pages - 1)
+ * @param[out] location Output page location
+ * @return CARQUET_OK on success
+ */
+CARQUET_API CARQUET_WARN_UNUSED_RESULT CARQUET_NONNULL(1, 3)
+carquet_status_t carquet_offset_index_get_page_location(
+    const carquet_offset_index_t* index,
+    int32_t page_index,
+    carquet_page_location_t* location);
+
+/**
+ * @brief Free an offset index.
+ */
+CARQUET_API
+void carquet_offset_index_free(carquet_offset_index_t* index);
+
+/* ============================================================================
+ * Key-Value Metadata API
+ * ============================================================================
+ *
+ * Parquet files can store arbitrary key-value string metadata in the footer.
+ * This is used by frameworks (Pandas, Arrow) to store schema annotations,
+ * serialization format info, and other application-specific metadata.
+ */
+
+/**
+ * @brief Get the number of key-value metadata entries in the file.
+ *
+ * @param[in] reader File reader
+ * @return Number of key-value pairs
+ */
+CARQUET_API CARQUET_PURE CARQUET_NONNULL(1)
+int32_t carquet_reader_num_metadata(const carquet_reader_t* reader);
+
+/**
+ * @brief Get a key-value metadata entry by index.
+ *
+ * @param[in] reader File reader
+ * @param[in] index Entry index (0 to num_metadata - 1)
+ * @param[out] key Output key string pointer (valid until reader is closed)
+ * @param[out] value Output value string pointer (may be NULL)
+ * @return CARQUET_OK on success
+ */
+CARQUET_API CARQUET_WARN_UNUSED_RESULT CARQUET_NONNULL(1, 3, 4)
+carquet_status_t carquet_reader_get_metadata(
+    const carquet_reader_t* reader,
+    int32_t index,
+    const char** key,
+    const char** value);
+
+/**
+ * @brief Find a metadata value by key.
+ *
+ * @param[in] reader File reader
+ * @param[in] key Key to search for
+ * @return Value string, or NULL if key not found
+ */
+CARQUET_API CARQUET_PURE CARQUET_NONNULL(1, 2)
+const char* carquet_reader_find_metadata(
+    const carquet_reader_t* reader,
+    const char* key);
+
+/**
+ * @brief Add key-value metadata to the file being written.
+ *
+ * Must be called before carquet_writer_close(). Multiple entries with
+ * the same key are allowed (last wins for most readers).
+ *
+ * @param[in] writer File writer
+ * @param[in] key Metadata key
+ * @param[in] value Metadata value (may be NULL)
+ * @return CARQUET_OK on success
+ */
+CARQUET_API CARQUET_WARN_UNUSED_RESULT CARQUET_NONNULL(1, 2)
+carquet_status_t carquet_writer_add_metadata(
+    carquet_writer_t* writer,
+    const char* key,
+    const char* value);
+
+/* ============================================================================
+ * Column Chunk Metadata API
+ * ============================================================================
+ *
+ * Access per-column-per-row-group metadata: encoding, compression codec,
+ * sizes, and availability of optional features (bloom filter, page index).
+ */
+
+/**
+ * @brief Detailed metadata for a column chunk.
+ */
+typedef struct carquet_column_chunk_metadata {
+    carquet_physical_type_t type;                /**< Physical type */
+    carquet_compression_t codec;                 /**< Compression codec used */
+    int64_t num_values;                          /**< Number of values */
+    int64_t total_compressed_size;               /**< Total compressed bytes */
+    int64_t total_uncompressed_size;             /**< Total uncompressed bytes */
+    int64_t data_page_offset;                    /**< File offset of first data page */
+    bool has_dictionary_page;                    /**< Dictionary page present */
+    int64_t dictionary_page_offset;              /**< File offset of dictionary page */
+    int32_t num_encodings;                       /**< Number of encodings used */
+    carquet_encoding_t encodings[4];             /**< Encodings used (up to 4) */
+    bool has_bloom_filter;                       /**< Bloom filter present */
+    bool has_column_index;                       /**< Column index present */
+    bool has_offset_index;                       /**< Offset index present */
+} carquet_column_chunk_metadata_t;
+
+/**
+ * @brief Get metadata for a column chunk.
+ *
+ * @param[in] reader File reader
+ * @param[in] row_group_index Row group index
+ * @param[in] column_index Column index
+ * @param[out] metadata Output metadata
+ * @return CARQUET_OK on success
+ */
+CARQUET_API CARQUET_WARN_UNUSED_RESULT CARQUET_NONNULL(1, 4)
+carquet_status_t carquet_reader_column_chunk_metadata(
+    const carquet_reader_t* reader,
+    int32_t row_group_index,
+    int32_t column_index,
+    carquet_column_chunk_metadata_t* metadata);
+
+/* ============================================================================
+ * Per-Column Writer Options
+ * ============================================================================
+ *
+ * Override global writer options on a per-column basis. Call these after
+ * creating the writer but before writing any data.
+ */
+
+/**
+ * @brief Set encoding for a specific column.
+ *
+ * Overrides the automatic encoding selection for this column.
+ *
+ * @param[in] writer File writer
+ * @param[in] column_index Column index
+ * @param[in] encoding Desired encoding
+ * @return CARQUET_OK on success
+ */
+CARQUET_API CARQUET_WARN_UNUSED_RESULT CARQUET_NONNULL(1)
+carquet_status_t carquet_writer_set_column_encoding(
+    carquet_writer_t* writer,
+    int32_t column_index,
+    carquet_encoding_t encoding);
+
+/**
+ * @brief Set compression for a specific column.
+ *
+ * Overrides the global compression setting for this column.
+ *
+ * @param[in] writer File writer
+ * @param[in] column_index Column index
+ * @param[in] codec Compression codec
+ * @param[in] level Compression level (0 for codec default)
+ * @return CARQUET_OK on success
+ */
+CARQUET_API CARQUET_WARN_UNUSED_RESULT CARQUET_NONNULL(1)
+carquet_status_t carquet_writer_set_column_compression(
+    carquet_writer_t* writer,
+    int32_t column_index,
+    carquet_compression_t codec,
+    int32_t level);
+
+/**
+ * @brief Enable or disable statistics for a specific column.
+ *
+ * @param[in] writer File writer
+ * @param[in] column_index Column index
+ * @param[in] enabled Whether to write statistics
+ * @return CARQUET_OK on success
+ */
+CARQUET_API CARQUET_WARN_UNUSED_RESULT CARQUET_NONNULL(1)
+carquet_status_t carquet_writer_set_column_statistics(
+    carquet_writer_t* writer,
+    int32_t column_index,
+    bool enabled);
+
+/**
+ * @brief Enable or disable bloom filter for a specific column.
+ *
+ * @param[in] writer File writer
+ * @param[in] column_index Column index
+ * @param[in] enabled Whether to write a bloom filter
+ * @return CARQUET_OK on success
+ */
+CARQUET_API CARQUET_WARN_UNUSED_RESULT CARQUET_NONNULL(1)
+carquet_status_t carquet_writer_set_column_bloom_filter(
+    carquet_writer_t* writer,
+    int32_t column_index,
+    bool enabled);
+
+/* ============================================================================
+ * Writer Buffer API
+ * ============================================================================
+ *
+ * Write Parquet data to an in-memory buffer instead of a file.
+ */
+
+/**
+ * @brief Create a writer that writes to an internal memory buffer.
+ *
+ * After closing the writer with carquet_writer_close(), retrieve the
+ * buffer contents with carquet_writer_get_buffer().
+ *
+ * @param[in] schema File schema
+ * @param[in] options Writer options (may be NULL)
+ * @param[out] error Error information (may be NULL)
+ * @return Writer handle, or NULL on error
+ */
+CARQUET_API CARQUET_WARN_UNUSED_RESULT CARQUET_NONNULL(1)
+carquet_writer_t* carquet_writer_create_buffer(
+    const carquet_schema_t* schema,
+    const carquet_writer_options_t* options,
+    carquet_error_t* error);
+
+/**
+ * @brief Get the buffer contents after writing.
+ *
+ * Must be called after carquet_writer_close(). The buffer is owned by the
+ * caller and must be freed with free().
+ *
+ * @param[in] writer Writer (must have been created with create_buffer)
+ * @param[out] buffer Output pointer to buffer data
+ * @param[out] size Output buffer size in bytes
+ * @return CARQUET_OK on success
+ */
+CARQUET_API CARQUET_WARN_UNUSED_RESULT CARQUET_NONNULL(1, 2, 3)
+carquet_status_t carquet_writer_get_buffer(
+    carquet_writer_t* writer,
+    void** buffer,
+    size_t* size);
 
 /* ============================================================================
  * C++ Compatibility - End

@@ -80,7 +80,7 @@ typedef struct {
     bool is_variable_length;
 } dict_builder_t;
 
-#define DICT_BUILDER_INITIAL_BUCKETS 1024U
+#define DICT_BUILDER_INITIAL_BUCKETS 1024U  /* Must be power of 2 */
 #define DICT_BUILDER_MAX_LOAD_NUM 3U
 #define DICT_BUILDER_MAX_LOAD_DEN 4U
 
@@ -90,11 +90,13 @@ static carquet_status_t dict_builder_rehash(dict_builder_t* builder, size_t new_
         return CARQUET_ERROR_OUT_OF_MEMORY;
     }
 
+    /* Use bitmask instead of modulo (new_bucket_count is always power of 2) */
+    size_t mask = new_bucket_count - 1;
     for (size_t i = 0; i < builder->num_buckets; i++) {
         dict_entry_t* entry = builder->buckets[i];
         while (entry) {
             dict_entry_t* next = entry->next;
-            size_t bucket = entry->hash % new_bucket_count;
+            size_t bucket = entry->hash & mask;
             entry->next = new_buckets[bucket];
             new_buckets[bucket] = entry;
             entry = next;
@@ -107,7 +109,40 @@ static carquet_status_t dict_builder_rehash(dict_builder_t* builder, size_t new_
     return CARQUET_OK;
 }
 
+/**
+ * Fast hash for fixed-size values using murmur3-style finalizer.
+ * Much faster than FNV-1a for 4/8 byte values because it avoids
+ * the per-byte sequential dependency chain.
+ */
+static inline uint32_t dict_hash_fixed32(const uint8_t* data) {
+    uint32_t h;
+    memcpy(&h, data, 4);
+    h ^= h >> 16;
+    h *= 0x85ebca6b;
+    h ^= h >> 13;
+    h *= 0xc2b2ae35;
+    h ^= h >> 16;
+    return h;
+}
+
+static inline uint32_t dict_hash_fixed64(const uint8_t* data) {
+    uint64_t k;
+    memcpy(&k, data, 8);
+    /* murmur3-style 64-to-32 mix */
+    k ^= k >> 33;
+    k *= 0xff51afd7ed558ccdULL;
+    k ^= k >> 33;
+    k *= 0xc4ceb9fe1a85ec53ULL;
+    k ^= k >> 33;
+    return (uint32_t)k;
+}
+
 static uint32_t dict_hash(const uint8_t* data, size_t size) {
+    /* Fast paths for common fixed-size types */
+    if (size == 4) return dict_hash_fixed32(data);
+    if (size == 8) return dict_hash_fixed64(data);
+
+    /* FNV-1a for variable-length data */
     uint32_t h = 0x811c9dc5;
     for (size_t i = 0; i < size; i++) {
         h ^= data[i];
@@ -178,9 +213,10 @@ static carquet_status_t dict_builder_add(dict_builder_t* builder,
         builder->indices_capacity = new_cap;
     }
 
-    /* Look up in hash table */
+    /* Look up in hash table (bitmask since num_buckets is power of 2) */
     uint32_t hash = dict_hash(value, value_size);
-    size_t bucket = hash % builder->num_buckets;
+    size_t mask = builder->num_buckets - 1;
+    size_t bucket = hash & mask;
 
     for (dict_entry_t* entry = builder->buckets[bucket]; entry; entry = entry->next) {
         if (entry->hash == hash &&
@@ -198,7 +234,8 @@ static carquet_status_t dict_builder_add(dict_builder_t* builder,
         if (status != CARQUET_OK) {
             return status;
         }
-        bucket = hash % builder->num_buckets;
+        mask = builder->num_buckets - 1;
+        bucket = hash & mask;
     }
 
     /* Add new entry */

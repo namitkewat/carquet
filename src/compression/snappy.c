@@ -1,10 +1,12 @@
 /**
  * @file snappy.c
- * @brief Optimized C Snappy compression/decompression
+ * @brief C Snappy compression/decompression
  *
  * Based on Google's Snappy (BSD-3-Clause license).
- * Ported from C++ to C with NEON SIMD support for ARM and
- * branchless decompression loop.
+ * C implementation of the Snappy format with NEON/SSSE3 SIMD support for
+ * pattern extension in overlapping copies. Uses a fixed 16K hash table
+ * (upstream uses adaptive 16K-32K); compressed output may differ byte-for-byte
+ * from upstream but always decompresses to the same result.
  *
  * Reference: https://github.com/google/snappy/blob/main/format_description.txt
  *
@@ -133,13 +135,9 @@ static inline void copy128(const void* src, void* dst) {
 }
 
 /* ============================================================================
- * kLengthMinusOffset — Branchless tag decode table
- * Encodes length - (offset << 8) for fast comparison.
- * From Google Snappy (BSD-3-Clause).
- *
- * For each tag byte, stores the length in the low byte.
- * For copy-1 tags, this gives us the copy length directly.
- * For copy-2 tags, this gives us the copy length directly.
+ * kLengthMinusOffset — Tag decode lookup table
+ * Encodes length - (offset << 8) for copy-1/copy-2 length extraction.
+ * From Google Snappy (BSD-3-Clause). Low byte = copy length.
  * ============================================================================ */
 
 static const int16_t kLengthMinusOffset[256] = {
@@ -183,18 +181,31 @@ static const int16_t kLengthMinusOffset[256] = {
  * Varint Encoding/Decoding
  * ============================================================================ */
 
+/**
+ * Read a varint-encoded uint32. Matches upstream Google Snappy's
+ * Varint::Parse32WithLimit: at most 5 bytes, and the 5th byte must
+ * have value < 16 (i.e. contributes at most 4 bits at position 28,
+ * keeping the result within uint32 range).
+ */
 static size_t snappy_read_varint(const uint8_t* p, const uint8_t* end, uint32_t* value) {
-    *value = 0;
-    int shift = 0;
+    uint32_t result = 0;
     const uint8_t* start = p;
-    while (p < end) {
-        uint8_t b = *p++;
-        *value |= ((uint32_t)(b & 0x7F)) << shift;
-        if ((b & 0x80) == 0) return (size_t)(p - start);
-        shift += 7;
-        if (shift >= 32) return 0;
-    }
-    return 0;
+
+    if (p >= end) return 0;
+    uint8_t b = *p++; result = b & 0x7F;           if (b < 128) goto done;
+    if (p >= end) return 0;
+    b = *p++; result |= (uint32_t)(b & 0x7F) << 7; if (b < 128) goto done;
+    if (p >= end) return 0;
+    b = *p++; result |= (uint32_t)(b & 0x7F) << 14; if (b < 128) goto done;
+    if (p >= end) return 0;
+    b = *p++; result |= (uint32_t)(b & 0x7F) << 21; if (b < 128) goto done;
+    if (p >= end) return 0;
+    b = *p++; result |= (uint32_t)(b & 0x7F) << 28; if (b < 16) goto done;
+    return 0; /* Overflow: 5th byte >= 16 would exceed uint32 */
+
+done:
+    *value = result;
+    return (size_t)(p - start);
 }
 
 static size_t snappy_write_varint(uint8_t* p, uint32_t value) {
@@ -209,47 +220,74 @@ static size_t snappy_write_varint(uint8_t* p, uint32_t value) {
 
 /* ============================================================================
  * SIMD Pattern Extension for Decompression
+ *
+ * Precomputed shuffle masks eliminate runtime modulo operations.
+ * pattern_size ranges from 1..15 (the < 16 branch of incremental_copy).
+ * Two tables: offset-0 masks (for initial load) and offset-16 masks (reshuffle).
  * ============================================================================ */
+
+/* masks_offset0[ps][i] = i % ps, for ps = 1..15 */
+static const uint8_t snappy_masks_offset0[16][16] = {
+    {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0}, /* ps=0 (unused) */
+    {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0}, /* ps=1 */
+    {0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1}, /* ps=2 */
+    {0,1,2,0,1,2,0,1,2,0,1,2,0,1,2,0}, /* ps=3 */
+    {0,1,2,3,0,1,2,3,0,1,2,3,0,1,2,3}, /* ps=4 */
+    {0,1,2,3,4,0,1,2,3,4,0,1,2,3,4,0}, /* ps=5 */
+    {0,1,2,3,4,5,0,1,2,3,4,5,0,1,2,3}, /* ps=6 */
+    {0,1,2,3,4,5,6,0,1,2,3,4,5,6,0,1}, /* ps=7 */
+    {0,1,2,3,4,5,6,7,0,1,2,3,4,5,6,7}, /* ps=8 */
+    {0,1,2,3,4,5,6,7,8,0,1,2,3,4,5,6}, /* ps=9 */
+    {0,1,2,3,4,5,6,7,8,9,0,1,2,3,4,5}, /* ps=10 */
+    {0,1,2,3,4,5,6,7,8,9,10,0,1,2,3,4}, /* ps=11 */
+    {0,1,2,3,4,5,6,7,8,9,10,11,0,1,2,3}, /* ps=12 */
+    {0,1,2,3,4,5,6,7,8,9,10,11,12,0,1,2}, /* ps=13 */
+    {0,1,2,3,4,5,6,7,8,9,10,11,12,13,0,1}, /* ps=14 */
+    {0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,0}, /* ps=15 */
+};
+
+/* masks_offset16[ps][i] = (16 + i) % ps, for ps = 1..15 */
+static const uint8_t snappy_masks_offset16[16][16] = {
+    {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0}, /* ps=0 (unused) */
+    {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0}, /* ps=1 */
+    {0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1}, /* ps=2 */
+    {1,2,0,1,2,0,1,2,0,1,2,0,1,2,0,1}, /* ps=3 */
+    {0,1,2,3,0,1,2,3,0,1,2,3,0,1,2,3}, /* ps=4 */
+    {1,2,3,4,0,1,2,3,4,0,1,2,3,4,0,1}, /* ps=5 */
+    {4,5,0,1,2,3,4,5,0,1,2,3,4,5,0,1}, /* ps=6 */
+    {2,3,4,5,6,0,1,2,3,4,5,6,0,1,2,3}, /* ps=7 */
+    {0,1,2,3,4,5,6,7,0,1,2,3,4,5,6,7}, /* ps=8 */
+    {7,8,0,1,2,3,4,5,6,7,8,0,1,2,3,4}, /* ps=9 */
+    {6,7,8,9,0,1,2,3,4,5,6,7,8,9,0,1}, /* ps=10 */
+    {5,6,7,8,9,10,0,1,2,3,4,5,6,7,8,9}, /* ps=11 */
+    {4,5,6,7,8,9,10,11,0,1,2,3,4,5,6,7}, /* ps=12 */
+    {3,4,5,6,7,8,9,10,11,12,0,1,2,3,4,5}, /* ps=13 */
+    {2,3,4,5,6,7,8,9,10,11,12,13,0,1,2,3}, /* ps=14 */
+    {1,2,3,4,5,6,7,8,9,10,11,12,13,14,0,1}, /* ps=15 */
+};
 
 #if SNAPPY_HAVE_NEON
 
-/* NEON: Generate shuffle mask for pattern of given size at given byte offset */
-static inline uint8x16_t neon_pattern_mask(int offset, int pattern_size) {
-    uint8_t mask[16];
-    for (int i = 0; i < 16; i++)
-        mask[i] = (uint8_t)((offset + i) % pattern_size);
-    return vld1q_u8(mask);
-}
-
-/* NEON: Load and expand a small pattern into a 16-byte vector */
 static inline uint8x16_t neon_load_pattern(const uint8_t* src, int pattern_size) {
-    uint8x16_t gen_mask = neon_pattern_mask(0, pattern_size);
+    uint8x16_t gen_mask = vld1q_u8(snappy_masks_offset0[pattern_size]);
     uint8x16_t raw = vld1q_u8(src);
     return vqtbl1q_u8(raw, gen_mask);
 }
 
-/* NEON: Get reshuffle mask for next 16 bytes of pattern continuation */
 static inline uint8x16_t neon_reshuffle_mask(int pattern_size) {
-    return neon_pattern_mask(16, pattern_size);
+    return vld1q_u8(snappy_masks_offset16[pattern_size]);
 }
 
 #elif SNAPPY_HAVE_SSSE3
 
-static inline __m128i ssse3_pattern_mask(int offset, int pattern_size) {
-    uint8_t mask[16];
-    for (int i = 0; i < 16; i++)
-        mask[i] = (uint8_t)((offset + i) % pattern_size);
-    return _mm_loadu_si128((const __m128i*)mask);
-}
-
 static inline __m128i ssse3_load_pattern(const uint8_t* src, int pattern_size) {
-    __m128i gen_mask = ssse3_pattern_mask(0, pattern_size);
+    __m128i gen_mask = _mm_loadu_si128((const __m128i*)snappy_masks_offset0[pattern_size]);
     __m128i raw = _mm_loadu_si128((const __m128i*)src);
     return _mm_shuffle_epi8(raw, gen_mask);
 }
 
 static inline __m128i ssse3_reshuffle_mask(int pattern_size) {
-    return ssse3_pattern_mask(16, pattern_size);
+    return _mm_loadu_si128((const __m128i*)snappy_masks_offset16[pattern_size]);
 }
 
 #endif
@@ -508,7 +546,9 @@ carquet_status_t carquet_snappy_decompress(
         }
     }
 
-    if ((size_t)(op - dst) != uncompressed_len)
+    /* Upstream requires BOTH output length match AND full input consumption.
+     * Without the ip check, trailing garbage after valid data is accepted. */
+    if ((size_t)(op - dst) != uncompressed_len || ip != ip_end)
         return CARQUET_ERROR_INVALID_COMPRESSED_DATA;
 
     *dst_size = uncompressed_len;

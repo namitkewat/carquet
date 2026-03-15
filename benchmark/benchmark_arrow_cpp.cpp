@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <future>
 #include <memory>
 #include <string>
 #include <vector>
@@ -183,6 +184,50 @@ static bool take_result(const char* what, arrow::Result<T> result, T* out) {
     return true;
 }
 
+typedef struct {
+    std::shared_ptr<arrow::Table> table;
+    std::string error;
+} row_group_read_result_t;
+
+static bool build_file_reader(const char* filename, bool use_threads,
+                              std::unique_ptr<parquet::arrow::FileReader>* out) {
+    parquet::ReaderProperties reader_props;
+    reader_props.set_page_checksum_verification(false);
+
+    parquet::ArrowReaderProperties arrow_props;
+    arrow_props.set_use_threads(use_threads);
+    arrow_props.set_pre_buffer(true);
+
+    parquet::arrow::FileReaderBuilder builder;
+    if (!check_status("Open input file",
+                      builder.OpenFile(filename, true, reader_props))) {
+        return false;
+    }
+    builder.properties(arrow_props);
+
+    if (!take_result("Build file reader", builder.Build(), out)) {
+        return false;
+    }
+
+    (*out)->set_use_threads(use_threads);
+    return true;
+}
+
+static row_group_read_result_t read_row_group_table(const char* filename, int row_group_index) {
+    row_group_read_result_t result;
+    std::unique_ptr<parquet::arrow::FileReader> reader;
+    if (!build_file_reader(filename, false, &reader)) {
+        result.error = "failed to create file reader";
+        return result;
+    }
+
+    arrow::Status status = reader->ReadRowGroup(row_group_index, &result.table);
+    if (!status.ok()) {
+        result.error = status.ToString();
+    }
+    return result;
+}
+
 static std::unique_ptr<test_data_t> test_data_create(int num_rows) {
     std::unique_ptr<arrow::Buffer> ids_buf_tmp;
     std::unique_ptr<arrow::Buffer> values_buf_tmp;
@@ -312,27 +357,38 @@ static double benchmark_write(const char* filename, const test_data_t* td,
 static double benchmark_read(const char* filename, int expected_rows) {
     double start = get_time_ms();
 
-    parquet::ReaderProperties reader_props;
-    reader_props.set_page_checksum_verification(false);
-
-    parquet::ArrowReaderProperties arrow_props;
-    arrow_props.set_use_threads(true);
-
-    parquet::arrow::FileReaderBuilder builder;
-    if (!check_status("Open input file",
-                      builder.OpenFile(filename, true, reader_props))) {
-        return -1.0;
-    }
-    builder.properties(arrow_props);
-
     std::unique_ptr<parquet::arrow::FileReader> reader;
-    if (!take_result("Build file reader", builder.Build(), &reader)) {
+    if (!build_file_reader(filename, true, &reader)) {
         return -1.0;
     }
-    reader->set_use_threads(true);
 
     std::shared_ptr<arrow::Table> table;
-    if (!check_status("Read table", reader->ReadTable(&table))) {
+    int num_row_groups = reader->num_row_groups();
+    if (num_row_groups > 1) {
+        std::vector<std::future<row_group_read_result_t>> futures;
+        futures.reserve(num_row_groups);
+        for (int rg = 0; rg < num_row_groups; ++rg) {
+            futures.push_back(std::async(std::launch::async, [filename, rg]() {
+                return read_row_group_table(filename, rg);
+            }));
+        }
+
+        std::vector<std::shared_ptr<arrow::Table>> row_group_tables(num_row_groups);
+        for (int rg = 0; rg < num_row_groups; ++rg) {
+            row_group_read_result_t result = futures[rg].get();
+            if (!result.error.empty()) {
+                std::fprintf(stderr, "Read row group %d: %s\n", rg, result.error.c_str());
+                return -1.0;
+            }
+            row_group_tables[rg] = std::move(result.table);
+        }
+
+        if (!take_result("Concatenate row groups",
+                         arrow::ConcatenateTables(row_group_tables),
+                         &table)) {
+            return -1.0;
+        }
+    } else if (!check_status("Read table", reader->ReadTable(&table))) {
         return -1.0;
     }
 
