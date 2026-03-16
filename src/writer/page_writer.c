@@ -635,11 +635,11 @@ carquet_status_t carquet_page_writer_add_values(
         }
 
         case CARQUET_PHYSICAL_BYTE_ARRAY: {
-            /* Encode all num_values entries (not just non-null) so that
-             * values[i] stays aligned with def_levels[i].  Null entries
-             * are written as zero-length byte arrays (4-byte len=0). */
+            /* Sparse encoding: values contains only the num_non_null entries.
+             * Null rows are indicated by def_levels and have no corresponding
+             * entry in the values array, consistent with all other physical types. */
             const carquet_byte_array_t* arrays = (const carquet_byte_array_t*)values;
-            status = carquet_encode_plain_byte_array(arrays, num_values,
+            status = carquet_encode_plain_byte_array(arrays, num_non_null,
                                                       &writer->values_buffer);
             break;
         }
