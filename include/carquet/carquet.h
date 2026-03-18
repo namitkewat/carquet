@@ -354,83 +354,155 @@ const carquet_cpu_info_t* carquet_get_cpu_info(void);
  * Memory Allocation
  * ============================================================================
  *
- * By default, Carquet uses the standard C library allocator (malloc/free).
- * Custom allocators can be provided for integration with application-specific
- * memory management systems.
+ * By default, Carquet uses the standard C library allocator (malloc/realloc/
+ * free).  Applications may replace this with a custom allocator via
+ * carquet_set_allocator() before any other library call that allocates memory.
+ *
+ * All three function-pointer fields (malloc, realloc, free) receive the same
+ * opaque 'ctx' pointer that was stored in carquet_allocator_t::ctx when the
+ * allocator was installed.  This lets a single implementation serve multiple
+ * independent allocation pools by distinguishing them through ctx.
+ *
+ * Typical use cases:
+ *   - Per-query memory arenas that can be bulk-freed after a query completes.
+ *   - Memory-tracking shims for leak detection in long-running services.
+ *   - Custom pool allocators in constrained or embedded environments.
+ *   - Integration with application-level allocators (e.g. jemalloc regions,
+ *     mimalloc heaps, tcmalloc thread-local caches).
  */
 
 /**
  * @brief Custom memory allocator interface.
  *
- * Users can provide custom memory allocation functions for all Carquet
- * operations. This is useful for:
+ * A value of this type fully describes a malloc/realloc/free triple that
+ * Carquet will use for all externally observable heap allocations.  The
+ * @c ctx field is forwarded unmodified to every call, allowing the same
+ * set of function pointers to be reused across multiple allocator instances
+ * that differ only in their context (e.g. separate pools per thread).
  *
- * - Memory tracking and debugging
- * - Custom memory pools
- * - Integration with game engines or other frameworks
+ * @par Ownership semantics
+ * Carquet copies the entire struct by value when carquet_set_allocator() is
+ * called.  The original struct in the caller's scope need not remain live.
  *
- * All three function pointers must be provided (non-NULL) when setting
- * a custom allocator.
+ * @par Null-pointer behaviour
+ * Each function must tolerate the same NULL-pointer cases that the C standard
+ * mandates for the underlying standard functions:
+ *   - @c malloc(0, ctx)       — implementation-defined (return NULL or unique ptr)
+ *   - @c realloc(NULL, n, ctx) — equivalent to malloc(n, ctx)
+ *   - @c realloc(p, 0, ctx)   — equivalent to free(p, ctx), return value unspecified
+ *   - @c free(NULL, ctx)       — no-op
  */
 typedef struct carquet_allocator {
     /**
-     * @brief Allocate memory.
-     * @param size Number of bytes to allocate
-     * @param ctx User context pointer
-     * @return Pointer to allocated memory, or NULL on failure
+     * @brief Allocate @p size bytes of uninitialized memory.
+     *
+     * @param[in] size  Number of bytes to allocate.
+     * @param[in] ctx   Opaque context pointer from carquet_allocator_t::ctx.
+     * @return          Suitably aligned pointer to allocated memory, or NULL
+     *                  if allocation fails or @p size is zero and the
+     *                  implementation returns NULL for zero-size requests.
      */
     void* (*malloc)(size_t size, void* ctx);
 
     /**
-     * @brief Reallocate memory.
-     * @param ptr Pointer to existing allocation (may be NULL)
-     * @param size New size in bytes
-     * @param ctx User context pointer
-     * @return Pointer to reallocated memory, or NULL on failure
+     * @brief Resize an existing allocation.
+     *
+     * @param[in] ptr   Existing allocation to resize, or NULL to allocate fresh
+     *                  memory (equivalent to malloc(size, ctx)).
+     * @param[in] size  New desired size in bytes.
+     * @param[in] ctx   Opaque context pointer from carquet_allocator_t::ctx.
+     * @return          Pointer to resized memory, or NULL on failure.  On
+     *                  failure the original @p ptr is @b not freed and remains
+     *                  valid.
      */
     void* (*realloc)(void* ptr, size_t size, void* ctx);
 
     /**
-     * @brief Free memory.
-     * @param ptr Pointer to free (may be NULL)
-     * @param ctx User context pointer
+     * @brief Release a previously allocated block.
+     *
+     * Must be a no-op when @p ptr is NULL.
+     *
+     * @param[in] ptr   Pointer previously returned by malloc or realloc, or NULL.
+     * @param[in] ctx   Opaque context pointer from carquet_allocator_t::ctx.
      */
     void (*free)(void* ptr, void* ctx);
 
-    /** @brief User context passed to all allocation functions */
+    /**
+     * @brief Opaque user context forwarded to every allocation call.
+     *
+     * May be NULL if the allocator functions do not require external state.
+     */
     void* ctx;
 } carquet_allocator_t;
 
 /**
- * @brief Set the global memory allocator.
+ * @brief Install a custom allocator as the process-wide Carquet allocator.
  *
- * Must be called before any other Carquet function that allocates memory.
- * If not called, the standard C library allocator is used.
+ * Replaces the library's active @c carquet_allocator_t.  The supplied struct
+ * is copied by value; the caller's original need not remain in scope after
+ * this function returns.
  *
- * @param[in] allocator Custom allocator (NULL to reset to default)
+ * Passing @c NULL, or a struct with any NULL function pointer, silently
+ * resets the allocator to the built-in C standard library shims
+ * (malloc / realloc / free), as if this function had never been called.
  *
- * @warning Not thread-safe. Must be called before any concurrent Carquet usage.
- * @warning All function pointers in the allocator must be non-NULL.
+ * @par Lifecycle
+ * Call this function exactly once during program initialisation, before any
+ * Carquet object (reader, writer, schema, …) has been created.  Changing the
+ * allocator while live objects exist produces undefined behaviour because
+ * those objects may later attempt to free memory with a different allocator
+ * than the one used to allocate it.
+ *
+ * @param[in] allocator
+ *   Pointer to a fully populated @c carquet_allocator_t, or @c NULL to restore
+ *   the default C allocator.  All three function pointers must be non-NULL
+ *   when @p allocator itself is non-NULL; the @c ctx field may be @c NULL.
+ *
+ * @warning Not thread-safe.  External synchronisation is required if other
+ *          threads may concurrently access any Carquet state.
+ *
+ * @note    The installed allocator is not invoked by this call itself; no
+ *          memory is allocated or freed as a side-effect.
  *
  * @code{.c}
- * carquet_allocator_t my_alloc = {
- *     .malloc = my_malloc,
- *     .realloc = my_realloc,
- *     .free = my_free,
- *     .ctx = my_context
+ * // Example: install a per-arena allocator backed by a custom pool.
+ * my_pool_t* pool = my_pool_create(4 * 1024 * 1024);
+ *
+ * carquet_allocator_t pool_alloc = {
+ *     .malloc  = my_pool_malloc,
+ *     .realloc = my_pool_realloc,
+ *     .free    = my_pool_free,
+ *     .ctx     = pool,
  * };
- * carquet_set_allocator(&my_alloc);
+ * carquet_set_allocator(&pool_alloc);
+ *
+ * // ... use Carquet ...
+ *
+ * carquet_set_allocator(NULL);  // restore default before destroying the pool
+ * my_pool_destroy(pool);
  * @endcode
+ *
+ * @see carquet_get_allocator()
  */
 CARQUET_API
 void carquet_set_allocator(const carquet_allocator_t* allocator);
 
 /**
- * @brief Get the current memory allocator.
+ * @brief Return a pointer to the currently active Carquet allocator.
  *
- * @return Pointer to current allocator configuration
+ * The returned pointer is always non-NULL and refers to the library's
+ * internal allocator record.  Callers must not free or modify it.
  *
- * @note Thread-safe: Yes (read-only)
+ * A common use of this function is to retrieve the current allocator before
+ * installing a replacement, so that the replacement can delegate to the
+ * original (allocator composition / layering pattern).
+ *
+ * @return Non-NULL, read-only pointer to the active @c carquet_allocator_t.
+ *
+ * @note Thread-safe: Yes — safe to call from multiple threads concurrently
+ *       provided that carquet_set_allocator() has already returned.
+ *
+ * @see carquet_set_allocator()
  */
 CARQUET_API CARQUET_PURE
 const carquet_allocator_t* carquet_get_allocator(void);
